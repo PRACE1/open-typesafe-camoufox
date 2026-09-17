@@ -82,6 +82,11 @@ async def find_elements(platform) -> list[ElementRef]:
     out: list[ElementRef] = []
     for raw in (result or [])[:MAX_ELEMENTS]:
         try:
+            value = str(raw.get("value", "") or "")
+            try:
+                value_len = int(raw.get("value_len", 0) or 0)
+            except (ValueError, TypeError):
+                value_len = len(value)
             out.append(ElementRef(
                 idx=int(raw.get("idx", len(out))),
                 kind=str(raw.get("kind", "?")),
@@ -90,6 +95,8 @@ async def find_elements(platform) -> list[ElementRef]:
                 label=str(raw.get("label", "") or ""),
                 placeholder=str(raw.get("placeholder", "") or ""),
                 text=str(raw.get("text", "") or ""),
+                value=value[:80],
+                value_len=value_len,
                 cx=float(raw.get("cx", 0.5)),
                 cy=float(raw.get("cy", 0.5)),
             ))
@@ -156,10 +163,17 @@ def format_elements(elements: list[ElementRef]) -> str:
 
 
 def element_criteria(e: ElementRef) -> str:
-    """One-line Choice criterion for an element idx."""
+    """One-line Choice criterion for an element idx.
+
+    Inputs declare filled vs empty so the decider can reason about the
+    clear-before-type system instead of retyping blindly.
+    """
     label = e.label or e.placeholder or e.text or e.id or "?"
     extra = f" ({e.type})" if e.type else ""
-    return f"{e.kind}{extra} \"{label}\" at {e.cx:.3f},{e.cy:.3f}"
+    base = f"{e.kind}{extra} \"{label}\" at {e.cx:.3f},{e.cy:.3f}"
+    if e.kind in ("input", "textarea", "select") or e.type:
+        base += f" filled({e.value_len}ch)" if e.value_len else " empty"
+    return base
 
 
 def build_state(*, task: str, url: str, elements: list[ElementRef],
@@ -174,6 +188,7 @@ def build_state(*, task: str, url: str, elements: list[ElementRef],
         "elements": [
             {"idx": e.idx, "kind": e.kind, "type": e.type, "label": e.label,
              "placeholder": e.placeholder, "text": e.text, "cx": e.cx, "cy": e.cy,
+             "value_len": e.value_len,
              "sel": f'[data-jev="{e.idx}"]'}
             for e in elements
         ],

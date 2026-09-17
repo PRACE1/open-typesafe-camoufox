@@ -33,6 +33,8 @@ class ElementRef:
     label: str = ""
     placeholder: str = ""
     text: str = ""
+    value: str = ""
+    value_len: int = 0
     cx: float = 0.5
     cy: float = 0.5
 

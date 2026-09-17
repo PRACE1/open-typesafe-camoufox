@@ -49,6 +49,19 @@ def page_settled(page_text: str) -> bool:
     return not _LOADING_RE.search(text)
 
 
+def loop_guard_trip(last_sig: tuple | None, run: int, sig: tuple) -> tuple[bool, int]:
+    """True when the same (kind, item, url) repeats 3+ guardable steps in a row.
+
+    The execution layer then forces a wait instead of re-issuing the action:
+    fixation breaks mechanically even when the classifier stays confident.
+    Waits and other kinds leave the counters untouched, so three identical
+    clicks/types trip it even with waits interleaved; any navigation (url in
+    the sig) or different target resets the run.
+    """
+    run = run + 1 if sig == last_sig else 1
+    return run >= 3, run
+
+
 def credential_placeholder(task: str, *, want_password: bool) -> str | None:
     """Pick a {ENV} placeholder from the task for a credential field."""
     names = re.findall(r"\{([A-Z_][A-Z0-9_]*)\}", task or "")
@@ -115,6 +128,8 @@ async def run_decide_session(
     stop_reason = ""
     paused = False
     noops = 0
+    last_sig: tuple | None = None
+    sig_run = 0
     steer_consumed = 0
     started = datetime.now().isoformat(timespec="seconds")
     t_end = time.time() + budget_s
@@ -234,6 +249,22 @@ async def run_decide_session(
                 log(f"GATE   conf {conf:.2f} < {min_confidence} — idle (no-op {noops + 1})")
                 history.append(f"step {steps}: low conf {conf:.2f}, idled")
                 entry["act"] = "idle (low confidence)"
+                noops += 1
+            # Loop-guard: the tab, clear, and click systems all report into
+            # the decision, but a confident classifier can still fixate
+            # (same click 5x). Three identical click/type targets in a row
+            # force a wait here instead of executing again.
+            guard_trip = False
+            if decision.kind in (Kind.CLICK_ITEM, Kind.TYPE_AT) and decision.element_idx is not None:
+                guard_trip, sig_run = loop_guard_trip(
+                    last_sig, sig_run,
+                    (decision.kind.value, decision.element_idx, page.url),
+                )
+                last_sig = (decision.kind.value, decision.element_idx, page.url)
+            if guard_trip:
+                log(f"LOOPGUARD {decision.kind.value} #{decision.element_idx} x{sig_run} — forced wait (no-op {noops + 1})")
+                history.append(f"step {steps}: loopguard tripped on {decision.kind.value} #{decision.element_idx}, waited")
+                entry["act"] = f"loopguard wait ({decision.kind.value} #{decision.element_idx})"
                 noops += 1
             elif decision.kind == Kind.WAIT:
                 # Patience, not doubt: the screen is still loading. Neutral —

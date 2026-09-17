@@ -46,6 +46,17 @@ ELEMENT_PROBE_JS = """
     if (tag === 'a') {
       elText = elText || (el.getAttribute ? String(el.getAttribute('title') || '') : '');
     }
+    // Inputs: expose the live value so the decider sees filled vs empty.
+    let elVal = '';
+    if ((tag === 'input' || tag === 'textarea') && typeof el.value === 'string') {
+      elVal = el.value.slice(0, 80);
+    }
+    // Links with no own text (icon/title wrapped in headings): fall back to
+    // the nearest heading text so results stay choosable instead of "?".
+    if (tag === 'a' && !elText) {
+      const h = el.querySelector('h1,h2,h3') || el.closest('h1,h2,h3');
+      if (h) elText = (h.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40);
+    }
     raw.push({
       el: el,
       doc_top: Math.round(docTop),
@@ -55,6 +66,8 @@ ELEMENT_PROBE_JS = """
       label: elLabel,
       placeholder: elPlaceholder,
       text: elText,
+      value: elVal,
+      value_len: elVal.length,
       cx: Math.round((r.left + r.width / 2) / vw * 1000) / 1000,
       cy: Math.round((r.top + r.height / 2) / vh * 1000) / 1000,
     });
@@ -71,6 +84,8 @@ ELEMENT_PROBE_JS = """
       label: o.label,
       placeholder: o.placeholder,
       text: o.text,
+      value: o.value,
+      value_len: o.value_len,
       doc_top: o.doc_top,
       cx: o.cx,
       cy: o.cy,

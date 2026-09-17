@@ -28,13 +28,15 @@ from enum import Enum
 
 from . import perception
 from .actions import action_failed, challenge_control, click_item, goto_url, heal_target, press_key, type_at
+from .capability.dynamic_registry import register_capability
 from .capability.human_move import HUMANIZE_LEVEL
-from .decide import Kind, decide_action
+from .capability.validator import validate_capability
+from .decide import HealStrategy, Kind, decide_action, decide_heal_action
 from .deps import RunState
 from .machine.run_engine import EDGES as _ENGINE_EDGES
 from .machine.run_engine import RunMachine, advance, state_id
 from .perception import is_credential_element
-from .writer import ProposedAction, compose_text, propose_action, propose_url, summarize_task
+from .writer import ProposedAction, compose_text, propose_action, propose_url, summarize_task, synthesize_capability
 
 _LOADING_RE = re.compile(r"looking for results|loading|^\\s*$", re.IGNORECASE)
 
@@ -192,7 +194,7 @@ def _apply_proposal(decision, proposed: ProposedAction):
         decision,
         kind=Kind(proposed.kind),
         element_idx=proposed.item
-        if proposed.kind in ("click_item", "type_at") else None,
+        if proposed.kind in ("click_item", "type_at", "challenge") else None,
         target_url=proposed.url if proposed.kind == "goto" else None,
         propose_url=proposed.kind == "goto" and proposed.url is None,
         confidence=max(decision.confidence, decision.approval),
@@ -216,9 +218,12 @@ def no_effect_trip(prev_acted: bool, prev_fp: tuple | None, fp: tuple,
     Strictly consecutive only: idle/wait/gate steps neither advance nor
     reset the count — they are patience, and only back-to-back dead actions
     end the run. (Loop-guard separately covers repeated identical intents.)
+    Synthesized heal_step<N> capabilities are effectful by construction.
     """
     return bool(prev_acted and prev_fp is not None and fp == prev_fp
-                and settled and last_effect_kind in EFFECT_KINDS)
+                and settled
+                and (last_effect_kind in EFFECT_KINDS
+                     or str(last_effect_kind or "").startswith("heal_step")))
 
 
 def notes_url_count(notes: list[str]) -> int:
@@ -426,6 +431,8 @@ async def run_decide_session(
                 advance(machine, phase_trail, "continue_run")  # verify -> see
             heal_edge = None
             challenge_stop = None
+            heal_abort = None
+            heal_accounted = False
             # Per-step timing: answers "why is the run slow" with data —
             # propose (writer LLM), decide (Jev), act (dispatch + settle).
             t_top = time.time()
@@ -960,37 +967,166 @@ async def run_decide_session(
                         # Self-healing retry: a stale map or covered target
                         # detours ACT -> HEAL -> ACT for exactly one re-attempt
                         # (remapped by label), else ACT -> HEAL -> VERIFY.
+                        # Jev triages the failure first; the runner executes
+                        # the strategy (remap / dismiss / challenge / abort).
                         if action_failed(res) and ("stale map" in res
                                                    or "target covered" in res):
                             old_label = (target.label or target.placeholder
                                          or target.text or target.id or "")
-                            log(f"HEAL   {res[:90]} — re-probing once")
+                            log(f"HEAL   {res[:90]} — triaging")
                             history.append(f"step {steps}: click failed, healing — {res[:90]}")
                             advance(machine, phase_trail, "act_now")  # gate -> act
                             advance(machine, phase_trail, "heal_needed")  # act -> heal
-                            new_idx = await heal_target(platform, old_label,
-                                                        target.kind)
-                            if new_idx is not None and new_idx != idx:
-                                log(f"HEAL   remapped #{idx} -> #{new_idx} — one re-attempt")
-                                history.append(f"step {steps}: healed #{idx} -> #{new_idx}, retrying")
-                                # The fresh probe owns the DOM selector; the
-                                # step's element list only supplies labels.
-                                res = await click_item(platform, elements, new_idx,
+                            strategy, need_new = await decide_heal_action(
+                                error_msg=res, last_kind="click_item",
+                                page_text=page_text)
+                            log(f"HEAL   triage -> {strategy.value} (novelty={need_new:.2f})")
+                            history.append(f"step {steps}: heal triage -> {strategy.value}")
+                            if strategy == HealStrategy.ABORT:
+                                heal_abort = (f"step {steps}: heal triage aborted — "
+                                              f"{res[:120]}")
+                                history.append(heal_abort)
+                                machine.healed_target_ready_flag = False
+                                advance(machine, phase_trail, "heal_failed")
+                                heal_edge = "heal_failed"
+                            elif strategy in (HealStrategy.DRAG_SLIDER,
+                                              HealStrategy.SOLVE_CHALLENGE):
+                                log(f"HEAL   failure is a challenge control — working it")
+                                res = await challenge_control(
+                                    platform, elements, idx,
+                                    expected_kind=target.kind)
+                                log(f"RESULT {res}")
+                                if action_failed(res):
+                                    history.append(f"step {steps}: heal challenge failed — {res[:90]}")
+                                    machine.healed_target_ready_flag = False
+                                    advance(machine, phase_trail, "heal_failed")
+                                    heal_edge = "heal_failed"
+                                else:
+                                    entry["act"] = f"element #{idx} challenge (via heal)"
+                                    entry["result"] = res
+                                    history.append(f"step {steps}: heal worked challenge #{idx} — {res[:90]}")
+                                    moves += 1
+                                    noops = 0
+                                    acted = True
+                                    last_effect_kind = "challenge"
+                                    heal_accounted = True
+                                    machine.healed_target_ready_flag = True
+                                    advance(machine, phase_trail, "healed")
+                                    heal_edge = "healed"
+                            elif strategy == HealStrategy.DISMISS_COVER:
+                                try:
+                                    await platform.page.keyboard.press("Escape")
+                                    await asyncio.sleep(0.6)
+                                except Exception:
+                                    pass
+                                log("HEAL   dismissed once — one re-attempt")
+                                res = await click_item(platform, elements, idx,
                                                              expected_kind=target.kind)
                                 log(f"RESULT {res}")
-                                advance(machine, phase_trail, "healed")  # heal -> act
-                                heal_edge = "healed"
-                                idx = new_idx
-                            else:
-                                log("HEAL   no remap target — accounting the failure")
-                                history.append(f"step {steps}: heal found no remap target")
-                                advance(machine, phase_trail, "heal_failed")  # heal -> verify
-                                heal_edge = "heal_failed"
+                                if action_failed(res):
+                                    machine.healed_target_ready_flag = False
+                                    advance(machine, phase_trail, "heal_failed")
+                                    heal_edge = "heal_failed"
+                                else:
+                                    machine.healed_target_ready_flag = True
+                                    advance(machine, phase_trail, "healed")
+                                    heal_edge = "healed"
+                            elif strategy == HealStrategy.EXPAND_CAPABILITY:
+                                # Live synthesis (gated): compose -> validate
+                                # (AST + signature + dry-run) -> register ->
+                                # execute once. Any gate failure accounts as
+                                # heal_failed; the code is audited to run_dir.
+                                cap_name = f"heal_step{steps}"
+                                box_norm = (list(target.box)
+                                            if target.box is not None else None)
+                                code = await synthesize_capability(
+                                    issue=res, ref=target.ref,
+                                    kind=target.kind, label=old_label,
+                                    box_norm=box_norm, page_text=page_text)
+                                if code is None:
+                                    history.append(f"step {steps}: heal synthesis declined")
+                                    log("HEAL   writer declined synthesis — accounting the failure")
+                                    machine.healed_target_ready_flag = False
+                                    advance(machine, phase_trail, "heal_failed")
+                                    heal_edge = "heal_failed"
+                                else:
+                                    audit_path = os.path.join(
+                                        run_dir, f"heal-{steps:02d}-{cap_name}.py")
+                                    try:
+                                        with open(audit_path, "w", encoding="utf-8") as f:
+                                            f.write(code)
+                                    except OSError:
+                                        audit_path = "(audit write failed)"
+                                    log(f"HEAL   synthesized {cap_name} -> {audit_path}")
+                                    ctx = {"ref": target.ref, "role": target.kind,
+                                           "label": old_label, "box_norm": box_norm}
+                                    result = await validate_capability(
+                                        code, cap_name, platform,
+                                        target.ref, ctx)
+                                    if not result.valid:
+                                        history.append(f"step {steps}: healed code rejected — {result.error}")
+                                        log(f"HEAL   validation failed ({result.error}) — accounting")
+                                        machine.healed_target_ready_flag = False
+                                        advance(machine, phase_trail, "heal_failed")
+                                        heal_edge = "heal_failed"
+                                    else:
+                                        register_capability(cap_name, result.func)
+                                        try:
+                                            heal_res = await asyncio.wait_for(
+                                                result.func(platform, target.ref, ctx),
+                                                timeout=30.0)
+                                        except asyncio.TimeoutError:
+                                            heal_res = "error: healed action timed out after 30s"
+                                        except Exception as exc:
+                                            heal_res = f"error: healed action raised: {exc}"
+                                        log(f"RESULT {heal_res}")
+                                        res = heal_res
+                                        if action_failed(heal_res):
+                                            history.append(f"step {steps}: healed action failed — {heal_res[:90]}")
+                                            machine.healed_target_ready_flag = False
+                                            advance(machine, phase_trail, "heal_failed")
+                                            heal_edge = "heal_failed"
+                                        else:
+                                            entry["act"] = f"{cap_name} ({target.ref})"
+                                            entry["result"] = heal_res
+                                            history.append(f"step {steps}: healed action worked — {heal_res[:90]}")
+                                            moves += 1
+                                            noops = 0
+                                            acted = True
+                                            last_effect_kind = cap_name
+                                            heal_accounted = True
+                                            machine.healed_target_ready_flag = True
+                                            advance(machine, phase_trail, "healed")
+                                            heal_edge = "healed"
+                            else:  # REMAP_STALE
+                                fresh, new_idx = await heal_target(
+                                    platform, old_label,
+                                    target.kind, target.sel)
+                                if new_idx is not None and new_idx != idx:
+                                    log(f"HEAL   remapped #{idx} -> #{new_idx} — one re-attempt")
+                                    history.append(f"step {steps}: healed #{idx} -> #{new_idx}, retrying")
+                                    # Retry against the FRESH list: refs and
+                                    # selectors belong to their own probe.
+                                    res = await click_item(platform, fresh, new_idx,
+                                                                 expected_kind=target.kind)
+                                    log(f"RESULT {res}")
+                                    machine.healed_target_ready_flag = True
+                                    advance(machine, phase_trail, "healed")  # heal -> act
+                                    heal_edge = "healed"
+                                    idx = new_idx
+                                else:
+                                    log("HEAL   no remap target — accounting the failure")
+                                    history.append(f"step {steps}: heal found no remap target")
+                                    machine.healed_target_ready_flag = False
+                                    advance(machine, phase_trail, "heal_failed")  # heal -> verify
+                                    heal_edge = "heal_failed"
                         if action_failed(res):
                             history.append(f"step {steps}: click failed — {res}")
                             entry["act"] = f"element #{idx} click"
                             entry["result"] = res
                             noops += 1
+                        elif heal_accounted:
+                            pass  # challenge-via-heal accounted above
                         else:
                             entry["act"] = f"element #{idx} click"
                             entry["result"] = res
@@ -1107,7 +1243,7 @@ async def run_decide_session(
                      "text": e.text, "value_len": e.value_len,
                      "href": e.href, "region": e.region,
                      "host": perception.host_of(e.href),
-                     "sel": f'[data-jev="{e.idx}"]',
+                     "ref": e.ref,
                      "cx": e.cx, "cy": e.cy}
                     for e in elements
                 ],
@@ -1184,6 +1320,11 @@ async def run_decide_session(
                 stop_reason = challenge_stop
                 advance(machine, phase_trail, "abort")  # verify -> stopped
                 log(f"STOP   image challenge — ending run honestly")
+            if heal_abort is not None and not done and not stopped:
+                stopped = True
+                stop_reason = heal_abort
+                advance(machine, phase_trail, "abort")  # verify -> stopped
+                log(f"STOP   heal triage aborted — ending run honestly")
             await asyncio.sleep(interval)
 
         cursor = await platform.harvest_cursor_events()

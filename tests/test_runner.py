@@ -171,6 +171,8 @@ def test_no_effect_trip_strictly_consecutive():
     assert no_effect_trip(True, fp, fp, False, "click_item") is False
     assert no_effect_trip(True, fp, fp, True, "type_at") is False
     assert no_effect_trip(True, fp, fp, True, None) is False
+    assert no_effect_trip(True, fp, fp, True, "heal_step5") is True
+    assert no_effect_trip(True, fp, fp, True, "challenge") is True
 
 
 def test_should_submit_instead():

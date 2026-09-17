@@ -15,6 +15,8 @@ acting for one re-attempt or on to verifying to account the failure.
 
 from __future__ import annotations
 
+from collections import deque
+
 from statemachine import State, StateMachine
 
 
@@ -38,9 +40,39 @@ class RunMachine(StateMachine):
     abort = gate.to(stopped) | verify.to(stopped) | see.to(stopped)
     acted = act.to(verify)
     heal_needed = act.to(heal)
-    healed = heal.to(act)
+    healed = heal.to(act, cond="healed_target_ready")
     heal_failed = heal.to(verify)
     continue_run = verify.to(see)
+
+    def healed_target_ready(self) -> bool:
+        """Guard: re-enter act only with a remapped target in hand.
+
+        The runner sets `machine.healed_target_ready = True` after a
+        successful label remap, False otherwise. A guarded `healed` with no
+        target raises TransitionNotAllowed instead of retrying blind.
+        """
+        return bool(getattr(self, "healed_target_ready_flag", False))
+
+    def on_enter_heal(self, **kwargs) -> None:
+        """Telemetry hook: count heal entries per session for the run log."""
+        self.heal_attempts = getattr(self, "heal_attempts", 0) + 1
+
+    def after_transition(self, **kwargs) -> None:
+        """Forensics hook: bounded log of (source, target) id pairs.
+
+        The runner dumps this on honest stops; tests assert the heal cycle
+        appears here end to end.
+        """
+        log = getattr(self, "transitions_log", None)
+        if log is None:
+            log = deque(maxlen=64)
+            self.transitions_log = log
+        try:
+            ed = kwargs.get("event_data")
+            log.append((str(ed.transition.source.id),
+                        str(ed.transition.target.id)))
+        except (AttributeError, TypeError):
+            log.append(("?", "?"))
 
 
 def state_id(machine: RunMachine) -> str:

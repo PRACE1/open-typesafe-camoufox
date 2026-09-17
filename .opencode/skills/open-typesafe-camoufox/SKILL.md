@@ -16,6 +16,8 @@ Repo: `open-typesafe-camoufox/`. Call shape from the repo root:
 uv run otc.py --url <start-url> --task "<plain-English goal>" --budget 240 --max-steps 20
 ```
 
+Runtime rules: `docs/LIBRARIES.md` · State machine rules: `docs/STATEMACHINE_CONVENTIONS.md`
+
 ## Setup (once)
 
 ```bash
@@ -68,7 +70,7 @@ Clicks auto-adopt new tabs (`+ newtab <url>` in RESULT, slow popups at next
 SEE); a tab switch logs `TAB SWITCH` with a fresh DOM digest and starts a
 reading cooldown (`goto refused until step N`). `close_others`
 always keeps the current tab and its opener. Every step walks
-`see → decide → gate → [act] → verify` (transcript `phases`; a stale/covered click detours `act → heal → act` once); `NOEFFECT` means a settled page identical to the last step, twice ends the run.
+`see → decide → gate → [act] → verify` (transcript `phases`; a stale/covered click detours act-heal-act once via Jev triage (remap/dismiss/challenge/gated synthesis/abort); `NOEFFECT` means a settled page identical to the last step, twice ends the run.
 
 ## Primitive / LLM contract (how decisions become actions, exactly)
 
@@ -77,10 +79,10 @@ directly; LLM capabilities never touch the browser directly; the harness in
 `src/runner.py` enforces every crossing:
 
 1. **LLM proposes + classifies.** Writer proposes one action (`PROPOSE`, with
-   rationale + selectors from the current map). Jev classifies kind/item/site
+   rationale + refs from the current map). Jev classifies kind/item/site
    (Choice), flags (Nouls: `ready`/`text?`/`done?`/`fit`/`approve`), progress
-   (Score). All state Jev sees is in the packet: elements (idx/kind/label/
-   text/href/host/region/selector), focused field, page text, tabs, notes,
+   (Score). All state Jev sees is in the packet: elements (ref/kind/label/
+   text/href/host/region/box), focused field, page text, tabs, notes,
    visited, lessons. Nothing else exists for it.
 2. **Harness routes.** `resolve_proposal_action` picks override / fallback /
    mismatch-idle / none. Gate (`conf`), loop-guard (3× identical intents),

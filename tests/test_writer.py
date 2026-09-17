@@ -52,10 +52,11 @@ def test_propose_url_without_key_not_ok(monkeypatch):
 
 
 def _els():
-    return [ElementRef(idx=0, kind="link", text="Prolific",
+    return [ElementRef(idx=0, kind="link", text="Prolific", ref="e0",
                        href="https://www.prolific.com/", region="main",
                        cx=0.3, cy=0.4),
-            ElementRef(idx=5, kind="textarea", label="Search", cx=0.5, cy=0.4)]
+            ElementRef(idx=5, kind="textarea", label="Search", ref="e5",
+                       cx=0.5, cy=0.4)]
 
 
 def _fake_chat(payload):
@@ -68,9 +69,59 @@ def _fake_chat(payload):
 
 def test_summarize_elements_shows_urls():
     s = summarize_elements(_els())
-    assert "[0] link" in s and "prolific.com" in s and "[main]" in s
-    assert "[5] textarea" in s and "empty" in s
+    assert "[e0] link" in s and "prolific.com" in s and "[main]" in s
+    assert "[e5] textarea" in s and "empty" in s
     assert "LINKS:" in s and "INPUTS:" in s
+
+
+def test_propose_accepts_ref_item(monkeypatch):
+    import src.writer as _w2
+
+    async def fake_chat(system, user):
+        assert "[e0]" in user  # proposer sees refs
+        return {"question": "Click?", "kind": "click_item",
+                "item": "e0", "url": None, "rationale": "Top."}
+
+    monkeypatch.setattr(_w2, "_chat_json", fake_chat)
+    p = asyncio.run(_w2.propose_action(
+        task="t", url="https://g.example/", elements=_els(),
+        page_text="p", history=[], notes=[]))
+    assert p is not None and p.item == 0
+
+
+def test_synthesize_returns_code_and_strips_fences(monkeypatch):
+    import src.writer as _w2
+
+    async def fake_chat(system, user, timeout_s=30.0, max_tokens=400):
+        assert "FAILURE" in user and "SKELETON" in user
+        return {"code": "```python\nasync def execute(platform, ref, ctx, dry_run=False):\n    return 'x'\n```"}
+
+    monkeypatch.setattr(_w2, "_chat_json", fake_chat)
+    code = asyncio.run(_w2.synthesize_capability(
+        issue="error: covered", ref="e2", kind="button", label="Go",
+        box_norm=[0.1, 0.2, 0.3, 0.1], page_excerpt="p"))
+    assert code is not None and code.startswith("async def execute")
+    assert "```" not in code
+
+
+def test_synthesize_none_on_decline_or_garbage(monkeypatch):
+    import src.writer as _w2
+
+    async def fake_empty(system, user, timeout_s=30.0, max_tokens=400):
+        return {}
+
+    monkeypatch.setattr(_w2, "_chat_json", fake_empty)
+    assert asyncio.run(_w2.synthesize_capability(
+        issue="e", ref="e1", kind="link", label="x",
+        box_norm=None, page_excerpt="p")) is None
+
+    async def fake_garbage(system, user, timeout_s=30.0, max_tokens=400):
+        return {"code": "just some prose, no function"}
+
+    monkeypatch.setattr(_w2, "_chat_json", fake_garbage)
+    assert asyncio.run(_w2.synthesize_capability(
+        issue="e", ref="e1", kind="link", label="x",
+        box_norm=None, page_excerpt="p")) is None
 
 
 def test_propose_valid_click(monkeypatch):

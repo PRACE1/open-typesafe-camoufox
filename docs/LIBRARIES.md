@@ -53,13 +53,42 @@ below is grounded in this repo — file paths given.
 - Smells to flag: unvalidated dicts crossing module boundaries, `Any`
   leaking into decision code, exceptions swallowed without a history line.
 
+## python-statemachine
+
+- `RunMachine` (`src/machine/run_engine.py`) owns transition truth; `EDGES`
+  + `legal()` + `advance()` are the only emitters. Conventions pinned in
+  `docs/STATEMACHINE_CONVENTIONS.md` (callbacks, `cond=` guards, generated
+  diagrams, TDD, ruff-99, Google docstrings).
+- Heal cycle `act -> heal -> act/verify`; `healed` guarded by
+  `healed_target_ready_flag` (remap in hand). `on_enter_heal` counts
+  attempts; `after_transition` keeps a bounded forensics log.
+- Diagram is generated (`docs/run_machine.dot` via `contrib/diagram`,
+  needs `pydot`); a test fails on drift — never hand-edit.
+- Smells to flag: phase strings appended outside `advance()`, unguarded
+  `healed`, prints in the engine instead of callbacks.
+
+## Ref-based element handles (playwright-cli contract)
+
+- Refs `eN` are ephemeral per-probe handles (`src/capability/element_probe.py`,
+  `src/perception.py`); the probe NEVER mutates the DOM (no `setAttribute`,
+  no markers) — stealth rule. Python-side `SnapshotElement` equivalents are
+  `ElementRef(ref, box)` with viewport-normalized boxes.
+- Context control: viewport filter + parent/child 80%-overlap dedup + 128
+  cap (inside Jev's 255 ceiling). Jev item Choice keys are refs, decoded via
+  `ref_to_idx` (bare ints accepted for cached-prompt compat).
+- Resolution re-runs the deterministic probe and takes the nth match,
+  cross-checked by kind + label (`_resolve_target`); `generate-locator`
+  equivalent is the role/name fallback in `dispatch_verified_click`.
+- Smells to flag: any DOM mutation in probe code, selectors stored on
+  elements, refs surviving across probes, caps above 255.
+
 ## httpx / python-dotenv / Pillow / humanmovemouse
 
 - `httpx.AsyncClient` with explicit timeouts everywhere; 429/529 retried
   with backoff (`src/decide.py`, `src/writer.py`). No bare `requests`.
 - `python-dotenv` loads `.env.local` (git-ignored, never committed);
   secrets resolve at execution and log masked (`_mask`).
-- `Pillow` renders annotated step PNGs (blue idxs / red choice / green
+- `Pillow` renders annotated step PNGs (blue ref boxes / red choice / green
   focus) in `src/report.py`.
 - `humanmovemouse` drives the 5-hop ellipse highlight; exactly one clean
   revolution (no stacked wobble sources).

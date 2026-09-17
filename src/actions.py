@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 
 from .capability.logging_utils import log
+from .capability.element_probe import RESOLVE_JS
 from .deps import ElementRef
 from .perception import find_elements, get_page_text
 from .writer import _mask, _resolve_placeholders
@@ -29,17 +30,19 @@ async def _clear_field(platform) -> None:
         log(f"clear field: {exc}")
 
 
-POINT_CHECK_JS = """({sel, x, y}) => {
-  const target = document.querySelector(sel);
-  if (!target) return {v: 'gone', k: ''};
-  const tag = (target.tagName || '').toLowerCase();
-  const kind = tag === 'a' ? 'link' : tag;
+POINT_CHECK_JS = """({x, y, expRole, expName}) => {
   const el = document.elementFromPoint(x, y);
-  if (!el) return {v: 'void', k: kind};
-  if (target === el || target.contains(el)) return {v: 'hit', k: kind};
+  if (!el) return {v: 'void', k: '', n: ''};
+  const tag = (el.tagName || '').toLowerCase();
+  const kind = tag === 'a' ? 'link' : tag;
+  const nm = ((el.getAttribute && (el.getAttribute('aria-label') || '')) || el.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 40);
+  const exp = String(expName || '').trim().toLowerCase();
+  const low = nm.toLowerCase();
+  const nameOk = !exp || low === exp || (exp && low.includes(exp)) || (exp && exp.includes(low));
+  if (kind === String(expRole || '') && nameOk) return {v: 'hit', k: kind, n: nm};
   const cls = (el.getAttribute && el.getAttribute('class')) || '';
-  return {v: 'covered:' + (el.tagName || '?').toLowerCase()
-    + (cls ? '.' + String(cls).replace(/\\s+/g, ' ').slice(0, 40) : ''), k: kind};
+  return {v: 'covered:' + tag
+    + (cls ? '.' + String(cls).replace(/\\s+/g, ' ').slice(0, 40) : ''), k: kind, n: nm};
 }"""
 
 
@@ -72,17 +75,24 @@ def may_click_through(verdict: str) -> bool:
     return _covering_tag(verdict) in _CLICK_THROUGH_TAGS
 
 
-async def _point_status(page, sel: str, px: int, py: int) -> str:
+async def _point_status(page, px: int, py: int,
+                      exp_role: str = "", exp_name: str = "") -> str:
     """Ask the DOM what is actually under the click point (verdict only)."""
-    verdict, _kind = await _inspect_point(page, sel, px, py)
+    verdict, _kind = await _inspect_point(page, px, py, exp_role, exp_name)
     return verdict
 
 
-async def _inspect_point(page, sel: str, px: int, py: int) -> tuple[str, str]:
-    """Ask the DOM what is under a point: (verdict, live element kind)."""
+async def _inspect_point(page, px: int, py: int,
+                         exp_role: str = "", exp_name: str = "") -> tuple[str, str]:
+    """Ask the DOM what is under a point: (verdict, live element kind).
+
+    Selector-free: elementFromPoint plus a role/name cross-check against the
+    expected target. No DOM markers are ever queried (stealth).
+    """
     try:
         res = await asyncio.wait_for(
-            page.evaluate(POINT_CHECK_JS, {"sel": sel, "x": px, "y": py}),
+            page.evaluate(POINT_CHECK_JS, {
+                "x": px, "y": py, "expRole": exp_role, "expName": exp_name}),
             timeout=10.0,
         )
         if isinstance(res, dict):
@@ -95,8 +105,8 @@ async def _inspect_point(page, sel: str, px: int, py: int) -> tuple[str, str]:
 def stale_mismatch(expected: str | None, live: str) -> bool:
     """True when the live element is no longer what was decided on.
 
-    data-jev idx tags are positional and re-assigned every probe; when the
-    page re-renders between decide and act, idx N can point at a different
+    Refs are positional and re-assigned every probe; when the page
+    re-renders between decide and act, ref eN can point at a different
     element (seen live: result link became the search box). Refuse to act
     on a stale reference.
     """
@@ -151,26 +161,160 @@ async def _refresh_snapshot(platform) -> str:
     return digest + ")"
 
 
+def _slot_changed(old: ElementRef, new: ElementRef) -> bool:
+    """True when the nth probe slot now holds a different element.
+
+    Kind change always counts. Label/text change counts only when both
+    sides have something to compare (empty labels carry no signal).
+    """
+    if old.kind != new.kind:
+        return True
+    o = (old.label or old.placeholder or old.text or "").strip().lower()
+    n = (new.label or new.placeholder or new.text or "").strip().lower()
+    return bool(o and n and o != n)
+
+
+async def _resolve_by_selector(platform, sel: str) -> dict | None:
+    """Read-only single-node lookup for a probe-generated selector.
+
+    Returns {box(px dict), kind, label} or None when the node is gone,
+    the selector is invalid, or the box is unusable. Never writes.
+    """
+    if not sel:
+        return None
+    try:
+        hit = await asyncio.wait_for(
+            platform.page.evaluate(RESOLVE_JS, sel), timeout=10.0)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(hit, dict):
+        return None
+    try:
+        x, y, w, h = (float(v) for v in (hit.get("box") or []))
+    except (ValueError, TypeError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    vp = platform.page.viewport_size or {"width": 1280, "height": 800}
+    vw = max(1, int(vp.get("width", 1280)))
+    vh = max(1, int(vp.get("height", 800)))
+    if w > 1.5 * vw or h > 1.5 * vh:
+        return None
+    kind = str(hit.get("kind", "") or "")
+    label = (str(hit.get("label", "") or "")
+             or str(hit.get("placeholder", "") or "")
+             or str(hit.get("text", "") or "")
+             or str(hit.get("id", "") or ""))
+    return {"box": {"x": x, "y": y, "width": w, "height": h},
+            "kind": kind, "label": label}
+
+
+async def _resolve_target(platform, elements: list[ElementRef],
+                          idx: int) -> dict:
+    """Resolve positional idx to its live element: selector first, nth fallback.
+
+    Refs die with their probe, so resolution is order-independent first:
+    the probe-generated durable selector addresses the SAME node even when
+    the page re-renders between decide and act (seen live: Google homepage
+    shuffles slots in seconds). Only when the node is gone does resolution
+    fall back to the nth match of a fresh probe, strictly cross-checked
+    (kind + label/text) against the decided element.
+
+    Returns status ok (box, element, live_kind, live_label), stale (same
+    slot or same selector, different element), or gone. Pure lookup — no
+    dispatch, no scrolling.
+    """
+    blank = {"status": "gone", "box": None, "element": None,
+             "live_kind": "", "live_label": ""}
+    old = next((e for e in elements if e.idx == idx), None)
+    if old is None:
+        return blank
+    if old.sel:
+        hit = await _resolve_by_selector(platform, old.sel)
+        if hit is not None:
+            live = ElementRef(idx=idx, kind=hit["kind"], label=hit["label"])
+            info = {"box": hit["box"], "element": old,
+                    "live_kind": hit["kind"], "live_label": hit["label"]}
+            if _slot_changed(old, live):
+                return {"status": "stale", **info}
+            return {"status": "ok", **info}
+    try:
+        fresh = await find_elements(platform)
+    except Exception:  # noqa: BLE001
+        return blank
+    if idx < 0 or idx >= len(fresh):
+        return blank
+    cand = fresh[idx]
+    box = None
+    if cand.box is not None:
+        vp = platform.page.viewport_size or {"width": 1280, "height": 800}
+        vw = max(1, int(vp.get("width", 1280)))
+        vh = max(1, int(vp.get("height", 800)))
+        bx, by, bw, bh = cand.box
+        # Unaimable spans (multi-viewport card anchors): no point on screen
+        # can be verified as the target, so refuse rather than guess.
+        if 0 < bw <= 1.5 and 0 < bh <= 1.5:
+            box = {"x": bx * vw, "y": by * vh,
+                   "width": bw * vw, "height": bh * vh}
+    live_label = (cand.label or cand.placeholder or cand.text
+                  or cand.id or "")
+    info = {"box": box, "element": cand, "live_kind": cand.kind,
+            "live_label": live_label}
+    if box is None:
+        return {**blank, **info}
+    if _slot_changed(old, cand):
+        return {"status": "stale", **info}
+    return {"status": "ok", **info}
+
+
+async def _scroll_box_into_view(platform, box: dict) -> None:
+    """Coordinate scroll (no selectors): bring an off-screen box on screen.
+
+    Fail-soft: any failure leaves the viewport alone and the caller treats
+    the target as not actionable this step.
+    """
+    try:
+        page = platform.page
+        vp = page.viewport_size or {"width": 1280, "height": 800}
+        vh = int(vp.get("height", 800))
+        if 0 <= box["y"] <= vh:
+            return
+        await page.evaluate("(dy) => window.scrollBy(0, dy)",
+                            box["y"] - vh / 3)
+        await asyncio.sleep(0.3)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _verified_center(platform, elements: list[ElementRef], idx: int,
                            samples: int = 5):
-    """Fresh box + sampled point checks with one re-scroll retry.
+    """Fresh box + sampled point checks with scroll + one re-resolve retry.
 
     Returns (px, py, verdict, live_kind). Prefers a direct hit, then a
-    clickable cover (anchor/button), else the last verdict seen.
+    clickable cover (anchor/button), else the last verdict seen. A shifted
+    map reports stale (no dispatch); a missing slot reports gone.
     """
     page = platform.page
-    sel = f'[data-jev="{idx}"]'
     vp = page.viewport_size or {"width": 1280, "height": 800}
     last: tuple = (None, None, "gone", "")
     for _ in (1, 2):
-        found = await _element_center(platform, elements, idx)
-        if not found:
+        res = await _resolve_target(platform, elements, idx)
+        if res["status"] == "gone" or res["box"] is None:
             last = (None, None, "gone", "")
             continue
-        _box = found[2]
+        if res["status"] == "stale":
+            return None, None, f"stale:{res['live_kind']}", res["live_kind"]
+        el = res["element"]
+        exp_name = (el.label or el.placeholder or el.text or el.id or "")
+        box = res["box"]
+        vh = int(vp.get("height", 800))
+        if not (0 <= box["y"] <= vh):
+            await _scroll_box_into_view(platform, box)
+            continue
         fallback = None
-        for px, py in _sample_points(_box, vp, samples):
-            verdict, live_kind = await _inspect_point(page, sel, px, py)
+        for px, py in _sample_points(box, vp, samples):
+            verdict, live_kind = await _inspect_point(
+                page, px, py, el.kind, exp_name)
             if verdict == "hit":
                 return px, py, verdict, live_kind
             if verdict.startswith("error:"):
@@ -198,6 +342,9 @@ async def probe_target(platform, elements: list[ElementRef], idx: int,
         return blank
     label = el.label or el.placeholder or el.text or el.id or f"element #{idx}"
     px, py, verdict, live_kind = await _verified_center(platform, elements, idx)
+    if verdict.startswith("stale:"):
+        return {"idx": idx, "status": "stale", "verdict": verdict,
+                "px": px, "py": py, "live_kind": live_kind, "label": label}
     if px is None or verdict == "gone":
         return {**blank, "label": label}
     if verdict.startswith("error:"):
@@ -280,20 +427,30 @@ async def verify_for_dispatch(platform, elements: list[ElementRef], idx: int,
 
 
 async def _element_center(platform, elements: list[ElementRef], idx: int):
-    """Scroll element idx into view; return (px, py, box) or None."""
+    """Resolve ref idx to a visible-box center; return (px, py, box) or None.
+
+    Selector-free: resolution runs through _resolve_target (fresh probe +
+    cross-check), scrolling by coordinates when the box is off-screen.
+    None covers gone, stale, and still-off-screen — point verification
+    downstream distinguishes the diagnosis.
+    """
     page = platform.page
-    sel = f'[data-jev="{idx}"]'
-    locator = page.locator(sel).first
-    await asyncio.wait_for(locator.scroll_into_view_if_needed(timeout=5000), timeout=15.0)
-    box = await locator.bounding_box()
-    if not box:
-        return None
     vp = page.viewport_size or {"width": 1280, "height": 800}
-    cx = box["x"] + box["width"] / 2
-    cy = box["y"] + box["height"] / 2
-    px = min(max(int(cx), 0), int(vp["width"]) - 1)
-    py = min(max(int(cy), 0), int(vp["height"]) - 1)
-    return px, py, box
+    for _ in (1, 2):
+        res = await _resolve_target(platform, elements, idx)
+        if res["status"] != "ok" or res["box"] is None:
+            return None
+        box = res["box"]
+        vh = int(vp.get("height", 800))
+        if not (0 <= box["y"] <= vh):
+            await _scroll_box_into_view(platform, box)
+            continue
+        cx = box["x"] + box["width"] / 2
+        cy = box["y"] + box["height"] / 2
+        px = min(max(int(cx), 0), int(vp["width"]) - 1)
+        py = min(max(int(cy), 0), int(vp["height"]) - 1)
+        return px, py, box
+    return None
 
 
 async def click_item(platform, elements: list[ElementRef], idx: int,
@@ -377,13 +534,18 @@ async def click_item(platform, elements: list[ElementRef], idx: int,
 
 
 def _remap_idx(fresh: list[ElementRef], old_label: str,
-               old_kind: str | None = None) -> int | None:
-    """Find old_label in a fresh element map (exact, case-insensitive).
+               old_kind: str | None = None,
+               old_sel: str | None = None) -> int | None:
+    """Find the old target in a fresh element map.
 
-    idx tags are positional: after a re-render the target usually survives
-    under a new number. Label match is strict on purpose — a wrong-element
-    click is worse than a no-op.
+    Same node first (durable selector equality — order-independent), then
+    exact label (case-insensitive). Label match stays strict on purpose —
+    a wrong-element click is worse than a no-op.
     """
+    if old_sel:
+        for e in fresh:
+            if e.sel == old_sel:
+                return e.idx
     want = (old_label or "").strip().lower()
     if not want:
         return None
@@ -395,17 +557,21 @@ def _remap_idx(fresh: list[ElementRef], old_label: str,
 
 
 async def heal_target(platform, old_label: str,
-                      old_kind: str | None = None) -> int | None:
-    """One self-healing retry: re-probe the page, remap the old label.
+                      old_kind: str | None = None,
+                      old_sel: str | None = None
+                      ) -> tuple[list[ElementRef], int | None]:
+    """One self-healing retry: re-probe the page, remap by selector/label.
 
-    Returns the fresh idx or None. Pure lookup — no dispatch — so the
-    runner can re-attempt exactly once before accounting the failure.
+    Returns (fresh_elements, new_idx | None). The fresh list MUST be used
+    for the re-attempt: positional refs and selectors belong to their own
+    probe, and retrying against the stale step list re-resolves the wrong
+    node. Pure lookup — no dispatch.
     """
     try:
         fresh = await find_elements(platform)
     except Exception:  # noqa: BLE001
-        return None
-    return _remap_idx(fresh, old_label, old_kind)
+        return [], None
+    return fresh, _remap_idx(fresh, old_label, old_kind, old_sel)
 
 
 def _challenge_kind(el: ElementRef) -> str:

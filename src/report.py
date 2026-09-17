@@ -45,18 +45,29 @@ def write_raw_png(run_dir: str, n: int, png_bytes: bytes) -> str:
 def annotate_png(png_bytes: bytes, elements: list[ElementRef],
                  chosen_idx: int | None = None,
                  focused_frame: dict | None = None) -> bytes:
-    """Blue idx rings, chosen element red, focused field green."""
+    """Ref boxes (blue), chosen element red, focused field green.
+
+    Boxes are viewport-normalized; elements without one fall back to the
+    legacy cx/cy ring so old replays still annotate.
+    """
     from PIL import Image, ImageDraw
 
     img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
     w, h = img.size
     d = ImageDraw.Draw(img)
     for e in elements:
-        x, y = e.cx * w, e.cy * h
-        r = 14
         color = "red" if (chosen_idx is not None and e.idx == chosen_idx) else "blue"
-        d.ellipse([x - r, y - r, x + r, y + r], outline=color, width=3)
-        d.text((x + r + 2, y - r), str(e.idx), fill=color)
+        if e.box is not None:
+            bx, by, bw, bh = e.box
+            x0, y0 = bx * w, by * h
+            d.rectangle([x0, y0, x0 + bw * w, y0 + bh * h],
+                        outline=color, width=3)
+            d.text((x0 + 2, y0 - 10), e.ref or str(e.idx), fill=color)
+        else:
+            x, y = e.cx * w, e.cy * h
+            r = 14
+            d.ellipse([x - r, y - r, x + r, y + r], outline=color, width=3)
+            d.text((x + r + 2, y - r), str(e.idx), fill=color)
     if focused_frame:
         try:
             x, y = int(focused_frame.get("x", 0)), int(focused_frame.get("y", 0))
@@ -117,7 +128,7 @@ def write_wire(run_dir: str, wire: dict[str, Any]) -> str:
     """Append one normalized wire record per step (wire.jsonl).
 
     The machine-readable twin of the human feed: normalized URL, tabs,
-    full element map (idx/kind/label/text/value/href/region/host/sel/coords),
+    full element map (idx/ref/kind/label/text/value/href/region/host/coords),
     focused field, page text, decision + Nouls + progress, action, result,
     phases, notes, visited. Grep-able and replayable offline without parsing
     the annotated payload dumps.

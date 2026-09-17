@@ -31,7 +31,7 @@ from .perception import host_of
 
 __all__ = [
     "WriterText", "WriterUrl", "ProposedAction",
-    "compose_text", "propose_url", "propose_action",
+    "compose_text", "propose_url", "propose_action", "synthesize_capability",
     "validate_url", "_mask", "_resolve_placeholders",
 ]
 
@@ -137,7 +137,8 @@ def _writer_config() -> tuple[str, str, str]:
     )
 
 
-async def _chat_json(system: str, user: str, timeout_s: float = 30.0) -> dict:
+async def _chat_json(system: str, user: str, timeout_s: float = 30.0,
+                   max_tokens: int = 400) -> dict:
     base, key, model = _writer_config()
     if not key:
         return {}
@@ -152,7 +153,7 @@ async def _chat_json(system: str, user: str, timeout_s: float = 30.0) -> dict:
                 {"role": "user", "content": user},
             ],
             "temperature": 0.2,
-            "max_output_tokens": 400,
+            "max_output_tokens": max_tokens,
         }
     elif kind == "messages":
         url = base.rstrip("/") + "/messages"
@@ -164,7 +165,7 @@ async def _chat_json(system: str, user: str, timeout_s: float = 30.0) -> dict:
             "system": system,
             "messages": [{"role": "user", "content": user}],
             "temperature": 0.2,
-            "max_tokens": 400,
+            "max_tokens": max_tokens,
         }
     else:
         url = base.rstrip("/") + "/chat/completions"
@@ -176,6 +177,7 @@ async def _chat_json(system: str, user: str, timeout_s: float = 30.0) -> dict:
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0.2,
+            "max_tokens": max_tokens,
         }
     async with httpx.AsyncClient(timeout=timeout_s) as client:
         res = await client.post(url, json=payload, headers=headers)
@@ -317,10 +319,10 @@ async def summarize_task(*, task: str, notes: list[str]) -> TaskVerdict:
 PROPOSE_SYSTEM = (
     "You propose the single best next browser action. Reply with JSON only: "
     '{"question": "Should the browser ...?", "kind": "<verb>", '
-    '"item": <element idx or null>, "url": "<absolute https URL or null>", '
+    '"item": <element ref like "e4" or null>, "url": "<absolute https URL or null>", '
     '"rationale": "<one sentence>"}. '
     "Verbs: wait, click_item, type_at, press_enter, press_escape, refresh, back, close_others, "
-    "goto, done, none. click_item/type_at need a valid item idx from the map; "
+    "goto, done, none. click_item/type_at need a valid item ref from the map; "
     "goto needs an absolute https url or null; other verbs take item null "
     "and url null. click_item targets links/buttons only — never propose "
     "clicking an input/textarea/select (those are typed via type_at). "
@@ -348,7 +350,7 @@ class ProposedAction:
 
 def _element_line(e: ElementRef) -> str:
     label = e.label or e.placeholder or e.text or e.id or "?"
-    bits = f"[{e.idx}] {e.kind} \"{label}\""
+    bits = f"[{e.ref}] {e.kind} \"{label}\""
     if e.kind == "link" and e.href:
         host = host_of(e.href)
         if host:
@@ -363,14 +365,15 @@ def _element_line(e: ElementRef) -> str:
 
 
 def summarize_elements(elements: list[ElementRef]) -> str:
-    """Compact map grouped by kind so the proposer grounds idx to kind.
+    """Compact map grouped by kind so the proposer grounds ref to kind.
 
     Links, inputs, and buttons read as separate sections — a flat list lets
-    the model attach a button's description to an input's idx (seen live).
+    the model attach a button's description to an input's ref (seen live).
+    Capped to the probe map (already ≤128 by perception).
     """
     groups: dict[str, list[str]] = {"link": [], "input": [], "button": []}
     other: list[str] = []
-    for e in elements[:60]:
+    for e in elements[:128]:
         line = _element_line(e)
         if e.kind in groups:
             groups[e.kind].append(line)
@@ -422,11 +425,15 @@ async def propose_action(*, task: str, url: str, elements: list[ElementRef],
         return None
     item = data.get("item", None)
     if item is not None:
+        # Writer speaks refs (e4); internal proposals stay positional ints.
+        text = str(item).strip()
+        if text.startswith("e"):
+            text = text[1:]
         try:
-            item = int(item)
+            item = int(text)
         except (ValueError, TypeError):
             return None
-        if item < 0:
+        if item < 0 or item >= len(elements):
             return None
     raw_url = data.get("url", None)
     cleaned_url = validate_url(raw_url) if raw_url is not None else None
@@ -439,3 +446,80 @@ async def propose_action(*, task: str, url: str, elements: list[ElementRef],
         url=cleaned_url,
         rationale=str(data.get("rationale", ""))[:200],
     )
+
+
+SYNTHESIZE_SYSTEM = (
+    "You write ONE self-contained async Python browser capability. "
+    "Reply with JSON only: {\"code\": \"<python source>\"}. "
+    "Hard rules: exactly `async def execute(platform, ref, ctx, dry_run=False)` "
+    "and nothing else at top level except `import asyncio` and constants. "
+    "No imports beyond asyncio. No eval/exec/open/os/sys/subprocess. "
+    "Drive ONLY via platform.page (Playwright async API: mouse, keyboard, "
+    "evaluate, wait_for_timeout). ctx carries ref/role/label/box_norm "
+    "(viewport-normalized x,y,w,h). With dry_run=True, resolve the target "
+    "and return a status string WITHOUT dispatching anything. "
+    "Return a one-line history string; prefix failures with 'error:'. "
+    "Never invent helpers outside the function body."
+)
+
+_CAPABILITY_SKELETON = """\
+import asyncio
+
+async def execute(platform, ref, ctx, dry_run=False):
+    page = platform.page
+    box = ctx.get("box_norm") or []
+    if dry_run:
+        return f"{ref} dry-run ok"
+    try:
+        # TODO: implement the widget interaction here
+        return f"{ref} acted"
+    except Exception as exc:
+        return f"error: healed action failed: {exc}"
+"""
+
+
+def _strip_fences(code: str) -> str:
+    """Remove ```python fences models love to wrap code in."""
+    text = (code or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    return text.strip()
+
+
+async def synthesize_capability(*, issue: str, ref: str, kind: str,
+                                label: str, box_norm: list[float] | None,
+                                page_excerpt: str,
+                                timeout_s: float = 60.0) -> str | None:
+    """Ask the writer to compose a capability for a novel widget failure.
+
+    Returns Python source (validator-gated downstream) or None when the
+    model declines, fails, or returns no usable code. Never raises.
+    """
+    box = ""
+    try:
+        if box_norm is not None:
+            box = ",".join(f"{float(v):.3f}" for v in box_norm)
+    except (ValueError, TypeError):
+        box = ""
+    user = (
+        f"FAILURE: {(issue or '')[:300]}\n"
+        f"TARGET: ref={ref} role={kind} label={(label or '')[:80]} "
+        f"box_norm=[{box}]\n"
+        f"PAGE: {(page_excerpt or '')[:400]}\n"
+        f"SKELETON (adapt, keep the contract):\n{_CAPABILITY_SKELETON}"
+    )
+    try:
+        data = await _chat_json(SYNTHESIZE_SYSTEM, user,
+                                timeout_s=timeout_s, max_tokens=1500)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    code = _strip_fences(str(data.get("code", "") or ""))
+    if "async def execute" not in code:
+        return None
+    return code

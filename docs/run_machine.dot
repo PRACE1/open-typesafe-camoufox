@@ -1,0 +1,50 @@
+digraph RunMachine {
+label=RunMachine;
+rankdir=LR;
+fontname=Helvetica;
+fontsize=10;
+penwidth=2.0;
+splines=true;
+ordering=out;
+compound=true;
+nodesep=0.3;
+ranksep=0.3;
+forcelabels=true;
+node [fontname=Helvetica, fontsize=10, penwidth=2.0];
+edge [fontname=Helvetica, fontsize=9, labeldistance=1.5];
+subgraph __anon___sg {
+label="";
+peripheries=0;
+margin=0;
+__anon__ [label="", shape=circle, style=filled, fillcolor=black, color=black, fixedsize=true, width=0.15, height=0.15, penwidth=0];
+}
+__anon__ -> see [label="", minlen=1, weight=100];
+subgraph __anon__ {
+label="";
+peripheries=0;
+margin=0;
+cluster=true;
+see [label=See, shape=rectangle, style="rounded, filled", fontname=Helvetica, fontsize=10, fillcolor=turquoise, penwidth=2, peripheries=1];
+decide [label=Decide, shape=rectangle, style="rounded, filled", fontname=Helvetica, fontsize=10, fillcolor=white, penwidth=2, peripheries=1];
+gate [label=Gate, shape=rectangle, style="rounded, filled", fontname=Helvetica, fontsize=10, fillcolor=white, penwidth=2, peripheries=1];
+act [label=Act, shape=rectangle, style="rounded, filled", fontname=Helvetica, fontsize=10, fillcolor=white, penwidth=2, peripheries=1];
+verify [label=Verify, shape=rectangle, style="rounded, filled", fontname=Helvetica, fontsize=10, fillcolor=white, penwidth=2, peripheries=1];
+heal [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="10">Heal</font></td></tr><hr/><tr><td align="left" cellpadding="6"><font point-size="9">entry / on_enter_heal</font></td></tr></table>>, shape=rectangle, style="rounded, filled", fontname=Helvetica, fontsize=10, fillcolor=white, penwidth=2, margin=0, peripheries=1];
+done [label=Done, shape=rectangle, style="rounded, filled", fontname=Helvetica, fontsize=10, fillcolor=white, penwidth=2, peripheries=2];
+stopped [label=Stopped, shape=rectangle, style="rounded, filled", fontname=Helvetica, fontsize=10, fillcolor=white, penwidth=2, peripheries=2];
+}
+see -> decide [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Perceived</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+see -> stopped [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Abort</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+decide -> gate [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Decided</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+gate -> act [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Act now</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+gate -> verify [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Idle now</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+gate -> done [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Finish</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+gate -> stopped [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Abort</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+act -> verify [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Acted</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+act -> heal [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Heal needed</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+verify -> done [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Finish</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+verify -> stopped [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Abort</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+verify -> see [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Continue run</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+heal -> act [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Healed<br/>[healed_target_ready]</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+heal -> verify [label=<<table border="0" cellborder="0" cellspacing="0" cellpadding="0"><tr><td cellpadding="4"><font point-size="9">Heal failed</font></td></tr><tr><td cellpadding="1"></td></tr></table>>, minlen=1];
+}

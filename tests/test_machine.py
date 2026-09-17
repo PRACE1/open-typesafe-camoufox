@@ -34,8 +34,10 @@ def test_idle_path_skips_act():
 
 def test_heal_cycle_returns_to_act_then_verify():
     m = RunMachine()
-    trail = walk(m, "perceived", "decided", "act_now", "heal_needed",
-                 "healed", "acted", "continue_run")
+    trail = walk(m, "perceived", "decided", "act_now", "heal_needed")
+    m.healed_target_ready_flag = True
+    for ev in ("healed", "acted", "continue_run"):
+        advance(m, trail, ev)
     assert trail == ["see", "decide", "gate", "act", "heal", "act",
                      "verify", "see"]
 
@@ -120,6 +122,9 @@ def test_full_edge_table_parity():
             # drive machine to src state first
             _drive_to(m, src)
             assert state_id(m) == src
+            if src == "heal" and ev == "healed":
+                # guarded edge: the test is the remapper holding a target
+                m.healed_target_ready_flag = True
             try:
                 getattr(m, ev)()
                 got = state_id(m)
@@ -155,6 +160,8 @@ def test_edges_table_matches_machine():
         for ev in events:
             m = RunMachine()
             _drive_to(m, src)
+            if src == "heal" and ev == "healed":
+                m.healed_target_ready_flag = True
             try:
                 getattr(m, ev)()
                 assert legal(src, state_id(m)), f"machine allows {src} -{ev}-> but EDGES forbids"
@@ -163,3 +170,69 @@ def test_edges_table_matches_machine():
     for src, dsts in EDGES.items():
         for dst in dsts:
             assert dst in states and src in states
+
+
+def test_conventions_doc_pinned_and_linked():
+    """docs/STATEMACHINE_CONVENTIONS.md exists and SKILL.md links it, so
+    every session loads the python-statemachine rules like xstate-v5."""
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    doc = os.path.join(root, "docs", "STATEMACHINE_CONVENTIONS.md")
+    assert os.path.isfile(doc)
+    body = open(doc, encoding="utf-8").read()
+    for marker in ("cond=", "on_enter_", "contrib/diagram.py",
+                   "TransitionNotAllowed", "Conventional Commits"):
+        assert marker in body
+    skill = open(os.path.join(
+        root, ".opencode", "skills", "open-typesafe-camoufox",
+        "SKILL.md"), encoding="utf-8").read()
+    assert "docs/STATEMACHINE_CONVENTIONS.md" in skill
+
+
+def _drive_heal(m):
+    walk(m, "perceived", "decided", "act_now", "heal_needed")
+
+
+def test_healed_guard_blocks_blind_retry():
+    from statemachine.exceptions import TransitionNotAllowed
+    m = RunMachine()
+    _drive_heal(m)
+    with pytest.raises(TransitionNotAllowed):
+        m.healed()
+    assert state_id(m) == "heal"
+    m.healed_target_ready_flag = True
+    m.healed()
+    assert state_id(m) == "act"
+
+
+def test_on_enter_heal_counts_attempts():
+    m = RunMachine()
+    assert getattr(m, "heal_attempts", 0) == 0
+    _drive_heal(m)
+    assert m.heal_attempts == 1
+    assert ("act", "heal") in list(m.transitions_log)
+
+
+def test_after_transition_logs_forensics():
+    m = RunMachine()
+    walk(m, "perceived", "decided", "act_now", "acted")
+    assert list(m.transitions_log) == [
+        ("see", "decide"), ("decide", "gate"), ("gate", "act"),
+        ("act", "verify")]
+
+
+def _normalized_dot():
+    pytest.importorskip("pydot")
+    from statemachine.contrib.diagram import DotGraphMachine
+    import re
+    dot = DotGraphMachine(RunMachine()).get_graph().to_string()
+    return re.sub(r"__initial_\d+|cluster___atomic_\d+", "__anon__", dot)
+
+
+def test_diagram_matches_committed():
+    """docs/run_machine.dot is machine-generated; this fails on drift so
+    nobody hand-edits the diagram again."""
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    committed = open(os.path.join(root, "docs", "run_machine.dot"),
+                     encoding="utf-8").read()
+    assert _normalized_dot() == committed
+    assert "heal" in committed and "act" in committed

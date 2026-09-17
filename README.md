@@ -73,11 +73,12 @@ Each step walks an explicit phase machine —
 `see → decide → gate → [act] → verify`, driven by the declarative engine
 ([`src/machine/run_engine.py`](src/machine/run_engine.py),
 spec: [`src/machine/run_machine.ts`](src/machine/run_machine.ts))
-— a stale/covered click detours `act → heal → act` for one label-remapped
-re-attempt (see [System diagrams](#system-diagrams)):
+— a stale/covered click detours `act → heal → act` for exactly one Jev-triaged recovery (remap / dismiss / challenge / gated synthesis), 
+else heal -> verify accounts it. State diagram is machine-generated (docs/run_machine.dot):
 
 1. **See** ([`src/perception.py`](src/perception.py)) — screenshot the page, probe
-   the DOM into an element map (reading order, `data-jev` tags), read the
+   the DOM into an element map (reading order, ephemeral `eN` refs, no DOM
+   markers), read the
    focused field (role/label/placeholder/value, credential flag) and the
    visible page text (the reading ground truth). Bank notes and visited
    URLs for long-horizon memory.
@@ -117,7 +118,7 @@ flowchart TB
     WRITER["src/writer.py — proposer + free text"]
     GATE["runner gate — confidence, loop-guard, Noul gates, veto"]
     ACT["src/actions.py — hover, verify, click, type, challenge"]
-    HEAL["runner heal — re-probe + label remap, one re-attempt"]
+    HEAL["runner heal — Jev triage + remap/dismiss/challenge/synthesize, one re-attempt"]
     PLAT["src/browser/camoufox.py — sole Playwright owner"]
     FOX["headed Camoufox browser"]
     TRACK["cursor tracker to cursor.json"]
@@ -255,7 +256,7 @@ While a run is going, steer it from another terminal via `steer.txt`
 ## How a step works
 
 Screenshot → element map ([`src/perception.py`](src/perception.py): DOM probe,
-reading order, `data-jev` tags) + focused field
+reading order, ephemeral `eN` refs, viewport boxes, zero DOM mutation) + focused field
 (role/label/placeholder/value, credential flag) + page text (visible words
 — the reading ground truth). Then the writer proposes the single best
 action as a yes/no question ([`src/writer.py`](src/writer.py)), and one Jev
@@ -307,7 +308,7 @@ Decide path (default, `otc --url … --task …`):
 | propose | [`writer`](src/writer.py) (Groq) | reads all elements + URLs, poses the single best action as the approval question |
 | gate | [`runner`](src/runner.py) | confidence gate, loop-guard, Noul gates |
 | act | [`actions`](src/actions.py) → [`platform`](src/browser/camoufox.py) | click/type/enter/refresh/goto/close/challenge; auto-adopts new tabs |
-| heal | [`runner`](src/runner.py) + [`actions`](src/actions.py) | stale/covered click → re-probe, label remap, one re-attempt |
+| heal | [`runner`](src/runner.py) + [`decide`](src/decide.py) + [`actions`](src/actions.py) | stale/covered click → Jev triage → remap / dismiss / challenge / gated synthesis, one re-attempt |
 | act | [`writer`](src/writer.py) | only on `type_text` (non-credential) and off-catalog `goto` |
 | verify | [`runner`](src/runner.py) | fingerprint vs last step, no-op and dead-run stops |
 

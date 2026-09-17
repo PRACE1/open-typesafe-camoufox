@@ -24,10 +24,23 @@ class CamoufoxDeps:
 
 @dataclass
 class ElementRef:
-    """One entry of the element map (perception.find_elements)."""
+    """One entry of the element map (perception.find_elements).
+
+    ref is the model-facing ephemeral handle (e0, e1, ...), valid for one
+    probe only — the playwright-cli contract. idx is the positional index
+    (int(ref[1:])); internal code keys on idx, models choose refs. box is
+    the viewport-normalized rect (x, y, w, h in 0..1 units) at probe time;
+    None when unknown. Callers scale by the live viewport for pixels. sel
+    is the read-only durable selector generated at probe time (id / name /
+    aria-label / structural path) for order-independent resolution; it is
+    internal only, never shown to models and never written to the DOM.
+    """
 
     idx: int
     kind: str
+    ref: str = ""
+    box: tuple[float, float, float, float] | None = None
+    sel: str = ""
     type: str = ""
     id: str = ""
     label: str = ""

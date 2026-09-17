@@ -13,6 +13,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "humanmovemouse>=1.2.0",
     "python-statemachine>=3.2.1",
+    "pydot>=4.0.1",
 ]
 
 [project.scripts]

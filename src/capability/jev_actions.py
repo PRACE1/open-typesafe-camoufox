@@ -20,8 +20,9 @@ JevCapability: 2-tool mixin (read_frame + move_cursor) on top of CamoufoxCapabil
   -> click focus -> type -> key. The idx comes from find_elements().
 
 find_elements() probes the live DOM for actionable elements (inputs,
-buttons, links) in reading order, tags each with [data-jev="<idx>"], and
-returns the element map the planner targets.
+buttons, links) in reading order and returns the element map the planner
+targets. Refs are ephemeral per-probe handles — the probe never mutates
+the DOM (stealth).
 
 Mixed into JevCapability(CamoufoxCapability) so tracker lifecycle, safe_goto,
 idle-motion, and cursor.json harvest from cursor_tracking.py are reused verbatim.
@@ -243,13 +244,42 @@ class JevCapability(CamoufoxCapability):
     async def _move_cursor_element(
         self, page, vp: dict[str, int], action: MoveCursorAction
     ) -> str:
-        """video-agent element pattern: scroll -> circle -> click -> type -> key."""
-        sel = f'[data-jev="{action.element}"]'
-        locator = page.locator(sel).first
-        await asyncio.wait_for(locator.scroll_into_view_if_needed(timeout=5000), timeout=15.0)
-        box = await locator.bounding_box()
-        if not box:
-            msg = f"error: element #{action.element} has no bounding box (hidden?)"
+        """video-agent element pattern: scroll -> circle -> click -> type -> key.
+
+        Selector-free: refs are positional per probe, so resolution re-runs
+        the probe query and takes the nth match (never a DOM marker)."""
+        box = None
+        visible = False
+        for _ in (1, 2):
+            try:
+                raw = await asyncio.wait_for(
+                    page.evaluate(ELEMENT_PROBE_JS), timeout=10.0)
+            except Exception:
+                raw = []
+            items = raw or []
+            box = None
+            if 0 <= action.element < len(items):
+                b = items[action.element].get("box") or []
+                if len(b) == 4 and b[2] > 0 and b[3] > 0:
+                    vw = max(1, int(vp.get("width", 1280)))
+                    vh = max(1, int(vp.get("height", 800)))
+                    box = {"x": b[0] * vw, "y": b[1] * vh,
+                           "width": b[2] * vw, "height": b[3] * vh}
+            if box is None:
+                break
+            if 0 <= box["y"] <= int(vp.get("height", 800)):
+                visible = True
+                break
+            try:
+                await page.evaluate(
+                    "(dy) => window.scrollBy(0, dy)",
+                    box["y"] - int(vp.get("height", 800)) / 3)
+                await asyncio.sleep(0.3)
+            except Exception:
+                break
+        if box is None or not visible:
+            msg = (f"error: element #{action.element} unresolvable "
+                   f"(hidden or map shifted?)")
             log(msg)
             return msg
         cx = box["x"] + box["width"] / 2

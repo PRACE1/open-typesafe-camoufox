@@ -84,13 +84,36 @@ def test_build_state_shape():
     assert s["focused_field"]["role"] == "input"
     assert s["page_text"] == "hello" and s["history"] == ["a", "b"]
     assert s["tabs"] == 1
-    assert s["elements"][0]["sel"] == '[data-jev="0"]'
+    # The packet is model-facing: refs, never positional idx or selectors.
+    assert "idx" not in s["elements"][0] and "sel" not in s["elements"][0]
+    els2 = [ElementRef(idx=0, kind="input", label="Search", ref="e0")]
+    s2 = build_state(task="t", url="https://a.example", elements=els2,
+                     focused=FocusedField(role="input"), page_text="hello",
+                     history=["a", "b"], frame="f", grid="80x20")
+    assert s2["elements"][0]["ref"] == "e0"
 
 
 def test_build_state_tabs_param():
     s = build_state(task="t", url="u", elements=[], focused=FocusedField(),
                     page_text="", history=[], tabs=3)
     assert s["tabs"] == 3
+
+
+def test_find_elements_parses_durable_selector():
+    import asyncio
+
+    from src.perception import find_elements
+
+    class _FakePage:
+        url = "https://base.example/"
+        async def evaluate(self, js):
+            return [{"kind": "input", "text": "", "cx": 0.5, "cy": 0.4,
+                     "box": [0.4, 0.3, 0.2, 0.05],
+                     "durable": 'input[name="q"]'}]
+
+    els = asyncio.run(find_elements(type("P", (), {"page": _FakePage()})()))
+    assert els[0].sel == 'input[name="q"]'
+    assert els[0].ref == "e0"
 
 
 def test_norm_url_drops_tracking_keeps_query():
@@ -179,16 +202,45 @@ def test_find_elements_parses_region():
 
     from src.perception import MAX_ELEMENTS, find_elements
 
-    assert MAX_ELEMENTS == 60
+    assert MAX_ELEMENTS == 128
 
     class _FakePage:
         url = "https://base.example/"
         async def evaluate(self, js):
-            return [{"idx": 0, "kind": "link", "text": "R", "region": "main",
-                     "href": "https://a.example/", "cx": 0.1, "cy": 0.1}]
+            return [{"kind": "link", "text": "R", "region": "main",
+                     "href": "https://a.example/", "cx": 0.1, "cy": 0.1,
+                     "box": [0.05, 0.05, 0.2, 0.05]}]
 
     els = asyncio.run(find_elements(type("P", (), {"page": _FakePage()})()))
     assert els[0].region == "main"
+    assert (els[0].idx, els[0].ref) == (0, "e0")
+    assert els[0].box == (0.05, 0.05, 0.2, 0.05)
+
+
+def test_dedup_overlaps_keeps_outer_rassigns_refs():
+    from src.deps import ElementRef as _E
+    from src.perception import _dedup_overlaps
+
+    outer = _E(idx=0, kind="link", label="Out", ref="e0",
+               box=(0.0, 0.0, 0.5, 0.2))
+    inner = _E(idx=1, kind="button", label="In", ref="e1",
+               box=(0.05, 0.05, 0.1, 0.05))  # fully inside outer
+    side = _E(idx=2, kind="link", label="Side", ref="e2",
+              box=(0.6, 0.0, 0.2, 0.2))  # disjoint
+    kept = _dedup_overlaps([outer, inner, side])
+    assert [e.label for e in kept] == ["Out", "Side"]
+    nobox = _E(idx=3, kind="link", label="NoBox", ref="e3", box=None)
+    assert _dedup_overlaps([nobox]) == [nobox]
+
+
+def test_parse_box_rejects_malformed():
+    from src.perception import _parse_box
+
+    assert _parse_box([0.1, 0.2, 0.3, 0.1]) == (0.1, 0.2, 0.3, 0.1)
+    assert _parse_box(None) is None
+    assert _parse_box([0.1, 0.2, 0.0, 0.1]) is None
+    assert _parse_box("junk") is None
+    assert _parse_box([0.1, 0.2]) is None
 
 
 def test_excerpt_for_anchors_on_task_keywords():

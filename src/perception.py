@@ -22,7 +22,7 @@ from urllib.parse import urljoin, urlparse
 from .capability.element_probe import ELEMENT_PROBE_JS
 from .deps import ElementRef, FocusedField
 
-MAX_ELEMENTS = 60  # probe cap; well under Jev's 255-option Choice cap
+MAX_ELEMENTS = 128  # probe cap; well under Jev's 255-option Choice cap
 PAGE_TEXT_LIMIT = 1500
 NOTES_LIMIT = 2000  # chars of extractive notes kept across the run
 
@@ -257,8 +257,10 @@ async def find_elements(platform) -> list[ElementRef]:
                 except ValueError:
                     href = ""
             region = str(raw.get("region", "") or "")[:24]
+            box = _parse_box(raw.get("box"))
+            sel = str(raw.get("durable", "") or "")[:200]
             out.append(ElementRef(
-                idx=int(raw.get("idx", len(out))),
+                idx=len(out),
                 kind=str(raw.get("kind", "?")),
                 type=str(raw.get("type", "") or ""),
                 id=str(raw.get("id", "") or ""),
@@ -269,12 +271,62 @@ async def find_elements(platform) -> list[ElementRef]:
                 value_len=value_len,
                 href=href,
                 region=region,
+                box=box,
+                sel=sel,
                 cx=float(raw.get("cx", 0.5)),
                 cy=float(raw.get("cy", 0.5)),
             ))
         except (ValueError, TypeError):
             continue
+    out = _dedup_overlaps(out)
+    # Refs are positional and valid for this probe only: assign AFTER
+    # dedup/cap so ref eN always addresses out[N]. (playwright-cli contract.)
+    for i, e in enumerate(out):
+        e.idx = i
+        e.ref = f"e{i}"
     return out
+
+
+def _parse_box(raw: object) -> tuple[float, float, float, float] | None:
+    """Viewport-normalized rect (x, y, w, h in 0..1) or None when malformed."""
+    try:
+        x, y, w, h = (float(v) for v in (raw or []))  # type: ignore[union-attr]
+    except (ValueError, TypeError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return (x, y, w, h)
+
+
+def _dedup_overlaps(elements: list[ElementRef]) -> list[ElementRef]:
+    """Drop elements ≥80% contained in an earlier, larger box.
+
+    Nested interactive nodes (a > button, input in label) double-report the
+    same click target; keeping the larger (usually outer) box gives one ref
+    per target and bounds Jev's context — our flat equivalent of
+    playwright-cli's --depth trimming.
+    """
+    kept: list[ElementRef] = []
+    for e in elements:
+        if e.box is None:
+            kept.append(e)
+            continue
+        x, y, w, h = e.box
+        area = w * h
+        drop = False
+        for k in kept:
+            if k.box is None:
+                continue
+            kx, ky, kw, kh = k.box
+            ix = max(0, min(x + w, kx + kw) - max(x, kx))
+            iy = max(0, min(y + h, ky + kh) - max(y, ky))
+            inter = ix * iy
+            if area and inter / area >= 0.8 and kw * kh >= area:
+                drop = True
+                break
+        if not drop:
+            kept.append(e)
+    return kept
 
 
 async def get_page_text(platform, limit: int = PAGE_TEXT_LIMIT) -> str:
@@ -377,11 +429,10 @@ def build_state(*, task: str, url: str, elements: list[ElementRef],
         "notes": list(notes or [])[-6:],
         "visited": list(visited or [])[-10:],
         "elements": [
-            {"idx": e.idx, "kind": e.kind, "type": e.type, "label": e.label,
+            {"ref": e.ref, "kind": e.kind, "type": e.type, "label": e.label,
              "placeholder": e.placeholder, "text": e.text, "cx": e.cx, "cy": e.cy,
              "value_len": e.value_len, "href": e.href,
-             "region": e.region, "host": host_of(e.href),
-             "sel": f'[data-jev="{e.idx}"]'}
+            "region": e.region, "host": host_of(e.href)}
             for e in elements
         ],
         "focused_field": {

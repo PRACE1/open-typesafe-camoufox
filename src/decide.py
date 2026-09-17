@@ -6,7 +6,8 @@ options (overlapping options read as doubt and tank confidence):
 
   kind : Choice over the action verbs — wait | click_item | type_at |
          goto | done | none
-  item : Choice over the element-map idx (used by click_item / type_at)
+  item : Choice over the element-map refs eN (used by click_item /
+         type_at / challenge; decoded to the positional idx)
   site : Choice over the run's URL catalog + "other" (used by goto;
          "other" means the writer proposes a URL, code-revalidated)
 
@@ -165,13 +166,17 @@ async def _post(payload: dict, timeout_s: float, base: str, key: str) -> dict:
 def _item_option(e: ElementRef, visited: set[str]) -> dict[str, Any]:
     """Structured Choice option: the model sees what the element is, what it
     holds, where it points, and whether it was already visited — the full
-    capability context for this selector, not just a label."""
+    capability context for this ref, not just a label. Keyed by ephemeral
+    ref (eN); the harness maps the chosen ref back to its idx."""
     label = e.label or e.placeholder or e.text or e.id or "?"
     state = "-"
     if e.kind in ("input", "textarea", "select") or e.type:
         state = f"filled({e.value_len}ch)" if e.value_len else "empty"
+    box = ""
+    if e.box is not None:
+        box = ",".join(f"{v:.3f}" for v in e.box)
     return {
-        "label": label,
+        "label": f"{e.ref}: {e.kind} \"{label}\"",
         "kind": e.kind,
         "type": e.type,
         "text": e.text,
@@ -180,7 +185,8 @@ def _item_option(e: ElementRef, visited: set[str]) -> dict[str, Any]:
         "region": e.region,
         "state": state,
         "at": f"{e.cx:.3f},{e.cy:.3f}",
-        "sel": f'[data-jev="{e.idx}"]',
+        "box": box,
+        "ref": e.ref,
         "visited": bool(e.href and norm_url(e.href) in visited),
     }
 
@@ -196,7 +202,7 @@ def build_questions(elements: list[ElementRef], sites: list[str],
     the run on the task-completion spectrum for long-horizon tracking.
     """
     vset = set(visited or [])
-    item_criteria = {str(e.idx): _item_option(e, vset) for e in elements[:MAX_ITEMS]}
+    item_criteria = {e.ref: _item_option(e, vset) for e in elements[:MAX_ITEMS]}
     if not item_criteria:
         item_criteria = {"-1": "No actionable elements on this page"}
     site_criteria: dict[str, Any] = {str(i): url[:160] for i, url in enumerate(sites)}
@@ -213,10 +219,10 @@ def build_questions(elements: list[ElementRef], sites: list[str],
         "item": {
             "type": "choice",
             "instructions": {
-                "question": "Which element should click_item/type_at act on?",
+                "question": "Which element should click_item/type_at/challenge act on?",
                 "focus": "Used only for those kinds; still pick the best candidate. "
-                         "Each option carries its label, text, href, fill-state, "
-                         "selector, and visited mark.",
+                         "Each option carries its ref, label, text, href, fill-state, "
+                         "box, and visited mark.",
             },
             "criteria": item_criteria,
         },
@@ -291,6 +297,97 @@ def build_questions(elements: list[ElementRef], sites: list[str],
     return questions
 
 
+class HealStrategy(str, Enum):
+    """Recovery vocabulary for the heal state (decide_heal_action)."""
+
+    REMAP_STALE = "remap_stale"
+    DISMISS_COVER = "dismiss_cover"
+    DRAG_SLIDER = "drag_slider"
+    SOLVE_CHALLENGE = "solve_challenge"
+    EXPAND_CAPABILITY = "expand_capability"
+    ABORT = "abort"
+
+
+HEAL_CRITERIA: dict[str, str] = {
+    HealStrategy.REMAP_STALE.value: "Target moved or map re-rendered; re-probe and act on the fresh ref",
+    HealStrategy.DISMISS_COVER.value: "Overlay, dropdown, or toast covers the target; dismiss it, then re-act",
+    HealStrategy.DRAG_SLIDER.value: "Target is a drag handle or slide-to-verify control",
+    HealStrategy.SOLVE_CHALLENGE.value: "Checkbox, Turnstile-style, or human-verification control blocks the task",
+    HealStrategy.EXPAND_CAPABILITY.value: "A novel widget needs a synthesized capability (wallet popup, canvas, custom drag)",
+    HealStrategy.ABORT.value: "Unrecoverable blocker; stop the run honestly",
+}
+
+
+async def decide_heal_action(*, error_msg: str, last_kind: str,
+                             page_text: str,
+                             timeout_s: float = 15.0) -> tuple[HealStrategy, float]:
+    """Triage an execution failure into a recovery strategy + novelty score.
+
+    One Jev request: a strategy Choice plus a need_new_cap Noul (probability
+    the blocker needs a synthesized capability). No-key fallback returns
+    (REMAP_STALE, 0.0) so the loop keeps its current remap behavior offline.
+    """
+    base, key, model = _env()
+    if not key:
+        return HealStrategy.REMAP_STALE, 0.0
+    payload: dict[str, Any] = {
+        "model": model,
+        "state": {"error": (error_msg or "")[:300],
+                  "last_action": last_kind,
+                  "page_excerpt": (page_text or "")[:400]},
+        "questions": {
+            "strategy": {
+                "type": "choice",
+                "instructions": {
+                    "question": "What recovery strategy resolves this execution failure?",
+                    "focus": ("Pick expand_capability only when the page needs a widget "
+                              "interaction no basic verb covers; prefer the concrete "
+                              "remap/dismiss/drag/challenge options otherwise."),
+                },
+                "criteria": dict(HEAL_CRITERIA),
+            },
+            "need_new_cap": {
+                "type": "noul",
+                "instructions": {
+                    "question": "Does this blocker require synthesizing a new browser capability?",
+                    "focus": "YES only for novel widgets; NO for moved targets, overlays, sliders, and checkboxes.",
+                },
+            },
+        },
+    }
+    try:
+        data = await _post(payload, timeout_s, base, key)
+    except Exception:
+        return HealStrategy.REMAP_STALE, 0.0
+    answers = data.get("answers", {}) if isinstance(data, dict) else {}
+    strat_raw = str(answers.get("strategy", {}).get("choice", ""))
+    try:
+        strategy = HealStrategy(strat_raw)
+    except ValueError:
+        strategy = HealStrategy.REMAP_STALE
+    try:
+        need = float(answers.get("need_new_cap", {}).get("noul", 0.0) or 0.0)
+    except (ValueError, TypeError):
+        need = 0.0
+    return strategy, min(max(need, 0.0), 1.0)
+
+
+def ref_to_idx(choice: str, elements: list[ElementRef]) -> int:
+    """Map a chosen item back to its positional idx.
+
+    Accepts ephemeral refs (e4) and, for backward compatibility with cached
+    prompts, bare ints (4). Returns -1 when unresolvable (sentinel → idle).
+    """
+    text = (choice or "").strip()
+    if text.startswith("e"):
+        text = text[1:]
+    try:
+        cand = int(text)
+    except (ValueError, TypeError):
+        return -1
+    return cand if any(e.idx == cand for e in elements) else -1
+
+
 def _decode(decision_raw: dict, elements: list[ElementRef], sites: list[str]) -> JevDecision:
     answers = decision_raw.get("answers", {})
     kind_raw = answers.get("kind", {})
@@ -305,14 +402,10 @@ def _decode(decision_raw: dict, elements: list[ElementRef], sites: list[str]) ->
         confidence = 0.0
 
     element_idx: int | None = None
-    if kind in (Kind.CLICK_ITEM, Kind.TYPE_AT):
+    if kind in (Kind.CLICK_ITEM, Kind.TYPE_AT, Kind.CHALLENGE):
         item_raw = answers.get("item", {})
-        try:
-            cand = int(str(item_raw.get("choice", "-1")))
-        except (ValueError, TypeError):
-            cand = -1
-        valid = {e.idx for e in elements}
-        element_idx = cand if cand in valid else None
+        cand = ref_to_idx(str(item_raw.get("choice", "-1")), elements)
+        element_idx = cand if cand >= 0 else None
 
     target_url: str | None = None
     propose_url = False

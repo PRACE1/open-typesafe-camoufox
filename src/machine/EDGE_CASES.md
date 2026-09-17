@@ -30,6 +30,9 @@ IDs used in commit messages and the run log (`EDGE #n`).
 | 22 | Login wall (account required) | task needs auth, no session | NOT handled — planner-visible; requires human credentials (out of scope by design) | open |
 | 23 | Checkbox / slider challenge | control labeled consent/captcha-checkbox/slide-to-verify | `challenge` kind → `challenge_control`: verified toggle, 8-step humanized drag + settle | handled (`actions.py`) |
 | 24 | Image / puzzle CAPTCHA | captcha/recaptcha/puzzle markers on the control | `challenge_control` refuses out loud; runner stops honestly (`image challenge needs a human`) instead of burning no-ops | handled (`actions.py`, `runner.py`) |
+| 25 | Ref shift after re-render | nth slot holds a different kind/label | `_resolve_target` cross-check → `stale` verdict, no dispatch; heal triage remaps by label | handled (`actions.py`, `decide.py`, `runner.py`) |
+| 26 | Hover-opened menu covers click | `covered:` verdict right after highlight | `verify_for_dispatch` dismisses once via Escape and re-verifies before refusing | handled (`actions.py`) |
+| 27 | Novel widget (wallet popup, canvas) | triage `expand_capability` + novelty ≥ 0.70 | writer synthesizes `execute(platform, ref, ctx)`; AST + signature + 3s dry-run gates; register `heal_step<N>`, execute once, audit to run dir | handled (`writer.py`, `capability/validator.py`, `capability/dynamic_registry.py`, `runner.py`) |
 
 ## Notes on #6 (blocked pages)
 

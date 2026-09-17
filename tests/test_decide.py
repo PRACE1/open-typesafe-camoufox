@@ -3,14 +3,16 @@
 import asyncio
 
 from src.decide import (
-    Kind, KIND_CRITERIA, MAX_ITEMS, JevDecision,
-    build_questions, decide_action,
+    HEAL_CRITERIA, HealStrategy, Kind, KIND_CRITERIA, MAX_ITEMS, JevDecision,
+    build_questions, decide_action, decide_heal_action, ref_to_idx,
 )
 from src.deps import ElementRef, FocusedField
 
 
 def _els(n):
-    return [ElementRef(idx=i, kind="link", label=f"l{i}", cx=0.1, cy=0.1) for i in range(n)]
+    return [ElementRef(idx=i, kind="link", label=f"l{i}", ref=f"e{i}",
+                       box=(0.01, 0.05, 0.1, 0.05), cx=0.1, cy=0.1)
+            for i in range(n)]
 
 
 def test_kinds_mutually_exclusive():
@@ -64,13 +66,16 @@ def test_approval_decode_and_default():
 
 def test_item_options_are_structured():
     from src.deps import ElementRef as _E
-    els = [_E(idx=0, kind="input", type="text", label="Search",
+    els = [_E(idx=0, kind="input", type="text", label="Search", ref="e0",
+              box=(0.01, 0.05, 0.1, 0.05),
               text="", href="", cx=0.5, cy=0.4, value="q", value_len=1)]
     q = build_questions(els, ["https://a.example"],
                         visited=["https://other.example/"])
-    opt = q["item"]["criteria"]["0"]
-    assert opt["label"] == "Search" and opt["state"] == "filled(1ch)"
-    assert opt["sel"] == '[data-jev="0"]' and opt["visited"] is False
+    assert set(q["item"]["criteria"]) == {"e0"}
+    opt = q["item"]["criteria"]["e0"]
+    assert opt["label"] == 'e0: input "Search"' and opt["state"] == "filled(1ch)"
+    assert opt["ref"] == "e0" and opt["box"] == "0.010,0.050,0.100,0.050"
+    assert opt["visited"] is False
 
 
 def test_item_choice_caps_at_255():
@@ -129,9 +134,24 @@ def _decode(raw, n=3):
 
 
 def test_decode_click_item():
-    d = _decode(_raw("click_item", item="2"))
+    d = _decode(_raw("click_item", item="e2"))
     assert d.kind == Kind.CLICK_ITEM and d.element_idx == 2 and d.confidence == 0.9
     assert d.need_text is False
+
+
+def test_decode_bare_int_item_compat():
+    d = _decode(_raw("click_item", item="2"))
+    assert d.element_idx == 2
+
+
+def test_decode_challenge_item():
+    d = _decode(_raw("challenge", item="e1"))
+    assert d.kind == Kind.CHALLENGE and d.element_idx == 1
+
+
+def test_decode_bad_ref_is_none():
+    assert _decode(_raw("click_item", item="e9")).element_idx is None
+    assert _decode(_raw("click_item", item="bogus")).element_idx is None
 
 
 def test_decode_type_at_needs_text():
@@ -173,3 +193,54 @@ def test_no_key_fallback_is_none(monkeypatch):
     ))
     assert isinstance(d, JevDecision) and d.kind == Kind.NONE and d.confidence == 0.0
     assert d.page_ready == 0.0 and d.needs_text == 0.0 and d.task_done == 0.0
+
+
+def test_heal_strategies_cover_criteria():
+    assert set(HEAL_CRITERIA) == {s.value for s in HealStrategy}
+    assert len(HealStrategy) == 6
+
+
+def test_ref_to_idx_maps_refs_and_bare_ints():
+    els = _els(3)
+    assert ref_to_idx("e2", els) == 2
+    assert ref_to_idx("2", els) == 2
+    assert ref_to_idx("e9", els) == -1
+    assert ref_to_idx("bogus", els) == -1
+    assert ref_to_idx("", els) == -1
+
+
+def test_heal_triage_no_key_falls_back_to_remap(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    strat, need = asyncio.run(decide_heal_action(
+        error_msg="error: element #2 stale map", last_kind="click_item",
+        page_text="p"))
+    assert strat == HealStrategy.REMAP_STALE and need == 0.0
+
+
+def test_heal_triage_decodes_strategy_and_clamps_noul(monkeypatch):
+    import src.decide as _decide
+
+    async def _fake_post(payload, timeout_s, base, key):
+        assert "strategy" in payload["questions"]
+        return {"answers": {"strategy": {"choice": "dismiss_cover"},
+                            "need_new_cap": {"noul": 9.9}}}
+
+    monkeypatch.setattr(_decide, "_post", _fake_post)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    strat, need = asyncio.run(decide_heal_action(
+        error_msg="error: covered", last_kind="click_item", page_text="p"))
+    assert strat == HealStrategy.DISMISS_COVER and need == 1.0
+
+
+def test_heal_triage_invalid_choice_falls_back(monkeypatch):
+    import src.decide as _decide
+
+    async def _fake_post(payload, timeout_s, base, key):
+        return {"answers": {"strategy": {"choice": "teleport"},
+                            "need_new_cap": {"noul": "junk"}}}
+
+    monkeypatch.setattr(_decide, "_post", _fake_post)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    strat, need = asyncio.run(decide_heal_action(
+        error_msg="e", last_kind="click_item", page_text="p"))
+    assert strat == HealStrategy.REMAP_STALE and need == 0.0

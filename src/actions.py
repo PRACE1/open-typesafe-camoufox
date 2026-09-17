@@ -499,14 +499,24 @@ async def click_item(platform, elements: list[ElementRef], idx: int,
 
 
 def _challenge_kind(el: ElementRef) -> str:
-    """Classify a challenge control: slider / checkbox / captcha / none."""
+    """Classify a challenge control: slider / checkbox / captcha / none.
+
+    Native role is authoritative: a checkbox is ALWAYS attempted via
+    verified click — including "I'm not a robot" (a grid follow-up is a
+    next-step problem, not a reason to refuse the toggle). Text markers
+    only classify non-checkbox elements (image grids, puzzle links).
+    """
+    if el.kind == "checkbox":
+        return "checkbox"
+    if el.kind == "slider":
+        return "slider"
     blob = f"{el.kind} {el.type} {el.label} {el.placeholder} {el.text} {el.id}".lower()
     if any(k in blob for k in ("captcha", "recaptcha", "puzzle", "verify you are human",
                                "i'm not a robot", "not a robot")):
         return "captcha"
     if "slider" in blob or "slide to" in blob or "drag" in blob:
         return "slider"
-    if "checkbox" in blob or el.kind == "checkbox":
+    if "checkbox" in blob:
         return "checkbox"
     return "none"
 

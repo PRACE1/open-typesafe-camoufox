@@ -111,6 +111,18 @@ EFFECT_KINDS = ("click_item", "press_enter", "press_escape", "refresh", "back", 
 STOP_AFTER_NOOPS = 3
 
 
+# Consecutive image-challenge dead-ends before an honest stop. The runner
+# must TRY (checkbox attempts, waits, re-observes, alternate routes), never
+# stop on first contact; image grids are unsolvable without vision, so the
+# budget bounds the attempts instead of hope.
+CAPTCHA_MAX_ATTEMPTS = 8
+
+
+def captcha_should_stop(streak: int, cap: int = CAPTCHA_MAX_ATTEMPTS) -> bool:
+    """True when image-challenge dead-ends exhaust the attempt budget."""
+    return streak >= cap
+
+
 def proposal_executable(proposed: ProposedAction | None, elements: list) -> bool:
     """True when an LLM-proposed candidate is safe to execute on approval.
 
@@ -408,8 +420,11 @@ async def run_decide_session(
     # Heal bookkeeping, reset each step at the loop top:
     # heal_edge tracks an ACT->HEAL detour so VERIFY advances correctly.
     heal_edge: str | None = None
-    # challenge_stop carries a captcha escalation to a terminal stop.
-    challenge_stop: str | None = None
+    # captcha_streak counts consecutive image-challenge dead-ends across
+    # steps; step_captcha marks the current step so any other outcome
+    # resets the streak (progress breaks the siege).
+    captcha_streak = 0
+    step_captcha = False
     steer_consumed = 0
     started = datetime.now().isoformat(timespec="seconds")
     t_end = None if budget_s <= 0 else time.time() + budget_s
@@ -442,9 +457,9 @@ async def run_decide_session(
             elif state_id(machine) != "see":
                 advance(machine, phase_trail, "continue_run")  # verify -> see
             heal_edge = None
-            challenge_stop = None
             heal_abort = None
             heal_accounted = False
+            step_captcha = False
             # Per-step timing: answers "why is the run slow" with data —
             # propose (writer LLM), decide (Jev), act (dispatch + settle).
             t_top = time.time()
@@ -954,14 +969,17 @@ async def run_decide_session(
                                                         expected_kind=by_idx[idx].kind)
                     log(f"RESULT {res}")
                     if "escalating" in res:
-                        # Image/puzzle CAPTCHA: dead end for the runner — stop
-                        # honestly after verify instead of burning no-ops.
+                        # Image/puzzle CAPTCHA: TRY, don't stop — checkbox
+                        # attempts, waits, and re-observes continue; only a
+                        # sustained siege (streak at cap) ends the run.
+                        # Neutral like wait: a blocked page is environmental,
+                        # not doubt, so it never feeds the no-op counter.
                         history.append(f"step {steps}: image challenge — {res}")
                         entry["act"] = f"element #{idx} challenge"
                         entry["result"] = res
-                        noops += 1
-                        challenge_stop = (
-                            f"step {steps}: image challenge needs a human — {res[:120]}")
+                        step_captcha = True
+                        captcha_streak += 1
+                        log(f"CAPTCHA image/puzzle dead-end x{captcha_streak}/{CAPTCHA_MAX_ATTEMPTS} — keep trying")
                     elif action_failed(res):
                         history.append(f"step {steps}: challenge failed — {res}")
                         entry["act"] = f"element #{idx} challenge"
@@ -1350,16 +1368,19 @@ async def run_decide_session(
                     history.append(f"step {steps}: DONE (synthesized) — {verdict.note[:80]}")
                     log(f"DONE   {verdict.note[:120]}")
 
+            if not step_captcha:
+                captcha_streak = 0
             if noops >= STOP_AFTER_NOOPS and not done and not stopped:
                 stopped = True
                 stop_reason = f"{STOP_AFTER_NOOPS} consecutive no-ops"
                 advance(machine, phase_trail, "abort")  # verify -> stopped
                 log(f"STOP   {STOP_AFTER_NOOPS} consecutive no-ops — ending run")
-            if challenge_stop is not None and not done and not stopped:
+            if captcha_should_stop(captcha_streak) and not done and not stopped:
                 stopped = True
-                stop_reason = challenge_stop
+                stop_reason = (f"image challenge persisted after "
+                               f"{captcha_streak} attempts — needs a human")
                 advance(machine, phase_trail, "abort")  # verify -> stopped
-                log(f"STOP   image challenge — ending run honestly")
+                log(f"STOP   {stop_reason} — ending run honestly")
             if heal_abort is not None and not done and not stopped:
                 stopped = True
                 stop_reason = heal_abort

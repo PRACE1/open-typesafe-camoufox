@@ -48,8 +48,12 @@ ARIA_IDENTITY_JS = """(el) => {
   const tag = (el.tagName || '').toLowerCase();
   const get = (a) => (el.getAttribute ? String(el.getAttribute(a) || '') : '');
   const text = (el.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 40);
+  const type = get('type');
+  let kind = tag === 'a' ? 'link' : tag;
+  if (tag === 'input' && type === 'checkbox') kind = 'checkbox';
+  if (tag === 'input' && type === 'range') kind = 'slider';
   return {
-    kind: tag === 'a' ? 'link' : tag,
+    kind: kind,
     role: get('role'),
     label: (get('aria-label') || text || get('placeholder') || get('value') || '').slice(0, 80),
   };

@@ -742,6 +742,10 @@ def test_challenge_classification():
     assert _challenge_kind(_el(1, label="Slide to verify")) == "slider"
     assert _challenge_kind(ElementRef(idx=1, kind="checkbox", label="Remember")) == "checkbox"
     assert _challenge_kind(_el(1, label="Next page")) == "none"
+    # Sorry-page regression: the recaptcha CHECKBOX must toggle, never escalate.
+    assert _challenge_kind(ElementRef(
+        idx=0, kind="checkbox", label="I'm not a robot")) == "checkbox"
+    assert _challenge_kind(ElementRef(idx=2, kind="slider", label="")) == "slider"
 
 
 def _pad(elements, n):

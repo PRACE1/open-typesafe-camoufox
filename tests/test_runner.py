@@ -3,8 +3,10 @@
 import pytest
 
 from src.runner import (
-    APPROVAL_FALLBACK, APPROVAL_MIN, BARE_CLICK_VETO_KINDS, EFFECT_KINDS,
-    OVERRIDABLE_KINDS, READING_COOLDOWN_STEPS, Phase, credential_placeholder,
+    APPROVAL_FALLBACK, APPROVAL_MIN, BARE_CLICK_VETO_KINDS,
+    CAPTCHA_MAX_ATTEMPTS, EFFECT_KINDS,
+    OVERRIDABLE_KINDS, READING_COOLDOWN_STEPS, Phase, captcha_should_stop,
+    credential_placeholder,
     fresh_tabs, loop_guard_trip, no_effect_trip, page_settled, phase_step,
     proposal_executable, reading_cooldown_active, resolve_proposal_action,
     should_override, should_submit_instead,
@@ -173,6 +175,15 @@ def test_no_effect_trip_strictly_consecutive():
     assert no_effect_trip(True, fp, fp, True, None) is False
     assert no_effect_trip(True, fp, fp, True, "heal_step5") is True
     assert no_effect_trip(True, fp, fp, True, "challenge") is True
+
+
+def test_captcha_budget_try_then_honest_stop():
+    assert CAPTCHA_MAX_ATTEMPTS == 8
+    assert captcha_should_stop(0) is False
+    assert captcha_should_stop(7) is False
+    assert captcha_should_stop(8) is True
+    assert captcha_should_stop(12) is True
+    assert captcha_should_stop(8, cap=9) is False
 
 
 def test_should_submit_instead():

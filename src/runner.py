@@ -27,10 +27,12 @@ from datetime import datetime
 from enum import Enum
 
 from . import perception
-from .actions import action_failed, click_item, goto_url, press_key, type_at
+from .actions import action_failed, challenge_control, click_item, goto_url, heal_target, press_key, type_at
 from .capability.human_move import HUMANIZE_LEVEL
 from .decide import Kind, decide_action
 from .deps import RunState
+from .machine.run_engine import EDGES as _ENGINE_EDGES
+from .machine.run_engine import RunMachine, advance, state_id
 from .perception import is_credential_element
 from .writer import ProposedAction, compose_text, propose_action, propose_url, summarize_task
 
@@ -97,7 +99,7 @@ BARE_CLICK_VETO_KINDS = ("input", "textarea", "select")
 # on purpose: typing never changes body text, so every type would read as
 # "no effect" (repeat-typing is the loop-guard's job, and clear-before-type
 # keeps retypes idempotent).
-EFFECT_KINDS = ("click_item", "press_enter", "press_escape", "refresh", "back")
+EFFECT_KINDS = ("click_item", "press_enter", "press_escape", "refresh", "back", "challenge")
 
 
 # Consecutive doubt no-ops before the run ends. High enough to survive a
@@ -256,12 +258,15 @@ def reading_cooldown_active(steps: int, until_step: int) -> bool:
 
 
 class Phase(str, Enum):
-    """Run-loop phases — the explicit Python state machine.
+    """Run-loop phase names — the transcript vocabulary.
 
+    Transition truth lives in src/machine/run_engine.py (RunMachine +
+    EDGES); phase_step below is a thin adapter over that table so the
+    classic walks keep working, and the loop body emits through advance().
     Every step walks SEE -> DECIDE -> GATE -> [ACT] -> VERIFY and ends in
     DONE/STOPPED. Idle paths skip ACT (GATE -> VERIFY). DONE is accepted in
-    GATE; stops are decided in VERIFY (or STEER). phase_step raises on an
-    illegal move so a broken loop fails loudly instead of drifting.
+    GATE; stops are decided in VERIFY (or STEER). A stale/covered click
+    detours ACT -> HEAL -> ACT (one re-attempt) or ACT -> HEAL -> VERIFY.
     """
 
     SEE = "see"
@@ -269,28 +274,22 @@ class Phase(str, Enum):
     GATE = "gate"
     ACT = "act"
     VERIFY = "verify"
+    HEAL = "heal"
     DONE = "done"
     STOPPED = "stopped"
 
 
-_PHASE_EDGES: dict[str, set[str]] = {
-    Phase.SEE.value: {Phase.DECIDE.value, Phase.STOPPED.value},
-    Phase.DECIDE.value: {Phase.GATE.value},
-    Phase.GATE.value: {Phase.ACT.value, Phase.VERIFY.value, Phase.DONE.value, Phase.STOPPED.value},
-    Phase.ACT.value: {Phase.VERIFY.value},
-    Phase.VERIFY.value: {Phase.SEE.value, Phase.DONE.value, Phase.STOPPED.value},
-    Phase.DONE.value: set(),
-    Phase.STOPPED.value: set(),
-}
-
-
 def phase_step(phases: list[str], nxt: Phase | str) -> list[str]:
-    """Append a phase transition; raise on an illegal move."""
+    """Append a phase transition; raise on an illegal move.
+
+    Validates against the engine's edge table (single source of truth),
+    so a broken loop fails loudly instead of drifting.
+    """
     nxt_v = nxt.value if isinstance(nxt, Phase) else str(nxt)
     if not phases:
         if nxt_v != Phase.SEE.value:
             raise ValueError(f"run must start at SEE, got {nxt_v}")
-    elif nxt_v not in _PHASE_EDGES.get(phases[-1], set()):
+    elif nxt_v not in _ENGINE_EDGES.get(phases[-1], set()):
         raise ValueError(f"illegal phase transition {phases[-1]} -> {nxt_v}")
     phases.append(nxt_v)
     return phases
@@ -386,9 +385,17 @@ async def run_decide_session(
     reading_until_step: int = 0
     last_page_id: int | None = None
     phase_trail: list[str] = []
+    # One declarative engine per session; every phase below is emitted
+    # through advance(), so an illegal move raises instead of drifting.
+    machine = RunMachine()
+    # Heal bookkeeping, reset each step at the loop top:
+    # heal_edge tracks an ACT->HEAL detour so VERIFY advances correctly.
+    heal_edge: str | None = None
+    # challenge_stop carries a captcha escalation to a terminal stop.
+    challenge_stop: str | None = None
     steer_consumed = 0
     started = datetime.now().isoformat(timespec="seconds")
-    t_end = time.time() + budget_s
+    t_end = None if budget_s <= 0 else time.time() + budget_s
 
     async with AsyncCamoufox(headless=headless, humanize=humanize) as browser:
         page = await browser.new_page()
@@ -405,7 +412,7 @@ async def run_decide_session(
         known_tab_ids = platform.tab_ids()
         last_page_id = id(platform.page)
 
-        while time.time() < t_end and steps < max_steps and not done and not stopped:
+        while (t_end is None or time.time() < t_end) and steps < max_steps and not done and not stopped:
             if paused:
                 log("PAUSED — human has the cursor; steer 'resume' to continue")
                 await asyncio.sleep(5)
@@ -413,7 +420,18 @@ async def run_decide_session(
             steps += 1
             entry: dict = {"n": steps, "t": round(time.time(), 1)}
             log(f"──── step {steps}/{max_steps} " + "─" * 40)
-            phase_step(phase_trail, Phase.SEE)
+            if not phase_trail:
+                phase_trail.append(state_id(machine))  # == "see"
+            elif state_id(machine) != "see":
+                advance(machine, phase_trail, "continue_run")  # verify -> see
+            heal_edge = None
+            challenge_stop = None
+            # Per-step timing: answers "why is the run slow" with data —
+            # propose (writer LLM), decide (Jev), act (dispatch + settle).
+            t_top = time.time()
+            t_proposed = t_top
+            t_decided = t_top
+            t_acted_at = t_top
             effective_task = task_text + (
                 "\nNEW INSTRUCTIONS:\n" + "\n".join(instructions[-5:])
                 if instructions else ""
@@ -527,7 +545,7 @@ async def run_decide_session(
                     instructions.append(payload)
             if stopped or paused:
                 if stopped:
-                    phase_step(phase_trail, Phase.STOPPED)
+                    advance(machine, phase_trail, "abort")  # see -> stopped
                 entry["phases"] = list(phase_trail)
                 report_mod.append_transcript(run_dir, entry)
                 if stopped:
@@ -579,6 +597,7 @@ async def run_decide_session(
                              "next step toward the TASK; answer NO if any other "
                              "action (including waiting) serves the task better.",
                 }
+            t_proposed = time.time()
 
             # DECIDE
             try:
@@ -594,15 +613,15 @@ async def run_decide_session(
                 entry["decide"] = f"failed: {exc}"
                 history.append(f"step {steps}: decide failed, idled")
                 noops += 1
-                phase_step(phase_trail, Phase.DECIDE)
-                phase_step(phase_trail, Phase.GATE)
-                phase_step(phase_trail, Phase.VERIFY)
+                advance(machine, phase_trail, "perceived")  # see -> decide
+                advance(machine, phase_trail, "decided")  # decide -> gate
+                advance(machine, phase_trail, "idle_now")  # gate -> verify
                 entry["phases"] = list(phase_trail)
                 report_mod.append_transcript(run_dir, entry)
                 await asyncio.sleep(interval)
                 continue
             conf = decision.confidence
-            phase_step(phase_trail, Phase.DECIDE)
+            advance(machine, phase_trail, "perceived")  # see -> decide
             # The model-side settle flag can only add patience, never remove
             # the regex guard: a loading verdict forces wait even on readable
             # text, but a ready verdict never overrides a loading regex.
@@ -705,8 +724,9 @@ async def run_decide_session(
             # the decision, but a confident classifier can still fixate
             # (same click 5x). Three identical click/type targets in a row
             # force a wait here instead of executing again.
+            t_decided = time.time()
             guard_trip = False
-            if decision.kind in (Kind.CLICK_ITEM, Kind.TYPE_AT) and decision.element_idx is not None:
+            if decision.kind in (Kind.CLICK_ITEM, Kind.TYPE_AT, Kind.CHALLENGE) and decision.element_idx is not None:
                 guard_sig = (
                     decision.kind.value, decision.element_idx,
                     next(((e.label or e.text or "")[:40] for e in elements
@@ -717,7 +737,7 @@ async def run_decide_session(
                 )
                 guard_trip, sig_run = loop_guard_trip(last_sig, sig_run, guard_sig)
                 last_sig = guard_sig
-            phase_step(phase_trail, Phase.GATE)
+            advance(machine, phase_trail, "decided")  # decide -> gate
             acted = False
             if conf < min_confidence and decision.kind not in (Kind.DONE,):
                 log(f"GATE   conf {conf:.2f} < {min_confidence} — idle (no-op {noops + 1})")
@@ -764,7 +784,7 @@ async def run_decide_session(
                     full_note = " | ".join(notes[-3:]) or page_text.strip()
                     note = full_note[:300]
                     done = True
-                    phase_step(phase_trail, Phase.DONE)
+                    advance(machine, phase_trail, "finish")  # gate -> done
                     entry["act"] = f"DONE ({note[:80]})"
                     history.append(f"step {steps}: DONE — {note[:80]}")
                     log(f"DONE   {note[:120]}")
@@ -880,6 +900,41 @@ async def run_decide_session(
                 moves += 1
                 noops = 0
                 acted = True
+            elif decision.kind == Kind.CHALLENGE:
+                idx = decision.element_idx
+                by_idx = {e.idx: e for e in elements}
+                if idx is None or idx not in by_idx:
+                    log("ACT    challenge without valid item — idle")
+                    history.append(f"step {steps}: challenge without item, idled")
+                    entry["act"] = "challenge (no item)"
+                    noops += 1
+                else:
+                    log(f"ACT    element #{idx} challenge")
+                    res = await challenge_control(platform, elements, idx,
+                                                        expected_kind=by_idx[idx].kind)
+                    log(f"RESULT {res}")
+                    if "escalating" in res:
+                        # Image/puzzle CAPTCHA: dead end for the runner — stop
+                        # honestly after verify instead of burning no-ops.
+                        history.append(f"step {steps}: image challenge — {res}")
+                        entry["act"] = f"element #{idx} challenge"
+                        entry["result"] = res
+                        noops += 1
+                        challenge_stop = (
+                            f"step {steps}: image challenge needs a human — {res[:120]}")
+                    elif action_failed(res):
+                        history.append(f"step {steps}: challenge failed — {res}")
+                        entry["act"] = f"element #{idx} challenge"
+                        entry["result"] = res
+                        noops += 1
+                    else:
+                        entry["act"] = f"element #{idx} challenge"
+                        entry["result"] = res
+                        history.append(f"step {steps}: worked challenge #{idx} — {res}")
+                        moves += 1
+                        noops = 0
+                        acted = True
+                        last_effect_kind = "challenge"
             else:  # CLICK_ITEM / TYPE_AT
                 idx = decision.element_idx
                 by_idx = {e.idx: e for e in elements}
@@ -902,6 +957,35 @@ async def run_decide_session(
                         res = await click_item(platform, elements, idx,
                                                      expected_kind=by_idx[idx].kind)
                         log(f"RESULT {res}")
+                        # Self-healing retry: a stale map or covered target
+                        # detours ACT -> HEAL -> ACT for exactly one re-attempt
+                        # (remapped by label), else ACT -> HEAL -> VERIFY.
+                        if action_failed(res) and ("stale map" in res
+                                                   or "target covered" in res):
+                            old_label = (target.label or target.placeholder
+                                         or target.text or target.id or "")
+                            log(f"HEAL   {res[:90]} — re-probing once")
+                            history.append(f"step {steps}: click failed, healing — {res[:90]}")
+                            advance(machine, phase_trail, "act_now")  # gate -> act
+                            advance(machine, phase_trail, "heal_needed")  # act -> heal
+                            new_idx = await heal_target(platform, old_label,
+                                                        target.kind)
+                            if new_idx is not None and new_idx != idx:
+                                log(f"HEAL   remapped #{idx} -> #{new_idx} — one re-attempt")
+                                history.append(f"step {steps}: healed #{idx} -> #{new_idx}, retrying")
+                                # The fresh probe owns the DOM selector; the
+                                # step's element list only supplies labels.
+                                res = await click_item(platform, elements, new_idx,
+                                                             expected_kind=target.kind)
+                                log(f"RESULT {res}")
+                                advance(machine, phase_trail, "healed")  # heal -> act
+                                heal_edge = "healed"
+                                idx = new_idx
+                            else:
+                                log("HEAL   no remap target — accounting the failure")
+                                history.append(f"step {steps}: heal found no remap target")
+                                advance(machine, phase_trail, "heal_failed")  # heal -> verify
+                                heal_edge = "heal_failed"
                         if action_failed(res):
                             history.append(f"step {steps}: click failed — {res}")
                             entry["act"] = f"element #{idx} click"
@@ -977,6 +1061,7 @@ async def run_decide_session(
             # (click auto-adopt) — re-sync the local handle so the screenshot,
             # url, and artifacts below all read the CURRENT tab.
             page = platform.page
+            t_acted_at = time.time()
 
             # REPORT artifacts for this step
             from .decide import build_questions
@@ -1029,15 +1114,26 @@ async def run_decide_session(
                 "notes": notes, "visited": visited,
             })
             report_mod.append_transcript(run_dir, entry)
+            log(f"TIME   propose={t_proposed - t_top:.1f}s "
+                f"decide={t_decided - t_proposed:.1f}s "
+                f"act={t_acted_at - t_decided:.1f}s")
 
             # VERIFY: fingerprint the step's outcome and evaluate the stop
             # rules. A settled page identical to the previous step means the
             # last action changed nothing readable. Twice in a row ends the
             # run with an honest reason instead of looping to max_steps.
             if not done:
-                if acted:
-                    phase_step(phase_trail, Phase.ACT)
-                phase_step(phase_trail, Phase.VERIFY)
+                if heal_edge == "healed":
+                    # Heal cycle re-attempted: the engine sits at act, so
+                    # verify from there whether the retry worked or not.
+                    advance(machine, phase_trail, "acted")  # act -> verify
+                elif heal_edge == "heal_failed":
+                    pass  # engine already at verify via heal_failed
+                else:
+                    if acted:
+                        advance(machine, phase_trail, "act_now")  # gate -> act
+                    # gate -> verify skips act; act -> verify closes it.
+                    advance(machine, phase_trail, "acted" if acted else "idle_now")
             # VERIFY: fingerprint the step's outcome and evaluate the stop
             # rules. Only a step that ACTED can prove the previous action
             # dead: idle/wait/gate steps are patience, not evidence.
@@ -1050,7 +1146,7 @@ async def run_decide_session(
                 if dead_run >= 2:
                     stopped = True
                     stop_reason = "action had no observable effect twice"
-                    phase_step(phase_trail, Phase.STOPPED)
+                    advance(machine, phase_trail, "abort")  # verify -> stopped
             else:
                 dead_run = 0
             prev_fp = fp
@@ -1073,7 +1169,7 @@ async def run_decide_session(
                     log(f"SYNTH  failed ({exc.__class__.__name__})")
                 if verdict is not None and verdict.done:
                     done = True
-                    phase_step(phase_trail, Phase.DONE)
+                    advance(machine, phase_trail, "finish")  # verify -> done
                     entry["act"] = f"DONE ({verdict.note[:80]})"
                     history.append(f"step {steps}: DONE (synthesized) — {verdict.note[:80]}")
                     log(f"DONE   {verdict.note[:120]}")
@@ -1081,8 +1177,13 @@ async def run_decide_session(
             if noops >= STOP_AFTER_NOOPS and not done and not stopped:
                 stopped = True
                 stop_reason = f"{STOP_AFTER_NOOPS} consecutive no-ops"
-                phase_step(phase_trail, Phase.STOPPED)
+                advance(machine, phase_trail, "abort")  # verify -> stopped
                 log(f"STOP   {STOP_AFTER_NOOPS} consecutive no-ops — ending run")
+            if challenge_stop is not None and not done and not stopped:
+                stopped = True
+                stop_reason = challenge_stop
+                advance(machine, phase_trail, "abort")  # verify -> stopped
+                log(f"STOP   image challenge — ending run honestly")
             await asyncio.sleep(interval)
 
         cursor = await platform.harvest_cursor_events()

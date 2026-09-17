@@ -97,7 +97,7 @@ def test_approval_threshold_and_overridable_kinds():
     assert set(OVERRIDABLE_KINDS) == {"click_item", "type_at", "goto"}
     assert set(BARE_CLICK_VETO_KINDS) == {"input", "textarea", "select"}
     assert "type_at" not in EFFECT_KINDS  # typing never changes body text
-    assert set(EFFECT_KINDS) == {"click_item", "press_enter", "press_escape", "refresh", "back"}
+    assert set(EFFECT_KINDS) == {"click_item", "press_enter", "press_escape", "refresh", "back", "challenge"}
     from src.runner import STOP_AFTER_NOOPS
     assert STOP_AFTER_NOOPS == 3
 

@@ -5,10 +5,15 @@ import { assign, setup } from 'xstate';
  *
  * Mirrors src/runner.py: one step walks
  *   seeing -> deciding -> gating -> [acting] -> verifying
- * and ends in done / stopped / blocked. Idle paths skip `acting`.
- * Async work (perceive/decide/propose/act) runs as invoked promise actors;
+ * and ends in done / stopped. Idle paths skip `acting`. Async work
+ * (perceive/decide/propose/act) runs as invoked promise actors;
  * pure checks are named guards; context (not states) carries counters,
  * memory, and outcomes — per the xstate-v5 skill conventions.
+ *
+ * A stale/covered click detours acting -> healing -> acting (one
+ * label-remapped re-attempt) or acting -> healing -> verifying.
+ * The executable twin is src/machine/run_engine.py (python-statemachine),
+ * which the runner drives event-by-event; this file is the readable spec.
  *
  * The parallel `session` region models the browser side: the active page
  * handle and the cursor-tracker lifecycle (tracking <-> navigating <->
@@ -37,6 +42,9 @@ type RunEvent =
   | { type: 'GOTO_DENIED' }
   | { type: 'ACTED' }
   | { type: 'IDLED' }
+  | { type: 'HEAL_NEEDED'; reason: string }
+  | { type: 'HEALED'; item: number }
+  | { type: 'HEAL_FAILED' }
   | { type: 'DONE_ACCEPTED' }
   | { type: 'LIMITS_HIT'; reason: string }
   | { type: 'SYNTH_DONE'; note: string }
@@ -126,11 +134,25 @@ export const otcRunMachine = setup({
       ],
     },
     acting: {
-      // one deterministic handler (click/type/enter/goto/back/...);
+      // one deterministic handler (click/type/enter/goto/back/challenge/...);
       // click auto-adopts fresh tabs; failures report error: prefix.
+      // A stale/covered click raises HEAL_NEEDED instead of dying here.
       invoke: {
         src: 'executeAction',
         onDone: { target: 'verifying' },
+        onError: { target: 'verifying' },
+      },
+      on: {
+        HEAL_NEEDED: { target: 'healing' },
+      },
+    },
+    healing: {
+      // self-healing retry: re-probe the page, remap the failed target by
+      // label, re-attempt exactly once (HEALED carries the fresh item).
+      // No remap target -> HEAL_FAILED accounts the failure in verifying.
+      invoke: {
+        src: 'healTarget',
+        onDone: { target: 'acting' },
         onError: { target: 'verifying' },
       },
     },

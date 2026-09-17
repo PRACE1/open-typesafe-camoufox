@@ -7,12 +7,18 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from scripts.jev_hooks import (
     ISSUE_KINDS,
+    KIND_TO_RULE,
+    LEARN_MIN_SCORE,
+    MEMORY_MAX_LINES,
     _excerpt,
     _heuristic_score,
     _parse_opts,
     _subsample,
     _windows,
+    append_lesson,
+    format_lesson,
     main,
+    memory_path,
 )
 
 
@@ -89,3 +95,32 @@ def test_issue_kinds_cover_none_option():
     assert len(ISSUE_KINDS) >= 6
     for key, desc in ISSUE_KINDS.items():
         assert isinstance(key, str) and isinstance(desc, str) and desc.strip()
+
+def test_format_lesson_filters_and_maps_kind():
+    assert format_lesson("a.py", 1, 5, 0.5, "race-condition") is None  # below floor
+    assert format_lesson("a.py", 1, 5, 0.9, "none-of-these") is None
+    assert format_lesson("a.py", 1, 5, 0.9, "unclassified") is None
+    assert format_lesson("a.py", 1, 5, 0.9, "bogus") is None
+    lesson = format_lesson("src/x.py", 10, 20, 0.9, "race-condition")
+    assert lesson is not None and "L10-L20" in lesson and "src/x.py" in lesson
+    assert set(KIND_TO_RULE) - {"none-of-these", "unclassified"} == {
+        k for k in KIND_TO_RULE
+    }
+    assert LEARN_MIN_SCORE == 0.80
+
+
+def test_append_lesson_dedupes_caps_and_failsoft(tmp_path):
+    mem = tmp_path / "MEMORY.md"
+    assert append_lesson(str(mem), "- rule one") is True
+    assert append_lesson(str(mem), "- rule one") is False  # dup
+    assert "- rule one" in mem.read_text(encoding="utf-8")
+    big = tmp_path / "big.md"
+    big.write_text("\n".join(f"- line {i}" for i in range(MEMORY_MAX_LINES)),
+                   encoding="utf-8")
+    assert append_lesson(str(big), "- one more") is False  # capped
+    assert append_lesson(str(tmp_path / "no-dir-here" / "x" / "MEMORY.md"),
+                         "- ok") is True  # creates parents
+
+
+def test_memory_path_is_shared_notebook():
+    assert memory_path().endswith(os.path.join(".agent-memory", "MEMORY.md"))

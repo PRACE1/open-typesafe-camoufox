@@ -42,6 +42,7 @@ class Kind(str, Enum):
     BACK = "back"
     CLOSE_OTHERS = "close_others"
     GOTO = "goto"
+    CHALLENGE = "challenge"
     DONE = "done"
     NONE = "none"
 
@@ -82,6 +83,10 @@ KIND_CRITERIA: dict[str, dict[str, str]] = {
     Kind.GOTO.value: {
         "what": "Leave this page for a chosen catalog URL when the current page is finished",
         "not_for": "In-page actions; same-page retries",
+    },
+    Kind.CHALLENGE.value: {
+        "what": "Work the chosen checkbox/slider challenge (consent, captcha-checkbox, slide-to-verify) blocking the task",
+        "not_for": "Plain links/buttons/inputs (click_item/type_at); image puzzles — pick this anyway and the harness refuses those out loud",
     },
     Kind.DONE.value: {
         "what": "The TASK outcome is observably complete in PAGE TEXT; stop with the outcome",

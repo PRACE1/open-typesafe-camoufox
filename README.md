@@ -70,7 +70,11 @@ complete (or budget/steps run out):
 ## How it works
 
 Each step walks an explicit phase machine —
-`see → decide → gate → [act] → verify` (see [System diagrams](#system-diagrams)):
+`see → decide → gate → [act] → verify`, driven by the declarative engine
+([`src/machine/run_engine.py`](src/machine/run_engine.py),
+spec: [`src/machine/run_machine.ts`](src/machine/run_machine.ts))
+— a stale/covered click detours `act → heal → act` for one label-remapped
+re-attempt (see [System diagrams](#system-diagrams)):
 
 1. **See** ([`src/perception.py`](src/perception.py)) — screenshot the page, probe
    the DOM into an element map (reading order, `data-jev` tags), read the
@@ -92,7 +96,9 @@ Each step walks an explicit phase machine —
 4. **Act** ([`src/actions.py`](src/actions.py) →
    [`src/browser/camoufox.py`](src/browser/camoufox.py)) — scroll into
    view, circle-highlight, re-measure, verify the click point, then click
-   / type (clear-before-type) / press key / refresh / back / goto. The
+   / type (clear-before-type) / press key / refresh / back / goto /
+   challenge (checkbox toggle, slider drag; image CAPTCHAs are refused
+   out loud and stop the run honestly). The
    click's own humanized move settles on the target.
 5. **Verify** — adopt new tabs (harvest old buffer, bind the new page,
    restart the tracker), fingerprint the outcome, enforce stop rules.
@@ -110,7 +116,8 @@ flowchart TB
     DECIDE["src/decide.py — Jev API: kind, item, site + Nouls + Score"]
     WRITER["src/writer.py — proposer + free text"]
     GATE["runner gate — confidence, loop-guard, Noul gates, veto"]
-    ACT["src/actions.py — hover, verify, click and type"]
+    ACT["src/actions.py — hover, verify, click, type, challenge"]
+    HEAL["runner heal — re-probe + label remap, one re-attempt"]
     PLAT["src/browser/camoufox.py — sole Playwright owner"]
     FOX["headed Camoufox browser"]
     TRACK["cursor tracker to cursor.json"]
@@ -122,6 +129,8 @@ flowchart TB
     DECIDE --> GATE
     WRITER -.-> GATE
     GATE --> ACT
+    ACT --> HEAL
+    HEAL --> ACT
     ACT --> PLAT
     PLAT --> FOX
     FOX --> TRACK
@@ -138,9 +147,12 @@ stateDiagram-v2
     gate --> act: all gates pass
     gate --> verify: idle, wait, vetoed
     act --> verify: result + fresh snapshot
+    act --> heal: stale map / covered target
+    heal --> act: remapped, one re-attempt
+    heal --> verify: no remap target
     verify --> see: continue
     verify --> done: task_done + settled
-    verify --> stopped: no-ops, dead-run, budget
+    verify --> stopped: no-ops, dead-run, budget, image-challenge
     done --> [*]
     stopped --> [*]
 ```
@@ -249,9 +261,9 @@ reading order, `data-jev` tags) + focused field
 action as a yes/no question ([`src/writer.py`](src/writer.py)), and one Jev
 request answers ([`src/decide.py`](src/decide.py)):
 
-- `kind` — one of 11 verbs (`wait`, `click_item`, `type_at`,
+- `kind` — one of 12 verbs (`wait`, `click_item`, `type_at`,
   `press_enter`, `press_escape`, `refresh`, `back`, `close_others`,
-  `goto`, `done`, `none`), each with a what/not-for boundary
+  `goto`, `challenge`, `done`, `none`), each with a what/not-for boundary
 - `item` — which element idx, as structured options
   (label/text/href/fill-state/selector)
 - `site` — which catalog URL (`goto` targets)
@@ -294,7 +306,8 @@ Decide path (default, `otc --url … --task …`):
 | decide | [`decide`](src/decide.py) (Jev) | kind/item/site Choices + page_ready/needs_text/task_done/approval Nouls + progress Score |
 | propose | [`writer`](src/writer.py) (Groq) | reads all elements + URLs, poses the single best action as the approval question |
 | gate | [`runner`](src/runner.py) | confidence gate, loop-guard, Noul gates |
-| act | [`actions`](src/actions.py) → [`platform`](src/browser/camoufox.py) | click/type/enter/refresh/goto/close; auto-adopts new tabs |
+| act | [`actions`](src/actions.py) → [`platform`](src/browser/camoufox.py) | click/type/enter/refresh/goto/close/challenge; auto-adopts new tabs |
+| heal | [`runner`](src/runner.py) + [`actions`](src/actions.py) | stale/covered click → re-probe, label remap, one re-attempt |
 | act | [`writer`](src/writer.py) | only on `type_text` (non-credential) and off-catalog `goto` |
 | verify | [`runner`](src/runner.py) | fingerprint vs last step, no-op and dead-run stops |
 

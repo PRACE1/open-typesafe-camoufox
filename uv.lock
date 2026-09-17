@@ -1658,6 +1658,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-ai" },
     { name = "python-dotenv" },
+    { name = "python-statemachine" },
 ]
 
 [package.dev-dependencies]
@@ -1675,6 +1676,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pydantic-ai", specifier = ">=1.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "python-statemachine", specifier = ">=3.2.1" },
 ]
 
 [package.metadata.requires-dev]
@@ -2641,6 +2643,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/5b/42/55c32bb9b12693c092ad250a0e82edb5b31ddeda6eb772de5f308b3804ad/python_multipart-0.0.32.tar.gz", hash = "sha256:be54b7f3fa167bb83e4fcd936b887b708f4e57fe75911c02aebf53efaf8d938e", size = 46881, upload-time = "2026-06-04T16:18:58.647Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e1/04/e8135ebd1ad02c56ec633277529b2602ff99ff634be76cdba5744cf554fd/python_multipart-0.0.32-py3-none-any.whl", hash = "sha256:ff6d3f776f16878c894e52e107296ffc890e913c611b1a4ec6c44e2821fe2e23", size = 30042, upload-time = "2026-06-04T16:18:57.319Z" },
+]
+
+[[package]]
+name = "python-statemachine"
+version = "3.2.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/da/ec/9600288c5cd4960bab1f20d2420d3a93845f278938bc70a6380edbcc807a/python_statemachine-3.2.1.tar.gz", hash = "sha256:dff36682cab00ba7f797e01ebdd90c4dbb2c2e00fe7cfcc9f926f63c50266507", size = 770078, upload-time = "2026-08-01T16:52:44.987Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/91/d5/e1dde86357f286b508f4b8241e2b634cf1c24ccaa3f2fe6a250a008f8d4c/python_statemachine-3.2.1-py3-none-any.whl", hash = "sha256:609b46fcc68f400affac42a2fe514a5b5e552cb859319475f91e1f08696d7759", size = 158637, upload-time = "2026-08-01T16:52:43.683Z" },
 ]
 
 [[package]]

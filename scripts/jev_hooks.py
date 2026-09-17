@@ -42,6 +42,57 @@ MAX_WINDOWS = 20
 MAX_KIND_CALLS = 3
 MAX_LINE_SCAN_FILES = 10
 
+# Capture hot windows back into the shared notebook so future runs learn.
+# Only high-confidence, classified findings (>= LEARN_MIN_SCORE, never
+# none-of-these/unclassified) become rules; the file is capped and deduped.
+LEARN_MIN_SCORE = 0.80
+MEMORY_MAX_LINES = 200
+MAX_LESSONS_PER_RUN = 10
+
+KIND_TO_RULE = {
+    "race-condition": "Guard shared mutable state before use: lock it, snapshot it, or re-check it after await — never trust it across an async gap.",
+    "unhandled-error": "Every fallible call needs an owner: catch with context, bound retries/timeouts, and a falsy sentinel the caller must handle.",
+    "secret-exposure": "Secrets resolve at execution from env and log masked; they never enter code, prompts, logs, or transcripts.",
+    "logic-error": "Re-derive boundary conditions from the spec (inclusive/exclusive, empty/None) and test both sides, not just the happy path.",
+    "api-misuse": "Match the callee's real contract (signature, return shape, sync/async); never assume — read it or probe it.",
+    "resource-leak": "Every acquisition pairs with release on all paths (finally/with); cap buffers and retries.",
+    "input-validation": "Normalize and allow-list untrusted input (paths, URLs, shell, eval) at the boundary before use.",
+}
+
+
+def format_lesson(path: str, start: int, end: int, score: float,
+                  kind: str) -> str | None:
+    """Anti-pattern rule from one hot window; None when not worth learning."""
+    if score < LEARN_MIN_SCORE or kind not in KIND_TO_RULE:
+        return None
+    return f"- {KIND_TO_RULE[kind]} (seen: {path} L{start}-L{end})"
+
+
+def memory_path() -> str:
+    """Shared notebook path — the same file report.load_lessons reads."""
+    return os.path.join(ROOT, ".agent-memory", "MEMORY.md")
+
+
+def append_lesson(mem_path: str, line: str) -> bool:
+    """Append one rule line, deduped and capped. Fail-soft, never bricks git."""
+    try:
+        existing: list[str] = []
+        try:
+            with open(mem_path, encoding="utf-8") as f:
+                existing = f.read().splitlines()
+        except OSError:
+            pass
+        if line.strip() in (ln.strip() for ln in existing):
+            return False
+        if len(existing) >= MEMORY_MAX_LINES:
+            return False
+        os.makedirs(os.path.dirname(mem_path), exist_ok=True)
+        with open(mem_path, "a", encoding="utf-8") as f:
+            f.write(line.rstrip() + "\n")
+        return True
+    except OSError:
+        return False
+
 ISSUE_NOUL = {
     "type": "noul",
     "instructions": "Does this Python source file likely contain a defect, bug, or risky pattern?",
@@ -61,6 +112,57 @@ ISSUE_KINDS = {
     "input-validation": "untrusted input used unchecked (paths, URLs, shell, eval)",
     "none-of-these": "no defect visible; the range looks clean",
 }
+
+# Capture hot windows back into the shared notebook so future runs learn.
+# Only high-confidence, classified findings (>= LEARN_MIN_SCORE, never
+# none-of-these/unclassified) become rules; the file is capped and deduped.
+LEARN_MIN_SCORE = 0.80
+MEMORY_MAX_LINES = 200
+MAX_LESSONS_PER_RUN = 10
+
+KIND_TO_RULE = {
+    "race-condition": "Guard shared mutable state before use: lock it, snapshot it, or re-check it after await — never trust it across an async gap.",
+    "unhandled-error": "Every fallible call needs an owner: catch with context, bound retries/timeouts, and a falsy sentinel the caller must handle.",
+    "secret-exposure": "Secrets resolve at execution from env and log masked; they never enter code, prompts, logs, or transcripts.",
+    "logic-error": "Re-derive boundary conditions from the spec (inclusive/exclusive, empty/None) and test both sides, not just the happy path.",
+    "api-misuse": "Match the callee's real contract (signature, return shape, sync/async); never assume — read it or probe it.",
+    "resource-leak": "Every acquisition pairs with release on all paths (finally/with); cap buffers and retries.",
+    "input-validation": "Normalize and allow-list untrusted input (paths, URLs, shell, selectors) at the boundary before use.",
+}
+
+
+def format_lesson(path: str, start: int, end: int, score: float,
+                  kind: str) -> str | None:
+    """Anti-pattern rule from one hot window; None when not worth learning."""
+    if score < LEARN_MIN_SCORE or kind not in KIND_TO_RULE:
+        return None
+    return f"- {KIND_TO_RULE[kind]} (seen: {path} L{start}-L{end})"
+
+
+def memory_path() -> str:
+    """Shared notebook path — the same file report.load_lessons reads."""
+    return os.path.join(ROOT, ".agent-memory", "MEMORY.md")
+
+
+def append_lesson(mem_path: str, line: str) -> bool:
+    """Append one rule line, deduped and capped. Fail-soft, never bricks git."""
+    try:
+        existing: list[str] = []
+        try:
+            with open(mem_path, encoding="utf-8") as f:
+                existing = f.read().splitlines()
+        except OSError:
+            pass
+        if line.strip() in (ln.strip() for ln in existing):
+            return False
+        if len(existing) >= MEMORY_MAX_LINES:
+            return False
+        os.makedirs(os.path.dirname(mem_path), exist_ok=True)
+        with open(mem_path, "a", encoding="utf-8") as f:
+            f.write(line.rstrip() + "\n")
+        return True
+    except OSError:
+        return False
 
 
 def _git(*args: str) -> str:
@@ -240,11 +342,15 @@ async def _jev_window_kinds(base: str, key: str, model: str, path: str,
 
 
 async def _jev_line_detail(base: str, key: str, model: str, path: str,
-                           opts: dict) -> list[str]:
-    """Exact-line outline for one file: hot ranges + inferred kinds."""
+                           opts: dict) -> tuple[list[str], list[tuple[int, int, float, str]]]:
+    """Exact-line outline for one file: hot ranges + inferred kinds.
+
+    Returns (display_lines, structured) where structured is
+    [(start, end, score, kind)] for the capture step.
+    """
     lines = _read_lines(path)
     if not lines:
-        return []
+        return [], []
     windows = _subsample(_windows(lines, opts["window"]), MAX_WINDOWS)
     scored = await _jev_window_scores(base, key, model, path, windows)
     hot = [(s, e, t, scored[(s, e)])
@@ -253,8 +359,10 @@ async def _jev_line_detail(base: str, key: str, model: str, path: str,
     hot.sort(key=lambda r: r[3], reverse=True)
     hot = hot[:MAX_KIND_CALLS]
     kinds = await _jev_window_kinds(base, key, model, path, hot) if hot else {}
-    return [f"L{s}-L{e} ({sc:.2f}): {kinds.get((s, e), 'unreviewed')}"
-            for (s, e, _t, sc) in hot]
+    structured = [(s, e, sc, kinds.get((s, e), "unreviewed")) for (s, e, _t, sc) in hot]
+    display = [f"L{s}-L{e} ({sc:.2f}): {kinds.get((s, e), 'unreviewed')}"
+               for (s, e, _t, sc) in hot]
+    return display, structured
 
 
 def _parse_opts(argv: list[str], threshold: float) -> dict:
@@ -309,9 +417,12 @@ async def _scan_with_detail(files: list[str], opts: dict) -> tuple[float, bool]:
 
     Returns (top_score, live). Line detail runs only for files at/above
     --line-floor (top MAX_LINE_SCAN_FILES by score) to bound Jev calls.
+    Hot classified windows are captured back into .agent-memory/MEMORY.md
+    as anti-pattern rules (capped per run), closing the hooks->memory loop.
     """
     scores, live = await _jev_scores(files)
     detail: dict[str, list[str]] = {}
+    learned = 0
     if live and not opts["no_lines"]:
         ranked = sorted(files, key=lambda p: scores.get(p, 0.0), reverse=True)
         creds = _jev_client()
@@ -323,8 +434,18 @@ async def _scan_with_detail(files: list[str], opts: dict) -> tuple[float, bool]:
                 break
             if creds is None:
                 break
-            detail[path] = await _jev_line_detail(*creds, path, opts)
+            display, structured = await _jev_line_detail(*creds, path, opts)
+            detail[path] = display
             scanned += 1
+            for start, end, score, kind in structured:
+                if learned >= MAX_LESSONS_PER_RUN:
+                    break
+                rule = format_lesson(path, start, end, score, kind)
+                if rule is not None and append_lesson(memory_path(), rule):
+                    print(f"jev-hooks: learned -> {rule[:100]}")
+                    learned += 1
+    if learned:
+        print(f"jev-hooks: captured {learned} lesson(s) into .agent-memory/MEMORY.md")
     return _report(files, scores, live, detail), live
 
 

@@ -9,9 +9,9 @@ IDs used in commit messages and the run log (`EDGE #n`).
 | 1 | Blank / transitioning page | 0 elements, empty text | `seeing` → `deciding` → `wait`; `page_ready` Noul low | handled (`runner.py`, `decide.py`) |
 | 2 | Loading spinner / "Looking for results" | `page_settled()` false | `wait` (neutral, never counts to stops) | handled |
 | 3 | Language banner mistaken for loading | text ≥300ch with banner | `page_settled()` length rule | handled |
-| 4 | Covered click point (overlay span) | `elementFromPoint` ≠ target | `acting`: skip with `covered:<tag>` diagnosis; anchors/buttons click through | handled (`actions.py`) |
-| 5 | Stale idx after re-render | live kind ≠ decided kind | `acting`: `stale map` abort, no dispatch | handled |
-| 6 | **Bot-check / CAPTCHA page** (Google `/sorry`, "unusual traffic", recaptcha text) | `is_blocked_page()` on URL+text | `seeing` records `blocked` context; loop keeps classifying positions + moving the cursor humanized, iteratively until it resolves (bounded by budget/noop rails) | handled (`perception.py`, `runner.py`, state `page_state`) |
+| 4 | Covered click point (overlay span) | `elementFromPoint` ≠ target | `acting`: anchors/buttons click through; other covers dismissed once via Escape (hover-opened menus included) and re-verified; still-covered detours `acting`→`healing`→`acting` for one remapped re-attempt | handled (`actions.py`, `runner.py`) |
+| 5 | Stale idx after re-render | live kind ≠ decided kind | `acting`→`healing`→`acting`: re-probe, exact label remap, one re-attempt; no target → `healing`→`verifying` | handled (`actions.py`, `runner.py`) |
+| 6 | **Bot-check / CAPTCHA page** (Google `/sorry`, "unusual traffic", recaptcha text) | `is_blocked_page()` on URL+text | `seeing` records `blocked` context; checkbox/slider controls worked via `challenge` (edge #23); image puzzles escalate to an honest stop (edge #24) | handled (`perception.py`, `runner.py`, state `page_state`) |
 | 7 | Click opens new tab | tab-set diff after click / at SEE | `acting`→adopt; `seeing` reconciles slow popups; opener kept on close | handled |
 | 8 | Popup dies with opener | live probe (`ME_CLOSED`) | `close_other_tabs` keeps current+opener; survivor fallback | handled |
 | 9 | Stale tab listeners fire | event source ≠ bound page | generation guard in all three nav handlers | handled (`cursor_tracking.py`) |
@@ -28,14 +28,16 @@ IDs used in commit messages and the run log (`EDGE #n`).
 | 20 | Budget / max-steps exhausted | loop condition | `stopped`, reason recorded | handled |
 | 21 | No API keys | empty key at call time | deterministic offline fallbacks (kind `none`/writer decline) | handled |
 | 22 | Login wall (account required) | task needs auth, no session | NOT handled — planner-visible; requires human credentials (out of scope by design) | open |
+| 23 | Checkbox / slider challenge | control labeled consent/captcha-checkbox/slide-to-verify | `challenge` kind → `challenge_control`: verified toggle, 8-step humanized drag + settle | handled (`actions.py`) |
+| 24 | Image / puzzle CAPTCHA | captcha/recaptcha/puzzle markers on the control | `challenge_control` refuses out loud; runner stops honestly (`image challenge needs a human`) instead of burning no-ops | handled (`actions.py`, `runner.py`) |
 
 ## Notes on #6 (blocked pages)
 
 Detection is deterministic (`perception.is_blocked_page`): Google `/sorry/`
 path, "unusual traffic" text, recaptcha/verify-human markers, access-denied
 markers. The reason rides in the state packet (`page_state`) so Jev
-understands the context, and the loop works the page's verification controls
-(checkbox/button/input — the probe covers all inputs) with the same
+understands the context, and the loop works the page's checkbox/slider
+verification controls via the `challenge` kind with the same
 classify → humanized move → verify cycle as any page, bounded by the normal
-budget/no-op/dead-run rails. There is no special stop and no special
-solver: a bot-check page is just a page.
+budget/no-op/dead-run rails. Image/puzzle CAPTCHAs are the one special
+stop: unsolvable by design, so the runner says so and ends the run.

@@ -10,13 +10,140 @@ text field genuinely needs free text.
 otc --url https://www.google.com --task "Type ONE surprising moon fact in the search box, press Enter, read the top result, and mark done."
 ```
 
-(`otc` here is `uv run otc.py` from a source checkout — see Install. When
+(`otc` here is `uv run otc.py` from a source checkout — see [Install](#install). When
 packaged, `pyproject [project.scripts]` installs real `otc` /
 `open-typesafe-camoufox` commands.)
 
 Shaped after [`typesafe-computer-use`](https://github.com/awlevin/typesafe-computer-use);
 CLI ergonomics take a leaf from [`camoufox-cli`](https://github.com/Bin-Huang/camoufox-cli)
 (one installable command, flags-over-config, offline replay).
+
+## Table of Contents
+
+- [What it is](#what-it-is)
+- [What it does](#what-it-does)
+- [How it works](#how-it-works)
+- [System diagrams](#system-diagrams)
+- [Goal](#goal)
+- [Goal: earn $1 USDC on Solana](#goal-earn-1-usdc-on-solana)
+- [What we did here](#what-we-did-here)
+- [Why this decision-making shape](#why-this-decision-making-shape)
+- [Install](#install)
+- [Use](#use)
+- [How a step works](#how-a-step-works)
+- [What fires when (capability trigger map)](#what-fires-when-capability-trigger-map)
+- [Run folder](#run-folder)
+- [Caveats](#caveats)
+- [Layout](#layout)
+- [Development](#development)
+- [References](#references)
+
+## What it is
+
+`open-typesafe-camoufox` ([`otc.py`](otc.py), [`pyproject.toml`](pyproject.toml)) is an
+open-source browser agent: a Python program that operates a real,
+headed [Camoufox](https://camoufox.com) browser window the way a person
+would — moving a humanized cursor, clicking, typing, submitting forms,
+opening tabs — in pursuit of a plain-English task. It is built for
+**cheap, observable computer use**: every step costs a fraction of a cent
+and leaves a full audit trail (see [Run folder](#run-folder)).
+
+## What it does
+
+Given a starting URL and a task, `otc` loops until the task is observably
+complete (or budget/steps run out):
+
+- **Reads** the live page into structured data (element map, focused
+  field, visible text) via [`src/perception.py`](src/perception.py)
+- **Decides** the single next action with the Jev classifier
+  ([`src/decide.py`](src/decide.py)) over 11 mutually exclusive action
+  kinds, gated by confidence and Noul flags
+- **Proposes** with a small writer model ([`src/writer.py`](src/writer.py))
+  when a step needs reasoning or free text
+- **Acts** through humanized cursor primitives
+  ([`src/actions.py`](src/actions.py)) executed solely by the platform
+  adapter ([`src/browser/camoufox.py`](src/browser/camoufox.py))
+- **Verifies** every outcome, adopts new tabs, records everything, and
+  stops honestly (`done`, budget, or explicit stop rules) via
+  [`src/runner.py`](src/runner.py)
+
+## How it works
+
+Each step walks an explicit phase machine —
+`see → decide → gate → [act] → verify` (see [System diagrams](#system-diagrams)):
+
+1. **See** ([`src/perception.py`](src/perception.py)) — screenshot the page, probe
+   the DOM into an element map (reading order, `data-jev` tags), read the
+   focused field (role/label/placeholder/value, credential flag) and the
+   visible page text (the reading ground truth). Bank notes and visited
+   URLs for long-horizon memory.
+2. **Propose + decide** ([`src/writer.py`](src/writer.py),
+   [`src/decide.py`](src/decide.py)) — the writer poses the single best
+   action as a yes/no question; one Jev request answers three `Choice`
+   sets (`kind` / `item` / `site`), five Noul flags (`page_ready`,
+   `needs_text`, `task_done`, `fits`, `approval`), and one `Score`
+   (`progress`). Structured options carry label/text/href/fill-state/
+   selector, and kinds carry what/not-for boundaries.
+3. **Gate** ([`src/runner.py`](src/runner.py)) — confidence gate,
+   loop-guard (three identical targets force a wait), Noul gates
+   (`ready` only adds patience, `text?` gates the writer call, `done?`
+   must agree before `done`), bare-input-click veto, stale-map and
+   point checks.
+4. **Act** ([`src/actions.py`](src/actions.py) →
+   [`src/browser/camoufox.py`](src/browser/camoufox.py)) — scroll into
+   view, circle-highlight, re-measure, verify the click point, then click
+   / type (clear-before-type) / press key / refresh / back / goto. The
+   click's own humanized move settles on the target.
+5. **Verify** — adopt new tabs (harvest old buffer, bind the new page,
+   restart the tracker), fingerprint the outcome, enforce stop rules.
+   Full details per phase: [What fires when](#what-fires-when-capability-trigger-map).
+
+## System diagrams
+
+Architecture — how the pieces connect:
+
+```mermaid
+flowchart TB
+    CLI["otc.py — CLI: url, task, budget"]
+    RUNNER["src/runner.py — step loop + stop rules"]
+    PERC["src/perception.py — DOM probe to element map"]
+    DECIDE["src/decide.py — Jev API: kind, item, site + Nouls + Score"]
+    WRITER["src/writer.py — proposer + free text"]
+    GATE["runner gate — confidence, loop-guard, Noul gates, veto"]
+    ACT["src/actions.py — hover, verify, click and type"]
+    PLAT["src/browser/camoufox.py — sole Playwright owner"]
+    FOX["headed Camoufox browser"]
+    TRACK["cursor tracker to cursor.json"]
+    REP["src/report.py — PNGs, payload, answers, transcript, replay"]
+    CLI --> RUNNER
+    RUNNER --> PERC
+    PERC --> DECIDE
+    PERC --> WRITER
+    DECIDE --> GATE
+    WRITER -.-> GATE
+    GATE --> ACT
+    ACT --> PLAT
+    PLAT --> FOX
+    FOX --> TRACK
+    ACT -.-> REP
+```
+
+Step loop — the state machine every step walks:
+
+```mermaid
+stateDiagram-v2
+    [*] --> see: step tick
+    see --> decide: packet built
+    decide --> gate: kind + item + Nouls + Score
+    gate --> act: all gates pass
+    gate --> verify: idle, wait, vetoed
+    act --> verify: result + fresh snapshot
+    verify --> see: continue
+    verify --> done: task_done + settled
+    verify --> stopped: no-ops, dead-run, budget
+    done --> [*]
+    stopped --> [*]
+```
 
 ## Goal
 
@@ -96,9 +223,9 @@ uv run otc.py --url https://example.com --preflight   # proves keys + headed bro
 `uv run otc.py` is the call shape (a source checkout, like
 `camoufox-cli`'s daemon model but without the install step). After
 `pip install .`, the `[project.scripts]` entry points give you bare `otc`.
-No new keys needed for the writer — it defaults to
-a small Groq model (`WRITER_MODEL` overrides; `ANTHROPIC_API_KEY` is an
-optional haiku override).
+The writer is provider-driven via `WRITER_*` env (OpenAI-compatible `chat`,
+`response`, or `messages` API shapes — see [`.env.example`](.env.example));
+it falls back to `GROQ_*` when unset.
 
 ## Use
 
@@ -115,33 +242,22 @@ While a run is going, steer it from another terminal via `steer.txt`
 
 ## How a step works
 
-```
-screenshot ─► element map (DOM probe, reading order, data-jev tags)
-              focused field (role/label/placeholder/value, credential flag)
-              page text (visible words — the reading ground truth)
-                          │
-                          ▼
-             Groq proposes the single best action as a yes/no question
-                          │
-                          ▼
-             one Jev request: Choices, Noul flags, and a Score
-             ┌───────────────────────────────────────────────┐
-             │ kind : wait | click_item | type_at |          │
-             │        press_enter | refresh | close_others | │
-             │        goto | done | none                     │
-             │        (each with a what/not-for boundary)    │
-             │ item : which element idx — structured options │
-             │        (label/text/href/fill-state/selector)  │
-             │ site : which catalog URL (goto targets)       │
-             │ Noul : page_ready? needs_text? task_done?     │
-             │ Noul : approval? (LLM-posed question)         │
-             │ Score: progress on the task spectrum          │
-             └───────────────────────────────────────────────┘
-                          │  conf < 0.4 → idle (no-op)
-                          │  two doubt no-ops → stop
-                          ▼
-             deterministic action ─► verify ─► next step
-```
+Screenshot → element map ([`src/perception.py`](src/perception.py): DOM probe,
+reading order, `data-jev` tags) + focused field
+(role/label/placeholder/value, credential flag) + page text (visible words
+— the reading ground truth). Then the writer proposes the single best
+action as a yes/no question ([`src/writer.py`](src/writer.py)), and one Jev
+request answers ([`src/decide.py`](src/decide.py)):
+
+- `kind` — one of 11 verbs (`wait`, `click_item`, `type_at`,
+  `press_enter`, `press_escape`, `refresh`, `back`, `close_others`,
+  `goto`, `done`, `none`), each with a what/not-for boundary
+- `item` — which element idx, as structured options
+  (label/text/href/fill-state/selector)
+- `site` — which catalog URL (`goto` targets)
+- Noul flags — `page_ready`, `needs_text`, `task_done`, `fits`,
+  `approval` (on the LLM-posed question)
+- `Score` — `progress` on the task spectrum
 
 `wait` is patience, not doubt: a loading page idles without counting
 toward the stop rule, so the loop can never retype into a transition (the
@@ -165,7 +281,7 @@ Each step walks an explicit phase machine —
 step means the action changed nothing, twice in a row ends the run
 honestly. The three Noul flags ride along: `page_ready` can only add
 patience (never override the loading check), `needs_text` gates the
-writer call, `task_done` must agree before `done` is accepted. `progress`
+writer call, `done?` must agree before `done` is accepted. `progress`
 scores the run on the task-completion spectrum for long-horizon tracking.
 
 ## What fires when (capability trigger map)
@@ -174,13 +290,13 @@ Decide path (default, `otc --url … --task …`):
 
 | phase | module | fires |
 |---|---|---|
-| see | `perception` | element map, focused field, page text, tabs; banks notes + visited |
-| decide | `decide` (Jev) | kind/item/site Choices + page_ready/needs_text/task_done/approval Nouls + progress Score |
-| propose | `writer` (Groq) | reads all elements + URLs, poses the single best action as the approval question |
-| gate | `runner` | confidence gate, loop-guard, Noul gates |
-| act | `actions` → `platform` | click/type/enter/refresh/goto/close; auto-adopts new tabs |
-| act | `writer` | only on `type_at` (non-credential) and off-catalog `goto` |
-| verify | `runner` | fingerprint vs last step, no-op and dead-run stops |
+| see | [`perception`](src/perception.py) | element map, focused field, page text, tabs; banks notes + visited |
+| decide | [`decide`](src/decide.py) (Jev) | kind/item/site Choices + page_ready/needs_text/task_done/approval Nouls + progress Score |
+| propose | [`writer`](src/writer.py) (Groq) | reads all elements + URLs, poses the single best action as the approval question |
+| gate | [`runner`](src/runner.py) | confidence gate, loop-guard, Noul gates |
+| act | [`actions`](src/actions.py) → [`platform`](src/browser/camoufox.py) | click/type/enter/refresh/goto/close; auto-adopts new tabs |
+| act | [`writer`](src/writer.py) | only on `type_text` (non-credential) and off-catalog `goto` |
+| verify | [`runner`](src/runner.py) | fingerprint vs last step, no-op and dead-run stops |
 
 Legacy path (`--legacy-planner`): `read_frame` → braille → `decide_cursor`
 hint; `build_step_agent` planner → `JevStep`; `JevCapability.move_cursor`
@@ -211,24 +327,30 @@ Every run writes `runs/<timestamp>/`:
   invisible to it (pixel fallback is future work).
 - Slow pages burn steps on `wait`; raise `--budget`/`--max-steps` for them.
 - Passwords are only filled from `{ENV}` placeholders declared in `--task`
-  (see `.env.example`); the writer will never invent credentials.
+  (see [`.env.example`](.env.example)); the writer will never invent credentials.
 - `runs/` and `.env.local` are git-ignored; never commit secrets.
 
 ## Layout
 
-```
-src/
-  browser/camoufox.py   the ONLY module touching playwright/camoufox
-  perception.py         element map, focused field, page text, state packet
-  decide.py             Jev primary selector (kind/item/site + confidence)
-  writer.py             small-model free text ({fill,text}/{ok,url})
-  actions.py            one handler per kind -> history line
-  runner.py             Jev-primary step loop, stop rules, steer
-  report.py             run folder, annotated PNGs, payload, answers, replay
-  deps.py               typed RunState (replaces __jev_* string tuples)
-  run/                  CLI (run.py: otc), env_loader, logging_utils
-  run/agent_runner.py   legacy GPT planner loop (--legacy-planner only)
-```
+| Module | File | Role |
+|---|---|---|
+| runner | [`src/runner.py`](src/runner.py) | Jev-primary step loop, stop rules, steer |
+| perception | [`src/perception.py`](src/perception.py) | element map, focused field, page text, state packet |
+| decide | [`src/decide.py`](src/decide.py) | Jev primary selector (kind/item/site + confidence) |
+| writer | [`src/writer.py`](src/writer.py) | small-model free text ({fill,text}/{ok,url}) |
+| actions | [`src/actions.py`](src/actions.py) | one handler per kind -> history line |
+| platform | [`src/browser/camoufox.py`](src/browser/camoufox.py) | the ONLY module touching playwright/camoufox |
+| report | [`src/report.py`](src/report.py) | run folder, annotated PNGs, payload, answers, replay |
+| deps | [`src/deps.py`](src/deps.py) | typed RunState (replaces __jev_* string tuples) |
+| machine | [`src/machine/run_machine.ts`](src/machine/run_machine.ts) | xstate v5 run-machine spec + [`EDGE_CASES.md`](src/machine/EDGE_CASES.md) |
+| cli | [`src/run/run.py`](src/run/run.py) | CLI (`otc`), env loading, logging |
+| legacy | [`src/run/agent_runner.py`](src/run/agent_runner.py) | GPT planner loop (`--legacy-planner` only) |
+
+Supporting: [`otc.py`](otc.py) + [`run_fact.py`](run_fact.py) entry points,
+[`tests/`](tests/) (155 passing), [`docs/LIBRARIES.md`](docs/LIBRARIES.md),
+[`scripts/jev_hooks.py`](scripts/jev_hooks.py),
+[`.opencode/skills/open-typesafe-camoufox/SKILL.md`](.opencode/skills/open-typesafe-camoufox/SKILL.md),
+[`lefthook.yml`](lefthook.yml), [`pyproject.toml`](pyproject.toml).
 
 ## Development
 
@@ -253,3 +375,12 @@ npx lefthook install # one-time per clone: wires .git/hooks
   with `--files` (skips scope detection).
 - Bypass with `git push --no-verify` or `JEV_HOOKS_OFF=1`.
 - No key / no network → heuristic fallback, never blocks.
+
+## References
+
+- [TypeSafe docs](https://docs.typesafe.ai) — Choice/Score/Noul primitives, confidence, Jev models
+- [`typesafe-computer-use`](https://github.com/awlevin/typesafe-computer-use) — the reference cheap-computer-use loop this project is shaped after
+- [`camoufox-cli`](https://github.com/Bin-Huang/camoufox-cli) — CLI ergonomics reference (one command, flags-over-config)
+- [Camoufox](https://camoufox.com) — the anti-detect browser underneath `src/browser/`
+- [uv](https://docs.astral.sh/uv/) — Python package + project manager used here
+- [lefthook](https://github.com/evilmartians/lefthook) — git hooks manager wiring the Jev hooks

@@ -27,7 +27,7 @@ from datetime import datetime
 from enum import Enum
 
 from . import perception
-from .actions import click_item, goto_url, press_key, type_at
+from .actions import action_failed, click_item, goto_url, press_key, type_at
 from .capability.human_move import HUMANIZE_LEVEL
 from .decide import Kind, decide_action
 from .deps import RunState
@@ -551,34 +551,52 @@ async def run_decide_session(
                     log(f"ACT    goto {target}")
                     res = await goto_url(platform, target)
                     log(f"RESULT {res}")
-                    entry["act"] = f"goto {target}"
-                    entry["result"] = res
-                    history.append(f"step {steps}: goto {target} — {res}")
-                    moves += 1
-                    noops = 0
-                    acted = True
+                    if action_failed(res):
+                        history.append(f"step {steps}: goto failed — {res}")
+                        entry["act"] = f"goto {target}"
+                        entry["result"] = res
+                        noops += 1
+                    else:
+                        entry["act"] = f"goto {target}"
+                        entry["result"] = res
+                        history.append(f"step {steps}: goto {target} — {res}")
+                        moves += 1
+                        noops = 0
+                        acted = True
             elif decision.kind == Kind.PRESS_ENTER:
                 log("ACT    key=Enter")
                 res = await press_key(platform, "Enter")
                 log(f"RESULT {res}")
-                entry["act"] = "key=Enter"
-                entry["result"] = res
-                history.append(f"step {steps}: pressed Enter — {res}")
-                moves += 1
-                noops = 0
-                acted = True
-                last_effect_kind = "press_enter"
+                if action_failed(res):
+                    history.append(f"step {steps}: Enter failed — {res}")
+                    entry["act"] = "key=Enter"
+                    entry["result"] = res
+                    noops += 1
+                else:
+                    entry["act"] = "key=Enter"
+                    entry["result"] = res
+                    history.append(f"step {steps}: pressed Enter — {res}")
+                    moves += 1
+                    noops = 0
+                    acted = True
+                    last_effect_kind = "press_enter"
             elif decision.kind == Kind.REFRESH:
                 log("ACT    refresh")
                 res = await platform.refresh_page()
                 log(f"RESULT {res}")
-                entry["act"] = "refresh"
-                entry["result"] = res
-                history.append(f"step {steps}: refreshed — {res}")
-                moves += 1
-                noops = 0
-                acted = True
-                last_effect_kind = "refresh"
+                if action_failed(res):
+                    history.append(f"step {steps}: refresh failed — {res}")
+                    entry["act"] = "refresh"
+                    entry["result"] = res
+                    noops += 1
+                else:
+                    entry["act"] = "refresh"
+                    entry["result"] = res
+                    history.append(f"step {steps}: refreshed — {res}")
+                    moves += 1
+                    noops = 0
+                    acted = True
+                    last_effect_kind = "refresh"
             elif decision.kind == Kind.CLOSE_OTHERS:
                 log("ACT    close other tabs")
                 n_closed = await platform.close_other_tabs()
@@ -611,13 +629,19 @@ async def run_decide_session(
                         log(f"ACT    element #{idx} (scroll+circle+click)")
                         res = await click_item(platform, elements, idx)
                         log(f"RESULT {res}")
-                        entry["act"] = f"element #{idx} click"
-                        entry["result"] = res
-                        history.append(f"step {steps}: clicked element #{idx} — {res}")
-                        moves += 1
-                        noops = 0
-                        acted = True
-                        last_effect_kind = "click_item"
+                        if action_failed(res):
+                            history.append(f"step {steps}: click failed — {res}")
+                            entry["act"] = f"element #{idx} click"
+                            entry["result"] = res
+                            noops += 1
+                        else:
+                            entry["act"] = f"element #{idx} click"
+                            entry["result"] = res
+                            history.append(f"step {steps}: clicked element #{idx} — {res}")
+                            moves += 1
+                            noops = 0
+                            acted = True
+                            last_effect_kind = "click_item"
                 else:  # TYPE_AT
                     elem = by_idx[idx]
                     label = elem.label or elem.placeholder or elem.text or elem.id or f"element #{idx}"
@@ -660,13 +684,19 @@ async def run_decide_session(
                     if text_to_type is not None:
                         res = await type_at(platform, elements, idx, text_to_type)
                         log(f"RESULT {res}")
-                        entry["act"] = f"element #{idx} type={len(text_to_type)}ch"
-                        entry["result"] = res
-                        history.append(f"step {steps}: typed at #{idx} — {res}")
-                        moves += 1
-                        noops = 0
-                        acted = True
-                        last_effect_kind = "type_at"
+                        if action_failed(res):
+                            history.append(f"step {steps}: type failed — {res}")
+                            entry["act"] = f"element #{idx} type={len(text_to_type)}ch"
+                            entry["result"] = res
+                            noops += 1
+                        else:
+                            entry["act"] = f"element #{idx} type={len(text_to_type)}ch"
+                            entry["result"] = res
+                            history.append(f"step {steps}: typed at #{idx} — {res}")
+                            moves += 1
+                            noops = 0
+                            acted = True
+                            last_effect_kind = "type_at"
 
             # The action may have rebound the platform to a new tab
             # (click auto-adopt) — re-sync the local handle so the screenshot,

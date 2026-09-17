@@ -285,7 +285,7 @@ class CamoufoxPlatform(CursorTrackingMixin, BrowserActionsMixin):
             try:
                 await self.page.reload(wait_until="load", timeout=20000)
             except Exception as exc:  # noqa: BLE001
-                msg = f"refresh failed: {exc}"
+                msg = f"error: refresh failed: {exc}"
                 log(msg)
                 return msg
             self._last_url = self.page.url

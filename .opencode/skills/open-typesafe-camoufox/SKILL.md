@@ -59,7 +59,7 @@ Every run writes `runs/<timestamp>/`:
 | `run.log`, `run.json` | full feed; goal, outcome, seconds, config |
 | `step-NN-raw.png` | screenshot capture |
 | `step-NN.png` | elements blue, chosen red, focused field green |
-| `step-NN-payload.txt` | exact state + criteria sent to Jev, then the decision |
+| `step-NN-payload.jsonl` | pydantic-validated JSON line: state + questions + rankings + decision |
 | `step-NN-answers.json` | every classifier probability (debug stalls here first) |
 | `transcript.jsonl`, `cursor.json` | per-step lines + cursor trail |
 

@@ -89,6 +89,24 @@ def test_propose_accepts_ref_item(monkeypatch):
     assert p is not None and p.item == 0
 
 
+def test_propose_accepts_framed_aria_ref(monkeypatch):
+    import src.writer as _w2
+    from src.deps import ElementRef as _E
+
+    els = [_E(idx=0, kind="link", label="Why", ref="f2e11", aria="f2e11"),
+           _E(idx=1, kind="checkbox", label="Bot", ref="f3e7", aria="f3e7")]
+
+    async def fake_chat(system, user, timeout_s=30.0, max_tokens=400):
+        return {"question": "Tick?", "kind": "click_item",
+                "item": "f3e7", "url": None, "rationale": "Challenge."}
+
+    monkeypatch.setattr(_w2, "_chat_json", fake_chat)
+    p = asyncio.run(_w2.propose_action(
+        task="t", url="https://g.example/", elements=els,
+        page_text="p", history=[], notes=[]))
+    assert p is not None and p.item == 1
+
+
 def test_synthesize_returns_code_and_strips_fences(monkeypatch):
     import src.writer as _w2
 

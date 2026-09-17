@@ -4,12 +4,13 @@ import io
 import json
 import os
 
+import pytest
 from PIL import Image
 
 from src.deps import ElementRef
 from src.report import (
-    annotate_png, append_memory, load_lessons, make_run_dir, replay_payload,
-    write_answers_json, write_payload_txt, write_raw_png,
+    StepPayload, annotate_png, append_memory, load_lessons, make_run_dir,
+    replay_payload, write_answers_json, write_payload_jsonl, write_raw_png,
 )
 
 
@@ -40,16 +41,25 @@ def test_payload_and_answers_roundtrip(tmp_path):
     run_dir = str(tmp_path)
     state = {"task": "t", "elements": [{"idx": 0}]}
     questions = {"kind": {"type": "choice"}}
-    p = write_payload_txt(run_dir, 3, state, questions, "click_item conf=0.90 item=0")
-    assert os.path.exists(p)
-    body = open(p, encoding="utf-8").read()
-    assert "click_item conf=0.90" in body and '"task": "t"' in body
+    answers = {"kind": {"choice": "click_item",
+                        "probabilities": {"click_item": 0.9, "wait": 0.1}}}
+    p = write_payload_jsonl(run_dir, 3, t=1.5, url="https://a.example/",
+                            task="t", state=state, questions=questions,
+                            answers=answers,
+                            decision="click_item conf=0.90 item=0",
+                            phases=["see", "decide", "gate"])
+    assert os.path.exists(p) and p.endswith(".jsonl")
+    doc = StepPayload.model_validate_json(open(p, encoding="utf-8").read().strip())
+    assert doc.n == 3 and doc.url == "https://a.example/"
+    assert doc.answers["kind"]["probabilities"]["click_item"] == 0.9
+    assert doc.phases == ["see", "decide", "gate"]
     raw_png = write_raw_png(run_dir, 3, _png_bytes())
     assert os.path.exists(raw_png)
     a = write_answers_json(run_dir, 3, {"answers": {"kind": {"choice": "click_item"}}})
     assert os.path.exists(a)
     loaded = replay_payload(run_dir, 3)
     assert loaded["answers"]["answers"]["kind"]["choice"] == "click_item"
+    assert loaded["payload"]["decision"].startswith("click_item conf=0.90")
     assert replay_payload(run_dir, 99) == {}
 
 
@@ -93,14 +103,18 @@ def test_write_wire_jsonl_roundtrip(tmp_path):
     assert len(open(p, encoding="utf-8").read().strip().split("\n")) == 2
 
 
-def test_payload_writes_parseable_sections(tmp_path):
+def test_payload_jsonl_sections_parseable(tmp_path):
     import json as _json
     state = {"task": "t", "elements": [{"idx": i} for i in range(60)]}
     questions = {"kind": {"type": "choice", "criteria": {str(i): {"label": f"l{i}"} for i in range(60)}}}
-    p = write_payload_txt(str(tmp_path), 1, state, questions, "done")
-    body = open(p, encoding="utf-8").read()
-    st = _json.loads(body.split("=== step 1 state ===")[1].split("=== questions (criteria) ===")[0])
-    assert len(st["elements"]) == 60
-    q = _json.loads(body.split("=== questions (criteria) ===")[1].split("=== decision ===")[0])
-    assert len(q["kind"]["criteria"]) == 60
-    assert q["kind"]["type"] == "choice"
+    p = write_payload_jsonl(str(tmp_path), 1, state=state, questions=questions,
+                            decision="done")
+    lines = [ln for ln in open(p, encoding="utf-8").read().splitlines() if ln.strip()]
+    assert len(lines) == 1  # one JSON object per line (jsonl)
+    doc = _json.loads(lines[0])
+    assert len(doc["state"]["elements"]) == 60
+    assert len(doc["questions"]["kind"]["criteria"]) == 60
+    assert doc["questions"]["kind"]["type"] == "choice"
+    # schema rejects a bad step number loudly
+    with pytest.raises(Exception):
+        StepPayload.model_validate({"n": 0})

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 import httpx
 
 from .capability.jev_actions import _mask, _resolve_placeholders
-from .decide import Kind
+from .decide import Kind, ref_to_idx
 from .deps import ElementRef
 from .perception import host_of
 
@@ -319,7 +319,7 @@ async def summarize_task(*, task: str, notes: list[str]) -> TaskVerdict:
 PROPOSE_SYSTEM = (
     "You propose the single best next browser action. Reply with JSON only: "
     '{"question": "Should the browser ...?", "kind": "<verb>", '
-    '"item": <element ref like "e4" or null>, "url": "<absolute https URL or null>", '
+    '"item": <element ref like "e4"/"f3e7" or null>, "url": "<absolute https URL or null>", '
     '"rationale": "<one sentence>"}. '
     "Verbs: wait, click_item, type_at, press_enter, press_escape, refresh, back, close_others, "
     "goto, done, none. click_item/type_at need a valid item ref from the map; "
@@ -425,15 +425,9 @@ async def propose_action(*, task: str, url: str, elements: list[ElementRef],
         return None
     item = data.get("item", None)
     if item is not None:
-        # Writer speaks refs (e4); internal proposals stay positional ints.
-        text = str(item).strip()
-        if text.startswith("e"):
-            text = text[1:]
-        try:
-            item = int(text)
-        except (ValueError, TypeError):
-            return None
-        if item < 0 or item >= len(elements):
+        # Writer speaks refs (e4, f3e148); internal proposals stay ints.
+        item = ref_to_idx(str(item), elements)
+        if item < 0:
             return None
     raw_url = data.get("url", None)
     cleaned_url = validate_url(raw_url) if raw_url is not None else None

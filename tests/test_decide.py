@@ -74,8 +74,9 @@ def test_item_options_are_structured():
     assert set(q["item"]["criteria"]) == {"e0"}
     opt = q["item"]["criteria"]["e0"]
     assert opt["label"] == 'e0: input "Search"' and opt["state"] == "filled(1ch)"
-    assert opt["ref"] == "e0" and opt["box"] == "0.010,0.050,0.100,0.050"
-    assert opt["visited"] is False
+    assert opt["ref"] == "e0" and opt["visited"] is False
+    # No coordinates in options (aria identity; boxes resolve lazily at ACT).
+    assert "box" not in opt and "at" not in opt and "sel" not in opt
 
 
 def test_item_choice_caps_at_255():
@@ -152,6 +153,16 @@ def test_decode_challenge_item():
 def test_decode_bad_ref_is_none():
     assert _decode(_raw("click_item", item="e9")).element_idx is None
     assert _decode(_raw("click_item", item="bogus")).element_idx is None
+
+
+def test_decode_matches_native_aria_ref():
+    from src.deps import ElementRef as _E
+    els = [_E(idx=0, kind="checkbox", label="Bot", ref="f3e7", aria="f3e7"),
+           _E(idx=1, kind="link", label="Why", ref="f2e11", aria="f2e11")]
+    raw = _raw("challenge", item="f3e7")
+    from src.decide import _decode as _dec
+    d = _dec(raw, els, ["https://a.example"])
+    assert d.kind == Kind.CHALLENGE and d.element_idx == 0
 
 
 def test_decode_type_at_needs_text():

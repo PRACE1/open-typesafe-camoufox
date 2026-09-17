@@ -117,6 +117,9 @@ MAX_ITEMS = 255  # Jev Choice cardinality cap
 class JevDecision:
     kind: Kind
     element_idx: int | None = None
+    # The model's verbatim item answer (aria ref like e44/f3e7 when the
+    # Choice keys are native refs). Shows HOW the model decided in logs.
+    item_ref: str | None = None
     target_url: str | None = None
     propose_url: bool = False
     confidence: float = 0.0
@@ -172,9 +175,6 @@ def _item_option(e: ElementRef, visited: set[str]) -> dict[str, Any]:
     state = "-"
     if e.kind in ("input", "textarea", "select") or e.type:
         state = f"filled({e.value_len}ch)" if e.value_len else "empty"
-    box = ""
-    if e.box is not None:
-        box = ",".join(f"{v:.3f}" for v in e.box)
     return {
         "label": f"{e.ref}: {e.kind} \"{label}\"",
         "kind": e.kind,
@@ -184,8 +184,6 @@ def _item_option(e: ElementRef, visited: set[str]) -> dict[str, Any]:
         "host": host_of(e.href),
         "region": e.region,
         "state": state,
-        "at": f"{e.cx:.3f},{e.cy:.3f}",
-        "box": box,
         "ref": e.ref,
         "visited": bool(e.href and norm_url(e.href) in visited),
     }
@@ -222,7 +220,7 @@ def build_questions(elements: list[ElementRef], sites: list[str],
                 "question": "Which element should click_item/type_at/challenge act on?",
                 "focus": "Used only for those kinds; still pick the best candidate. "
                          "Each option carries its ref, label, text, href, fill-state, "
-                         "box, and visited mark.",
+                         "and visited mark.",
             },
             "criteria": item_criteria,
         },
@@ -375,14 +373,17 @@ async def decide_heal_action(*, error_msg: str, last_kind: str,
 def ref_to_idx(choice: str, elements: list[ElementRef]) -> int:
     """Map a chosen item back to its positional idx.
 
-    Accepts ephemeral refs (e4) and, for backward compatibility with cached
-    prompts, bare ints (4). Returns -1 when unresolvable (sentinel → idle).
+    Matches native aria refs and positional refs first (exact string),
+    then bare ints for backward compatibility with cached prompts.
+    Returns -1 when unresolvable (sentinel → idle).
     """
     text = (choice or "").strip()
-    if text.startswith("e"):
-        text = text[1:]
+    for e in elements:
+        if text == e.ref or (e.aria and text == e.aria):
+            return e.idx
+    short = text[1:] if text.startswith("e") else text
     try:
-        cand = int(text)
+        cand = int(short)
     except (ValueError, TypeError):
         return -1
     return cand if any(e.idx == cand for e in elements) else -1
@@ -402,9 +403,11 @@ def _decode(decision_raw: dict, elements: list[ElementRef], sites: list[str]) ->
         confidence = 0.0
 
     element_idx: int | None = None
+    item_ref: str | None = None
     if kind in (Kind.CLICK_ITEM, Kind.TYPE_AT, Kind.CHALLENGE):
         item_raw = answers.get("item", {})
-        cand = ref_to_idx(str(item_raw.get("choice", "-1")), elements)
+        item_ref = str(item_raw.get("choice", "") or "") or None
+        cand = ref_to_idx(item_ref or "-1", elements)
         element_idx = cand if cand >= 0 else None
 
     target_url: str | None = None
@@ -433,7 +436,7 @@ def _decode(decision_raw: dict, elements: list[ElementRef], sites: list[str]) ->
         progress = 0.0
 
     return JevDecision(
-        kind=kind, element_idx=element_idx, target_url=target_url,
+        kind=kind, element_idx=element_idx, item_ref=item_ref, target_url=target_url,
         propose_url=propose_url,
         confidence=min(max(confidence, 0.0), 1.0),
         page_ready=_noul("page_ready"), needs_text=_noul("needs_text"),

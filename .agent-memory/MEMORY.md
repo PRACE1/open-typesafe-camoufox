@@ -8,3 +8,4 @@
 - Passwords only ever come from {ENV} placeholders in the task; the writer always declines credentials.
 - `wait` is patience for loading screens, not indecision; `done` needs the concrete outcome quoted from PAGE TEXT.
 - Bot-check pages are worked like any page: the blocked reason rides in state, Jev classifies the verification controls, humanized cursor iterates until it resolves.
+- Re-derive boundary conditions from the spec (inclusive/exclusive, empty/None) and test both sides, not just the happy path. (seen: src/actions.py L251-L300)

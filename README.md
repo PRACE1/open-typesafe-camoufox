@@ -77,8 +77,8 @@ spec: [`src/machine/run_machine.ts`](src/machine/run_machine.ts))
 else heal -> verify accounts it. State diagram is machine-generated (docs/run_machine.dot):
 
 1. **See** ([`src/perception.py`](src/perception.py)) — screenshot the page, probe
-   the DOM into an element map (reading order, ephemeral `eN` refs, no DOM
-   markers), read the
+   the DOM into an element map (aria snapshot: native `eN` refs, roles,
+   names, landmark regions; no DOM markers), read the
    focused field (role/label/placeholder/value, credential flag) and the
    visible page text (the reading ground truth). Bank notes and visited
    URLs for long-horizon memory.
@@ -256,7 +256,7 @@ While a run is going, steer it from another terminal via `steer.txt`
 ## How a step works
 
 Screenshot → element map ([`src/perception.py`](src/perception.py): DOM probe,
-reading order, ephemeral `eN` refs, viewport boxes, zero DOM mutation) + focused field
+reading order, native aria `eN` refs, lazy boxes at ACT, zero DOM mutation) + focused field
 (role/label/placeholder/value, credential flag) + page text (visible words
 — the reading ground truth). Then the writer proposes the single best
 action as a yes/no question ([`src/writer.py`](src/writer.py)), and one Jev
@@ -326,7 +326,7 @@ Every run writes `runs/<timestamp>/`:
 | `run.log`, `run.json` | everything printed; goal, outcome, seconds, config |
 | `step-NN-raw.png` | the screenshot capture |
 | `step-NN.png` | elements numbered blue, chosen red, focused field green |
-| `step-NN-payload.txt` | exact state + criteria sent to Jev, then the decision |
+| `step-NN-payload.jsonl` | pydantic-validated JSON line: state + questions + full Jev answers (rankings) + decision |
 | `step-NN-answers.json` | every probability the classifier returned |
 | `transcript.jsonl`, `cursor.json` | per-step lines + cursor trail |
 

@@ -6,13 +6,13 @@ Every run writes runs/<timestamp>/:
   step-NN-raw.png      the screenshot capture
   step-NN.png          elements numbered in blue, the chosen one red,
                        the focused field outlined green
-  step-NN-payload.txt  the exact state + criteria sent to Jev, then every
-                       element with center + the decoded decision
+  step-NN-payload.jsonl  one pydantic-validated JSON line per step: state +
+                       questions + full Jev answers (rankings) + decision
   step-NN-answers.json every probability the classifier returned
   transcript.jsonl     one JSON line per step (kept from the legacy loop)
   cursor.json          video-agent-compatible cursor trail
 
-A stall replays offline from step-NN-payload.txt + step-NN-answers.json
+A stall replays offline from step-NN-payload.jsonl + step-NN-answers.json
 without touching the screen (see --replay in run.py).
 """
 
@@ -24,7 +24,57 @@ import os
 from datetime import datetime
 from typing import Any
 
+from pydantic import BaseModel, Field, ValidationError
+
 from .deps import ElementRef
+
+
+class StepPayload(BaseModel):
+    """Typed per-step record: everything Jev saw, asked, and answered.
+
+    Written as one JSON object per line (step-NN-payload.jsonl) so rankings
+    (Choice probability distributions) stay machine-parseable — no more
+    .txt dumps. Unknown extra keys are ignored on read for forward compat.
+    """
+
+    model_config = {"extra": "ignore"}
+
+    n: int = Field(ge=1)
+    t: float = 0.0
+    url: str = ""
+    task: str = ""
+    state: dict[str, Any] = Field(default_factory=dict)
+    questions: dict[str, Any] = Field(default_factory=dict)
+    answers: dict[str, Any] = Field(default_factory=dict)
+    decision: str = ""
+    phases: list[str] = Field(default_factory=list)
+
+
+def write_payload_jsonl(run_dir: str, n: int, *, t: float = 0.0,
+                        url: str = "", task: str = "",
+                        state: dict | None = None,
+                        questions: dict | None = None,
+                        answers: dict | None = None,
+                        decision: str = "",
+                        phases: list[str] | None = None) -> str:
+    """Validate one step record and append it as JSONL (one line per step).
+
+    Pydantic-validated on write: a schema break fails loudly in tests and
+    is caught here so a run never dies on its own telemetry — the raw dict
+    still lands for forensics.
+    """
+    path = os.path.join(run_dir, f"step-{n:02d}-payload.jsonl")
+    obj = {"n": n, "t": t, "url": url, "task": task,
+           "state": state or {}, "questions": questions or {},
+           "answers": answers or {}, "decision": decision,
+           "phases": phases or []}
+    try:
+        line = StepPayload.model_validate(obj).model_dump_json()
+    except ValidationError:
+        line = json.dumps(obj, ensure_ascii=False)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    return path
 
 
 def make_run_dir() -> str:
@@ -45,10 +95,11 @@ def write_raw_png(run_dir: str, n: int, png_bytes: bytes) -> str:
 def annotate_png(png_bytes: bytes, elements: list[ElementRef],
                  chosen_idx: int | None = None,
                  focused_frame: dict | None = None) -> bytes:
-    """Ref boxes (blue), chosen element red, focused field green.
+    """Acted ref box (blue), chosen element red, focused field green.
 
-    Boxes are viewport-normalized; elements without one fall back to the
-    legacy cx/cy ring so old replays still annotate.
+    Boxes are banked at dispatch time (lazy aria resolution); elements
+    never acted on carry box=None and are skipped. Replays of older runs
+    fall back to cx/cy rings.
     """
     from PIL import Image, ImageDraw
 
@@ -91,24 +142,6 @@ def write_annotated_png(run_dir: str, n: int, png_bytes: bytes,
         out = png_bytes
     with open(path, "wb") as f:
         f.write(out)
-    return path
-
-
-def write_payload_txt(run_dir: str, n: int, state: dict[str, Any],
-                      questions: dict[str, Any], decision: str) -> str:
-    path = os.path.join(run_dir, f"step-{n:02d}-payload.txt")
-    lines = [
-        f"=== step {n} state ===",
-        json.dumps(state, ensure_ascii=False, indent=1),
-        "",
-        "=== questions (criteria) ===",
-        json.dumps(questions, ensure_ascii=False, indent=1),
-        "",
-        "=== decision ===",
-        decision,
-    ]
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
     return path
 
 
@@ -160,6 +193,20 @@ def replay_payload(run_dir: str, n: int) -> dict[str, Any]:
     if os.path.exists(answers_path):
         with open(answers_path, encoding="utf-8") as f:
             out["answers"] = json.load(f)
+    payload_path = os.path.join(run_dir, f"step-{n:02d}-payload.jsonl")
+    if os.path.exists(payload_path):
+        with open(payload_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out["payload"] = StepPayload.model_validate_json(line).model_dump()
+                except (ValidationError, ValueError):
+                    try:
+                        out["payload"] = json.loads(line)
+                    except ValueError:
+                        continue
     return out
 
 

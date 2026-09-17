@@ -184,17 +184,24 @@ def _choice_is_vetoed(elements: list, idx: int | None) -> bool:
     return el is not None and el.kind in BARE_CLICK_VETO_KINDS
 
 
-def _apply_proposal(decision, proposed: ProposedAction):
+def _apply_proposal(decision, proposed: ProposedAction, elements=None):
     """Rewrite the decision to the approved/fallback proposal.
 
     Confidence is boosted past the gate; guard/verify rails still apply
     downstream, so a bad proposal costs ~one step, not the run.
     """
+    ref = decision.item_ref
+    if proposed.item is not None and elements is not None:
+        hit = next((e for e in elements if e.idx == proposed.item), None)
+        ref = hit.ref if hit is not None else None
+    elif proposed.item is None:
+        ref = None
     return replace(
         decision,
         kind=Kind(proposed.kind),
         element_idx=proposed.item
         if proposed.kind in ("click_item", "type_at", "challenge") else None,
+        item_ref=ref,
         target_url=proposed.url if proposed.kind == "goto" else None,
         propose_url=proposed.kind == "goto" and proposed.url is None,
         confidence=max(decision.confidence, decision.approval),
@@ -634,7 +641,9 @@ async def run_decide_session(
             # text, but a ready verdict never overrides a loading regex.
             ready_now = page_settled(page_text) and decision.page_ready >= 0.35
             log(f"DECIDE {decision.kind.value} conf={conf:.2f}"
-                + (f" item=#{decision.element_idx}" if decision.element_idx is not None else "")
+                + (f" item=#{decision.element_idx}"
+                   + (f"/{decision.item_ref}" if decision.item_ref else "")
+                   if decision.element_idx is not None else "")
                 + (f" site={decision.target_url or 'other...'}" if decision.kind == Kind.GOTO else "")
                 + f" | ready={decision.page_ready:.2f} text?={decision.needs_text:.2f}"
                 + f" done?={decision.task_done:.2f} prog={decision.progress:.2f}"
@@ -668,7 +677,7 @@ async def run_decide_session(
                     + f" (approval={decision.approval:.2f}) — executing proposal over Choice")
                 history.append(f"step {steps}: approved proposal — {proposed.rationale[:100]}")
                 entry["decide"] += " [approved-override]"
-                decision = _apply_proposal(decision, proposed)
+                decision = _apply_proposal(decision, proposed, elements)
                 conf = decision.confidence
             elif route == "fallback":
                 log(f"VETO-FALLBACK {proposed.kind}"
@@ -676,7 +685,7 @@ async def run_decide_session(
                     + f" (approval={decision.approval:.2f}) — Choice pick vetoed/mismatched, trying proposal")
                 history.append(f"step {steps}: veto fallback — {proposed.rationale[:100]}")
                 entry["decide"] += " [veto-fallback]"
-                decision = _apply_proposal(decision, proposed)
+                decision = _apply_proposal(decision, proposed, elements)
                 conf = decision.confidence
             elif route == "mismatch-idle":
                 m_sig = (
@@ -1101,7 +1110,7 @@ async def run_decide_session(
                             else:  # REMAP_STALE
                                 fresh, new_idx = await heal_target(
                                     platform, old_label,
-                                    target.kind, target.sel)
+                                    target.kind, target.sel, target.aria)
                                 if new_idx is not None and new_idx != idx:
                                     log(f"HEAL   remapped #{idx} -> #{new_idx} — one re-attempt")
                                     history.append(f"step {steps}: healed #{idx} -> #{new_idx}, retrying")
@@ -1215,13 +1224,18 @@ async def run_decide_session(
                 run_dir, steps, raw_png, elements,
                 chosen_idx=decision.element_idx, focused_frame=focused.frame or None,
             )
-            report_mod.write_payload_txt(
-                run_dir, steps, state_packet, build_questions(elements, sites, visited),
-                f"{decision.kind.value} conf={decision.confidence:.2f} "
-                f"item={decision.element_idx} "
-                f"ready={decision.page_ready:.2f} text?={decision.needs_text:.2f} "
-                f"done?={decision.task_done:.2f} prog={decision.progress:.2f} "
-                f"appr={decision.approval:.2f}",
+            report_mod.write_payload_jsonl(
+                run_dir, steps, t=entry.get("t", 0.0), url=page.url,
+                task=effective_task, state=state_packet,
+                questions=build_questions(elements, sites, visited),
+                answers=decision.raw,
+                decision=(f"{decision.kind.value} conf={decision.confidence:.2f} "
+                          f"item={decision.element_idx} "
+                          f"ref={decision.item_ref} "
+                          f"ready={decision.page_ready:.2f} text?={decision.needs_text:.2f} "
+                          f"done?={decision.task_done:.2f} prog={decision.progress:.2f} "
+                          f"appr={decision.approval:.2f}"),
+                phases=list(phase_trail),
             )
             entry["phases"] = list(phase_trail)
             report_mod.write_wire(run_dir, {
@@ -1243,7 +1257,7 @@ async def run_decide_session(
                      "text": e.text, "value_len": e.value_len,
                      "href": e.href, "region": e.region,
                      "host": perception.host_of(e.href),
-                     "ref": e.ref,
+                     "ref": e.ref, "aria": e.aria,
                      "cx": e.cx, "cy": e.cy}
                     for e in elements
                 ],

@@ -4,8 +4,9 @@ import pytest
 
 from src.runner import (
     APPROVAL_MIN, BARE_CLICK_VETO_KINDS, EFFECT_KINDS, OVERRIDABLE_KINDS,
-    Phase, credential_placeholder, fresh_tabs, loop_guard_trip, page_settled,
-    phase_step, proposal_executable, should_override,
+    READING_COOLDOWN_STEPS, Phase, credential_placeholder, fresh_tabs,
+    loop_guard_trip, page_settled, phase_step, proposal_executable,
+    reading_cooldown_active, should_override,
 )
 from src.writer import ProposedAction
 
@@ -153,3 +154,11 @@ def test_fresh_tabs_reconciliation():
     assert fresh_tabs({1, 2}, {1, 2, 3}) == {3}
     assert fresh_tabs({1, 2}, {1, 2}) == set()
     assert fresh_tabs(set(), {1}) == {1}  # first sighting lists all
+
+
+def test_reading_cooldown_window():
+    assert READING_COOLDOWN_STEPS == 4
+    assert reading_cooldown_active(7, 10) is True
+    assert reading_cooldown_active(10, 10) is True  # boundary inclusive
+    assert reading_cooldown_active(11, 10) is False
+    assert reading_cooldown_active(3, 0) is False  # never adopted

@@ -127,6 +127,18 @@ def fresh_tabs(known: set[int], current: set[int]) -> set[int]:
     return current - known
 
 
+# Steps a newly adopted result tab is protected from goto: the loop opened
+# this page to READ it, so leaving immediately (the observed goto-back to
+# Google) abandons the whole point. Rejections are neutral corrections,
+# not no-ops — the other stop rails still terminate honestly.
+READING_COOLDOWN_STEPS = 4
+
+
+def reading_cooldown_active(steps: int, until_step: int) -> bool:
+    """True while the loop must stay on its adopted page and read."""
+    return steps <= until_step
+
+
 class Phase(str, Enum):
     """Run-loop phases — the explicit Python state machine.
 
@@ -248,6 +260,8 @@ async def run_decide_session(
     dead_run = 0
     last_effect_kind: str | None = None
     known_tab_ids: set[int] = set()
+    reading_until_step: int = 0
+    last_page_id: int | None = None
     phase_trail: list[str] = []
     steer_consumed = 0
     started = datetime.now().isoformat(timespec="seconds")
@@ -266,6 +280,7 @@ async def run_decide_session(
         await platform.start_cursor_tracking()
         log(f"tracker selftest: {'PASS' if await platform.cursor_selftest() else 'WARN — cursor.json may be incomplete'}")
         known_tab_ids = platform.tab_ids()
+        last_page_id = id(platform.page)
 
         while time.time() < t_end and steps < max_steps and not done and not stopped:
             if paused:
@@ -309,6 +324,20 @@ async def run_decide_session(
             focused = await perception.get_focused_field(platform)
             page_text = await perception.get_page_text(platform)
             n_tabs = await platform.tab_count()
+            # TAB SWITCH: a new platform page means an adoption happened —
+            # start the reading cooldown and recapture the DOM digest now so
+            # the fresh tab is read in context instead of abandoned.
+            if last_page_id is not None and id(platform.page) != last_page_id:
+                reading_until_step = steps + READING_COOLDOWN_STEPS
+                head = page_text.strip().replace("\n", " ")[:120]
+                msg = (f"step {steps}: TAB SWITCH — reading {platform.page.url} "
+                       f"({len(elements)} elements, {len(page_text.strip())}ch"
+                       f"{' :: ' + head if head else ''}); "
+                       f"goto refused until step {reading_until_step}")
+                log(f"TABS   {msg}")
+                history.append(msg)
+                entry.setdefault("tabs", []).append(f"switched; cooldown to {reading_until_step}")
+            last_page_id = id(platform.page)
             try:
                 page_host = urllib.parse.urlparse(page.url).netloc.lower()
             except ValueError:
@@ -379,12 +408,22 @@ async def run_decide_session(
             # it as the approval Noul below — LLM reasons, Noul confirms.
             # The question is wrapped with the candidate + rationale as
             # structured supporting data (docs: structure sharpens Nouls).
+            # On a freshly adopted result page the model is told to read it,
+            # not navigate away (matches the goto reading cooldown).
             proposed = None
             approval_struct: dict | str | None = None
+            reading_note = ""
+            if reading_cooldown_active(steps, reading_until_step):
+                reading_note = (
+                    f"CURRENTLY READING (adopted result page): {page.url} — "
+                    "read THIS page's content toward the task; do NOT propose "
+                    "goto or leaving this page."
+                )
             try:
                 proposed = await propose_action(
                     task=effective_task, url=page.url, elements=elements,
                     page_text=page_text, history=history, notes=notes,
+                    reading_note=reading_note,
                 )
             except Exception as exc:  # noqa: BLE001
                 log(f"PROPOSE failed ({exc.__class__.__name__})")
@@ -538,31 +577,38 @@ async def run_decide_session(
                     history.append(f"step {steps}: DONE — {note[:80]}")
                     log(f"DONE   {note[:120]}")
             elif decision.kind == Kind.GOTO:
-                target = decision.target_url
-                if decision.propose_url or not target:
-                    proposed = await propose_url(task=effective_task, history=history)
-                    target = proposed.url if proposed.ok else None
-                if not target:
-                    log("GOTO   no valid URL — idle")
-                    history.append(f"step {steps}: goto without URL, idled")
-                    entry["act"] = "goto (no URL)"
-                    noops += 1
+                if reading_cooldown_active(steps, reading_until_step):
+                    msg = (f"step {steps}: GOTO REJECTED (reading cooldown to step "
+                           f"{reading_until_step}) — read the adopted result page first")
+                    log(f"GOTO denied: {msg}")
+                    history.append(msg)
+                    entry["act"] = "goto rejected (reading)"
                 else:
-                    log(f"ACT    goto {target}")
-                    res = await goto_url(platform, target)
-                    log(f"RESULT {res}")
-                    if action_failed(res):
-                        history.append(f"step {steps}: goto failed — {res}")
-                        entry["act"] = f"goto {target}"
-                        entry["result"] = res
+                    target = decision.target_url
+                    if decision.propose_url or not target:
+                        proposed = await propose_url(task=effective_task, history=history)
+                        target = proposed.url if proposed.ok else None
+                    if not target:
+                        log("GOTO   no valid URL — idle")
+                        history.append(f"step {steps}: goto without URL, idled")
+                        entry["act"] = "goto (no URL)"
                         noops += 1
                     else:
-                        entry["act"] = f"goto {target}"
-                        entry["result"] = res
-                        history.append(f"step {steps}: goto {target} — {res}")
-                        moves += 1
-                        noops = 0
-                        acted = True
+                        log(f"ACT    goto {target}")
+                        res = await goto_url(platform, target)
+                        log(f"RESULT {res}")
+                        if action_failed(res):
+                            history.append(f"step {steps}: goto failed — {res}")
+                            entry["act"] = f"goto {target}"
+                            entry["result"] = res
+                            noops += 1
+                        else:
+                            entry["act"] = f"goto {target}"
+                            entry["result"] = res
+                            history.append(f"step {steps}: goto {target} — {res}")
+                            moves += 1
+                            noops = 0
+                            acted = True
             elif decision.kind == Kind.PRESS_ENTER:
                 log("ACT    key=Enter")
                 res = await press_key(platform, "Enter")

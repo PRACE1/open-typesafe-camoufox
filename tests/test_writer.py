@@ -109,3 +109,15 @@ def test_propose_no_elements_no_call(monkeypatch):
     assert asyncio.run(propose_action(task="t", url="u", elements=[],
                                       page_text="p", history=[], notes=[])) is None
     assert fake.calls == []
+
+
+def test_propose_reading_note_reaches_prompt(monkeypatch):
+    fake = _fake_chat({"question": "Should the browser wait?",
+                       "kind": "wait", "item": None, "url": None,
+                       "rationale": "Reading."})
+    monkeypatch.setattr(_w, "_chat_json", fake)
+    p = asyncio.run(propose_action(task="t", url="u", elements=_els(),
+                                   page_text="p", history=[], notes=[],
+                                   reading_note="CURRENTLY READING: https://a.example/"))
+    assert isinstance(p, ProposedAction) and p.kind == "wait"
+    assert "CURRENTLY READING" in fake.calls[0][1]

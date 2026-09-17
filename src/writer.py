@@ -231,7 +231,7 @@ def summarize_elements(elements: list[ElementRef]) -> str:
 
 async def propose_action(*, task: str, url: str, elements: list[ElementRef],
                          page_text: str, history: list[str],
-                         notes: list[str]) -> ProposedAction | None:
+                         notes: list[str], reading_note: str = "") -> ProposedAction | None:
     """Ask the small model for the single best next action as a yes/no question.
 
     Returns None when there is nothing to propose from (no key, no elements,
@@ -240,8 +240,11 @@ async def propose_action(*, task: str, url: str, elements: list[ElementRef],
     """
     if not elements:
         return None
+    context = ""
+    if reading_note:
+        context = f"CONTEXT: {reading_note}\n"
     user = (
-        f"TASK: {task}\nURL: {url}\n"
+        f"TASK: {task}\nURL: {url}\n{context}"
         f"ELEMENTS (idx kind label -> host [region] state):\n{summarize_elements(elements)}\n"
         f"PAGE TEXT:\n{(page_text or '').strip()[:600]}\n"
         f"NOTES:\n" + "\n".join(notes[-4:]) + "\n"

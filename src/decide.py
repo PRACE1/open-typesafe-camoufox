@@ -542,3 +542,59 @@ async def decide_action(
     }
     data = await _post(payload, timeout_s, base, key)
     return _decode(data, elements, sites)
+
+
+async def decide_restart_action(*, candidates: list[str], current_url: str,
+                                streak: int,
+                                timeout_s: float = 15.0
+                                ) -> tuple[str, str | None, float]:
+    """Jev-scored restart choice after repeated screenshot failures.
+
+    The model ranks where to restart from: back in history, or one of the
+    recently visited URLs (goto). Returns (action, url, conf) with action
+    in {"goto", "back"}; url is None for back. No-key or failure fallback
+    is ("back", None, 0.0) — history-back is the safe default, never a guess.
+    """
+    base, key, model = _env()
+    if not key:
+        return "back", None, 0.0
+    site_criteria: dict[str, Any] = {
+        str(i): url[:160] for i, url in enumerate(candidates or [])}
+    site_criteria["back"] = {
+        "what": "Go back in history to the previous working page",
+        "not_for": "When history is known to hold the dead page",
+    }
+    payload: dict[str, Any] = {
+        "model": model,
+        "state": {"current_url": (current_url or "")[:160],
+                  "screenshot_failures": streak},
+        "questions": {
+            "restart": {
+                "type": "choice",
+                "instructions": {
+                    "question": "Screenshots keep failing on this page. Where is the best place to restart from?",
+                    "focus": ("Prefer a recently visited working page over blind back. "
+                              "Pick back only when no candidate looks alive."),
+                },
+                "criteria": site_criteria,
+            },
+        },
+    }
+    try:
+        data = await _post(payload, timeout_s, base, key)
+    except Exception:
+        return "back", None, 0.0
+    answers = data.get("answers", {}) if isinstance(data, dict) else {}
+    raw = answers.get("restart", {})
+    choice = str(raw.get("choice", "back") or "back")
+    if choice == "back":
+        return "back", None, 0.0
+    try:
+        url = (candidates or [])[int(choice)]
+    except (ValueError, IndexError, TypeError):
+        return "back", None, 0.0
+    try:
+        conf = float(raw.get("confidence", 0.0) or 0.0)
+    except (ValueError, TypeError):
+        conf = 0.0
+    return "goto", url, min(max(conf, 0.0), 1.0)

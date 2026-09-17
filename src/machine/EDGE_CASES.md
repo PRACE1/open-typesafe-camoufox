@@ -35,6 +35,7 @@ IDs used in commit messages and the run log (`EDGE #n`).
 | 27 | Novel widget (wallet popup, canvas) | triage `expand_capability` + novelty ≥ 0.70 | writer synthesizes `execute(platform, ref, ctx)`; AST + signature + 3s dry-run gates; register `heal_step<N>`, execute once, audit to run dir | handled (`writer.py`, `capability/validator.py`, `capability/dynamic_registry.py`, `runner.py`) |
 | 28 | Off-snapshot element (portal, unmounted dropdown) | ref missing from snapshot map | 3-tier cascade: known `aria-ref=` → `fN` iframe → raw CSS passthrough; eval hatch via synthesized `page.evaluate` | handled (`capability/aria_refs.py`, `runner.py`) |
 | 29 | Noop stall (idle/wait/gate with budgets left) | step ends without acting or completing | recovery cycle: classify → select (heuristic, Jev tie-break) → one compensating dispatch (refresh/escape/back) → reread → verify; bounded, audited in `entry["recover"]` | handled (`runner.py`, `decide.py`, engine `recover` state) |
+| 30 | Wedged capture pipe (screenshot timeouts) | `shot_streak` 3/6/9 | Jev-scored restart (back vs recent visited URLs); streak 12+ stops honestly for mission relaunch; per-step verdict `unresolved` | handled (`runner.py`, `decide.py`) |
 
 ## Notes on #6 (blocked pages)
 

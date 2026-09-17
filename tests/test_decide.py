@@ -5,7 +5,7 @@ import asyncio
 from src.decide import (
     HEAL_CRITERIA, HealStrategy, Kind, KIND_CRITERIA, MAX_ITEMS, JevDecision,
     build_questions, decide_action, decide_heal_action,
-    decide_recovery_action, ref_to_idx,
+    decide_recovery_action, decide_restart_action, ref_to_idx,
 )
 from src.deps import ElementRef, FocusedField
 
@@ -290,3 +290,38 @@ def test_recovery_triage_invalid_choice_abstains(monkeypatch):
     monkeypatch.setenv("TYPESAFE_API_KEY", "k")
     assert asyncio.run(decide_recovery_action(
         reason="unknown", act="x", result="", page_excerpt="p")) == ("none", 0.0)
+
+
+def test_restart_action_no_key_defaults_back(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    assert asyncio.run(decide_restart_action(
+        candidates=["https://a.example/"], current_url="https://b.example/",
+        streak=3)) == ("back", None, 0.0)
+
+
+def test_restart_action_decodes_goto_and_clamps(monkeypatch):
+    import src.decide as _decide
+
+    async def _fake_post(payload, timeout_s, base, key):
+        crit = payload["questions"]["restart"]["criteria"]
+        assert "back" in crit and crit["0"].startswith("https://a.example")
+        return {"answers": {"restart": {"choice": "0", "confidence": 9.9}}}
+
+    monkeypatch.setattr(_decide, "_post", _fake_post)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    assert asyncio.run(decide_restart_action(
+        candidates=["https://a.example/"], current_url="https://b.example/",
+        streak=6)) == ("goto", "https://a.example/", 1.0)
+
+
+def test_restart_action_invalid_choice_defaults_back(monkeypatch):
+    import src.decide as _decide
+
+    async def _fake_post(payload, timeout_s, base, key):
+        return {"answers": {"restart": {"choice": "7"}}}
+
+    monkeypatch.setattr(_decide, "_post", _fake_post)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    assert asyncio.run(decide_restart_action(
+        candidates=["https://a.example/"], current_url="https://b.example/",
+        streak=3)) == ("back", None, 0.0)

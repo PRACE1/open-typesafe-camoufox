@@ -9,7 +9,8 @@ from src.runner import (
     classify_noop, confidence_gated, credential_placeholder, fresh_tabs,
     is_blank_page, loop_guard_trip, no_effect_trip, page_settled,
     phase_step, proposal_executable, reading_cooldown_active,
-    resolve_proposal_action, select_recovery, should_override,
+    resolve_proposal_action, restart_candidates, screenshot_dead,
+    screenshot_should_restart, select_recovery, should_override,
     should_submit_instead, step_verdict, stop_limits,
 )
 from src.runner import _apply_proposal as _apply_proposal_fn
@@ -314,6 +315,25 @@ def test_stop_limits_scale_with_budget():
     assert stop_limits(100) == (3, 2, 6)
     assert stop_limits(1000) == (20, 10, 20)
     assert stop_limits(500) == (10, 5, 10)
+
+
+def test_restart_candidates_recent_first_no_current():
+    urls = ["https://a.example/", "https://b.example/", "https://a.example/"]
+    assert restart_candidates(urls, "https://b.example/") == ["https://a.example/"]
+    assert restart_candidates(urls, "https://z.example/", limit=1) == ["https://a.example/"]
+    assert restart_candidates([], "https://z.example/") == []
+
+
+def test_screenshot_restart_schedule_and_dead_stop():
+    assert screenshot_should_restart(0) is False
+    assert screenshot_should_restart(2) is False
+    assert screenshot_should_restart(3) is True
+    assert screenshot_should_restart(4) is False
+    assert screenshot_should_restart(6) is True
+    assert screenshot_should_restart(9) is True
+    assert screenshot_should_restart(12) is False  # dead, not restart
+    assert screenshot_dead(11) is False
+    assert screenshot_dead(12) is True
 
 
 def test_classify_noop_maps_records_to_reasons():

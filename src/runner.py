@@ -33,7 +33,7 @@ from .capability.resolve import read_input_value
 from .capability.dynamic_registry import register_capability
 from .capability.human_move import HUMANIZE_LEVEL
 from .capability.validator import validate_capability
-from .decide import HealStrategy, Kind, decide_action, decide_heal_action, decide_recovery_action
+from .decide import HealStrategy, Kind, decide_action, decide_heal_action, decide_recovery_action, decide_restart_action
 from .deps import RunState
 from .machine.run_engine import EDGES as _ENGINE_EDGES
 from .machine.run_engine import RunMachine, advance, state_id
@@ -132,6 +132,32 @@ def stop_limits(max_steps: int) -> tuple[int, int, int]:
     return (max(STOP_AFTER_NOOPS, steps // 50),
             max(2, steps // 100),
             max(6, steps // 50))
+
+
+def restart_candidates(visited: list[str], current_url: str,
+                       limit: int = 5) -> list[str]:
+    """Most-recent distinct visited URLs excluding the current page.
+
+    Restart ranking pool for decide_restart_action: known-alive pages
+    first, bounded so the Choice stays small.
+    """
+    out: list[str] = []
+    for url in reversed(visited or []):
+        if url and url != current_url and url not in out:
+            out.append(url)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def screenshot_should_restart(streak: int) -> bool:
+    """Restart attempts at every 3rd consecutive capture failure (3, 6, 9)."""
+    return streak >= 3 and (streak - 3) % 3 == 0 and streak < 12
+
+
+def screenshot_dead(streak: int) -> bool:
+    """The capture pipe is unrecoverable: stop honestly, mission relaunches."""
+    return streak >= 12
 
 
 def classify_noop(act: str, result: Any = None, *, blank: bool = False,
@@ -502,6 +528,8 @@ async def run_decide_session(
     escalated_urls: set[str] = set()
     last_typed: tuple | None = None  # (element idx, page url) of the last successful type
     blank_streak = 0  # consecutive blank SEEs (dead loads draw waits forever)
+    shot_streak = 0  # consecutive screenshot failures (wedged capture pipe)
+    restart_tries = 0  # Jev-scored restart attempts this session
     recoveries: list[dict] = []  # audited recovery attempts (bounded, never blind repeats)
     recover_cap = max(3, max_steps // 100)
     recover_cap = max(3, max_steps // 100)
@@ -600,10 +628,53 @@ async def run_decide_session(
             page = platform.page
             try:
                 raw_png = await page.screenshot(type="png")
+                shot_streak = 0
             except Exception as exc:
-                log(f"SEE    screenshot failed: {exc}")
-                entry["see"] = f"screenshot failed: {exc}"
-                history.append(f"step {steps}: screenshot failed")
+                shot_streak += 1
+                log(f"SEE    screenshot failed x{shot_streak}: {exc}")
+                entry["see"] = f"screenshot failed x{shot_streak}: {exc}"
+                history.append(f"step {steps}: screenshot failed x{shot_streak}")
+                entry["verdict"] = "unresolved"
+                if screenshot_dead(shot_streak):
+                    stopped = True
+                    stop_reason = (f"page unresponsive: {shot_streak} consecutive "
+                                   f"screenshot failures — mission relaunches fresh")
+                    entry["restart"] = {"attempts": restart_tries,
+                                        "outcome": "terminal"}
+                    log(f"STOP   {stop_reason}")
+                    if state_id(machine) == "see":
+                        advance(machine, phase_trail, "abort")  # see -> stopped
+                    else:
+                        log(f"STOP   machine at {state_id(machine)}, trail ends without terminal")
+                    report_mod.append_transcript(run_dir, entry)
+                    break
+                if screenshot_should_restart(shot_streak):
+                    restart_tries += 1
+                    try:
+                        current = page.url
+                    except Exception:
+                        current = ""
+                    cands = restart_candidates(visited, current)
+                    action, url, conf = await decide_restart_action(
+                        candidates=cands, current_url=current,
+                        streak=shot_streak)
+                    if action != "goto" or conf < 0.4 or not url:
+                        action, url = "back", None
+                    if action == "back":
+                        try:
+                            res = await platform.go_back()
+                        except Exception as exc2:
+                            res = f"error: back failed: {exc2}"
+                        dest = "history-back"
+                    else:
+                        res = await goto_url(platform, url or "")
+                        dest = url
+                    history.append(f"step {steps}: restart -> {dest} (jev-scored {action}) — {str(res)[:100]}")
+                    entry["restart"] = {"streak": shot_streak,
+                                        "tries": restart_tries,
+                                        "action": action, "dest": dest,
+                                        "result": str(res)[:200]}
+                    log(f"RESTART {action} -> {dest} — {str(res)[:100]}")
                 report_mod.append_transcript(run_dir, entry)
                 await asyncio.sleep(interval)
                 continue

@@ -21,7 +21,12 @@ from statemachine import State, StateMachine
 
 
 class RunMachine(StateMachine):
-    """One step walks see -> decide -> gate -> [act] -> verify."""
+    """One step walks see -> decide -> gate -> [act] -> verify.
+
+    A noop step with budget left detours verify -> recover -> see: exactly
+    one compensating dispatch (refresh/escape/back) after fresh observation,
+    never a blind repeat. See docs/PYDANTIC_AI_CONTRACT.md section 8.
+    """
 
     see = State(initial=True)
     decide = State()
@@ -29,6 +34,7 @@ class RunMachine(StateMachine):
     act = State()
     verify = State()
     heal = State()
+    recover = State()
     done = State(final=True)
     stopped = State(final=True)
 
@@ -42,6 +48,8 @@ class RunMachine(StateMachine):
     heal_needed = act.to(heal)
     healed = heal.to(act, cond="healed_target_ready")
     heal_failed = heal.to(verify)
+    recover_needed = verify.to(recover)
+    recovered = recover.to(see)
     continue_run = verify.to(see)
 
     def healed_target_ready(self) -> bool:
@@ -56,6 +64,10 @@ class RunMachine(StateMachine):
     def on_enter_heal(self, **kwargs) -> None:
         """Telemetry hook: count heal entries per session for the run log."""
         self.heal_attempts = getattr(self, "heal_attempts", 0) + 1
+
+    def on_enter_recover(self, **kwargs) -> None:
+        """Telemetry hook: count recovery entries per session."""
+        self.recover_attempts = getattr(self, "recover_attempts", 0) + 1
 
     def after_transition(self, **kwargs) -> None:
         """Forensics hook: bounded log of (source, target) id pairs.
@@ -89,7 +101,8 @@ EDGES: dict[str, set[str]] = {
     "gate": {"act", "verify", "done", "stopped"},
     "act": {"verify", "heal"},
     "heal": {"act", "verify"},
-    "verify": {"see", "done", "stopped"},
+    "verify": {"see", "done", "stopped", "recover"},
+    "recover": {"see"},
     "done": set(),
     "stopped": set(),
 }

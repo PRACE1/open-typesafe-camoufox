@@ -4,7 +4,8 @@ import asyncio
 
 from src.decide import (
     HEAL_CRITERIA, HealStrategy, Kind, KIND_CRITERIA, MAX_ITEMS, JevDecision,
-    build_questions, decide_action, decide_heal_action, ref_to_idx,
+    build_questions, decide_action, decide_heal_action,
+    decide_recovery_action, ref_to_idx,
 )
 from src.deps import ElementRef, FocusedField
 
@@ -255,3 +256,37 @@ def test_heal_triage_invalid_choice_falls_back(monkeypatch):
     strat, need = asyncio.run(decide_heal_action(
         error_msg="e", last_kind="click_item", page_text="p"))
     assert strat == HealStrategy.REMAP_STALE and need == 0.0
+
+
+def test_recovery_triage_no_key_abstains(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    strat, conf = asyncio.run(decide_recovery_action(
+        reason="unknown", act="none", result="", page_excerpt="p"))
+    assert (strat, conf) == ("none", 0.0)
+
+
+def test_recovery_triage_decodes_choice_and_clamps(monkeypatch):
+    import src.decide as _decide
+
+    async def _fake_post(payload, timeout_s, base, key):
+        assert "recovery" in payload["questions"]
+        return {"answers": {"recovery": {"choice": "escape",
+                                         "confidence": 9.9}}}
+
+    monkeypatch.setattr(_decide, "_post", _fake_post)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    strat, conf = asyncio.run(decide_recovery_action(
+        reason="covered", act="x", result="covered:div", page_excerpt="p"))
+    assert (strat, conf) == ("escape", 1.0)
+
+
+def test_recovery_triage_invalid_choice_abstains(monkeypatch):
+    import src.decide as _decide
+
+    async def _fake_post(payload, timeout_s, base, key):
+        return {"answers": {"recovery": {"choice": "teleport"}}}
+
+    monkeypatch.setattr(_decide, "_post", _fake_post)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    assert asyncio.run(decide_recovery_action(
+        reason="unknown", act="x", result="", page_excerpt="p")) == ("none", 0.0)

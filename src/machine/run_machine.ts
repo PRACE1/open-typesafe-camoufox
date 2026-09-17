@@ -12,6 +12,9 @@ import { assign, setup } from 'xstate';
  *
  * A stale/covered click detours acting -> healing -> acting (one
  * label-remapped re-attempt) or acting -> healing -> verifying.
+ * A noop step with budget left detours verifying -> recovering -> seeing:
+ * exactly one compensating dispatch (refresh/escape/back) after fresh
+ * observation, never a blind repeat (docs/PYDANTIC_AI_CONTRACT.md 8).
  * The executable twin is src/machine/run_engine.py (python-statemachine),
  * which the runner drives event-by-event; this file is the readable spec.
  *
@@ -45,6 +48,8 @@ type RunEvent =
   | { type: 'HEAL_NEEDED'; reason: string }
   | { type: 'HEALED'; item: number }
   | { type: 'HEAL_FAILED' }
+  | { type: 'RECOVER_NEEDED'; reason: string }
+  | { type: 'RECOVERED'; action: string }
   | { type: 'DONE_ACCEPTED' }
   | { type: 'LIMITS_HIT'; reason: string }
   | { type: 'SYNTH_DONE'; note: string }
@@ -158,11 +163,24 @@ export const otcRunMachine = setup({
     },
     verifying: {
       // fingerprint vs last step (no-effect), stop-rule evaluation,
-      // synthesis verdict as last resort before stopping.
+      // synthesis verdict as last resort before stopping. A noop step
+      // with budget left detours to recovering for one compensation.
       always: [
         { target: 'stopped', guard: 'limitsHit' },
         { target: 'seeing' },
       ],
+      on: {
+        RECOVER_NEEDED: { target: 'recovering' },
+      },
+    },
+    recovering: {
+      // exactly one compensating dispatch (refresh/escape/back) on the
+      // freshly observed page; then back to seeing to verify by fingerprint.
+      invoke: {
+        src: 'compensate',
+        onDone: { target: 'seeing' },
+        onError: { target: 'seeing' },
+      },
     },
     done: { type: 'final' },
     stopped: { type: 'final' },

@@ -16,7 +16,7 @@ Repo: `open-typesafe-camoufox/`. Call shape from the repo root:
 uv run otc.py --url <start-url> --task "<plain-English goal>" --budget 240 --max-steps 20
 ```
 
-Runtime rules: `docs/LIBRARIES.md` · State machine rules: `docs/STATEMACHINE_CONVENTIONS.md` · Ref dictionary: `docs/REF_TYPES.md`
+Runtime rules: `docs/LIBRARIES.md` · State machine rules: `docs/STATEMACHINE_CONVENTIONS.md` · Ref dictionary: `docs/REF_TYPES.md` · Pydantic AI contract: `docs/PYDANTIC_AI_CONTRACT.md`
 
 ## Setup (once)
 

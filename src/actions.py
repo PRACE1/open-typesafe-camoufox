@@ -702,6 +702,47 @@ async def type_at(platform, elements: list[ElementRef], idx: int, text: str,
                 platform.resume_idle_motion()
 
 
+async def execute_recovery(platform, strategy: str) -> str:
+    """Dispatch one compensating action for a noop step; return a log line.
+
+    refresh/back/escape only — the strategies select_recovery() may name.
+    Settles like any action so the next SEE reads the result; the caller
+    accounts acted/noops and audits the attempt. Fail-soft: platform
+    failures become error: lines, never exceptions.
+    """
+    try:
+        before_ids = platform.tab_ids()
+    except Exception:  # noqa: BLE001
+        before_ids = []
+    try:
+        prev_url = platform.page.url
+    except Exception:  # noqa: BLE001
+        prev_url = ""
+    try:
+        if strategy == "refresh":
+            res = await platform.refresh_page()
+        elif strategy == "back":
+            res = await platform.go_back()
+        elif strategy == "escape":
+            res = await press_key(platform, "Escape")
+        else:
+            return f"error: unknown recovery {strategy}"
+    except Exception as exc:  # noqa: BLE001
+        return f"error: recovery {strategy} failed: {exc}"
+    try:
+        outcome, info = await platform.settle_after_action(prev_url, before_ids)
+    except Exception:  # noqa: BLE001
+        outcome, info = "same", ""
+    snap = await _refresh_snapshot(platform)
+    msg = f"recover:{strategy} — {res}"
+    if outcome in ("newtab", "navigated") and info:
+        msg += f" + {outcome} {info}"
+    if snap:
+        msg += f" + {snap}"
+    log(msg)
+    return msg
+
+
 async def press_key(platform, key: str) -> str:
     """Press Enter/Tab/Escape after typing (e.g. Enter to submit).
 

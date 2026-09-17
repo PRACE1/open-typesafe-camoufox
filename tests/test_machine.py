@@ -49,6 +49,22 @@ def test_heal_gives_up_to_verify():
     assert trail[-1] == "verify"
 
 
+def test_recover_cycle_returns_to_see():
+    m = RunMachine()
+    trail = walk(m, "perceived", "decided", "idle_now", "recover_needed",
+                 "recovered", "perceived", "decided", "idle_now")
+    assert trail == ["see", "decide", "gate", "verify", "recover", "see",
+                     "decide", "gate", "verify"]
+
+
+def test_recover_only_reachable_from_verify():
+    m = RunMachine()
+    with pytest.raises(TransitionNotAllowed):
+        m.recovered()  # see -> recover skips everything
+    with pytest.raises(TransitionNotAllowed):
+        m.recover_needed()  # see -> recover is illegal
+
+
 def test_done_and_stopped_terminals():
     m = RunMachine()
     walk(m, "perceived", "decided", "finish")
@@ -74,7 +90,7 @@ def test_terminals_have_no_outgoing():
         m.continue_run()
     for ev in ("perceived", "decided", "act_now", "idle_now", "finish",
                "abort", "acted", "heal_needed", "healed", "heal_failed",
-               "continue_run"):
+               "recover_needed", "recovered", "continue_run"):
         with pytest.raises((TransitionNotAllowed, AttributeError)):
             getattr(m, ev)()
 
@@ -108,14 +124,18 @@ def test_full_edge_table_parity():
         ("act", "heal_needed", "heal"),
         ("heal", "healed", "act"),
         ("heal", "heal_failed", "verify"),
+        ("verify", "recover_needed", "recover"),
+        ("recover", "recovered", "see"),
         ("verify", "continue_run", "see"),
         ("verify", "finish", "done"),
         ("verify", "abort", "stopped"),
         ("see", "abort", "stopped"),
     }
-    states = ["see", "decide", "gate", "act", "verify", "heal", "done", "stopped"]
+    states = ["see", "decide", "gate", "act", "verify", "heal", "recover",
+              "done", "stopped"]
     events = ["perceived", "decided", "act_now", "idle_now", "finish", "abort",
-              "acted", "heal_needed", "healed", "heal_failed", "continue_run"]
+              "acted", "heal_needed", "healed", "heal_failed",
+              "recover_needed", "recovered", "continue_run"]
     for src in states:
         for ev in events:
             m = RunMachine()
@@ -141,8 +161,9 @@ def _drive_to(m, target):
         "gate": ["perceived", "decided"],
         "act": ["perceived", "decided", "act_now"],
         "verify": ["perceived", "decided", "idle_now"],
-        "heal": ["perceived", "decided", "act_now", "heal_needed"],
-        "done": ["perceived", "decided", "finish"],
+    "heal": ["perceived", "decided", "act_now", "heal_needed"],
+    "recover": ["perceived", "decided", "idle_now", "recover_needed"],
+    "done": ["perceived", "decided", "finish"],
         "stopped": ["perceived", "decided", "idle_now", "abort"],
     }
     for ev in paths[target]:
@@ -152,9 +173,11 @@ def test_edges_table_matches_machine():
     """EDGES (the table phase_step validates against) agrees with the
     machine on every state/event pair - one source of transition truth."""
     from src.machine.run_engine import EDGES, legal
-    states = ["see", "decide", "gate", "act", "verify", "heal", "done", "stopped"]
+    states = ["see", "decide", "gate", "act", "verify", "heal", "recover",
+              "done", "stopped"]
     events = ["perceived", "decided", "act_now", "idle_now", "finish", "abort",
-              "acted", "heal_needed", "healed", "heal_failed", "continue_run"]
+              "acted", "heal_needed", "healed", "heal_failed",
+              "recover_needed", "recovered", "continue_run"]
     assert legal("", "see") and not legal("", "decide")
     for src in states:
         for ev in events:

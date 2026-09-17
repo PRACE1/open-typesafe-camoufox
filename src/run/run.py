@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import sys
+import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
@@ -83,6 +85,106 @@ async def _preflight(url: str) -> int:
         return 3
 
 
+def _covered_urls(run_dir: str, known: list[str]) -> list[str]:
+    """Merge a session's wire.jsonl URLs into the mission coverage list.
+
+    Pure accumulation, order-stable, deduped. Never raises (a missing or
+    corrupt wire file just contributes nothing).
+    """
+    urls = list(known)
+    seen = set(urls)
+    try:
+        with open(os.path.join(run_dir, "wire.jsonl"), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    url = json.loads(line).get("url", "")
+                except (ValueError, AttributeError):
+                    continue
+                if url and url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+    except OSError:
+        pass
+    return urls
+
+
+MISSION_MAX_SESSIONS = 10
+
+
+async def _mission(start_url: str, task: str, steer_file: str, fps: float,
+                   min_confidence: float, budget_s: float, max_steps: int,
+                   headless: bool) -> dict:
+    """Resume-until-done driver: stopped sessions relaunch with coverage.
+
+    Each session shares the total step budget and wall-clock deadline;
+    covered URLs seed the next session's visited memory plus a steer line,
+    so a mission cannot die on a transient stall — only done, exhaustion,
+    an empty (0-step) session, or the session cap ends it.
+    """
+    deadline = None if budget_s <= 0 else time.time() + budget_s
+    total_steps = 0
+    total_moves = 0
+    covered: list[str] = []
+    seeded: list[str] = []
+    done = False
+    session = 0
+    last_run_dir = ""
+    while True:
+        session += 1
+        if session > MISSION_MAX_SESSIONS:
+            log(f"MISSION session cap ({MISSION_MAX_SESSIONS}) — ending mission")
+            break
+        remaining_steps = max_steps - total_steps
+        if remaining_steps <= 0:
+            log("MISSION step budget exhausted — ending mission")
+            break
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                log("MISSION wall-clock budget exhausted — ending mission")
+                break
+        else:
+            remaining = 0
+        fresh = [u for u in covered if u not in seeded]
+        if fresh:
+            seeded.extend(fresh)
+            try:
+                with open(steer_file, "a", encoding="utf-8") as f:
+                    f.write(f"instruction SESSION {session}: already covered, do not revisit: "
+                            + " | ".join(fresh[:50]) + "\n")
+            except OSError as exc:
+                log(f"MISSION steer append failed ({exc}) — continuing unseeded")
+        log(f"MISSION session {session}/{MISSION_MAX_SESSIONS} "
+            f"(steps used {total_steps}/{max_steps})")
+        result = await run_decide_session(
+            start_url=start_url,
+            task=task,
+            fps=fps,
+            min_confidence=min_confidence,
+            budget_s=remaining,
+            max_steps=remaining_steps,
+            headless=headless,
+            steer_file=steer_file,
+            seed_visited=covered,
+        )
+        total_steps += result["steps"]
+        total_moves += result["moves"]
+        last_run_dir = result["run_dir"]
+        covered = _covered_urls(result["run_dir"], covered)
+        log(f"MISSION session {session} end: steps={result['steps']} "
+            f"moves={result['moves']} done={result['done']} "
+            f"covered_urls={len(covered)}")
+        if result["done"]:
+            done = True
+            break
+        if result["steps"] <= 1 and result["moves"] == 0:
+            log("MISSION stalled (empty session) — ending mission")
+            break
+    return {"steps": total_steps, "moves": total_moves, "done": done,
+            "stopped": not done, "run_dir": last_run_dir,
+            "sessions": session, "covered_urls": len(covered)}
+
+
 def _replay(run_dir: str, step: int) -> int:
     """Offline replay: print a saved step's Jev answers without driving the browser."""
     import glob as _glob
@@ -126,6 +228,7 @@ def main() -> int:
     ap.add_argument("--min-confidence", type=float, default=0.4, help="Jev-primary: gate below this confidence (idle instead of acting).")
     ap.add_argument("--replay", default="", help="Run dir to replay offline, e.g. runs/20260917-092647.")
     ap.add_argument("--replay-step", type=int, default=0, help="Step number to replay (0 = list available steps).")
+    ap.add_argument("--mission", action="store_true", help="Resume-until-done: stopped sessions relaunch with covered URLs seeded, sharing the step/wall-clock budget (max 10 sessions). For long collection missions that must not die on transient stalls.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     set_verbose(args.verbose)
@@ -149,19 +252,11 @@ def main() -> int:
         log("Fill them in .env.local (never commit) or drop the placeholders from --task.")
         return 4
 
+    if args.mission and args.legacy_planner:
+        log("MISSION with --legacy-planner: running a single legacy session (flag applies to the decide loop).")
+        args.mission = False
     result = asyncio.run(
-        run_jev_session(
-            start_url=args.url,
-            task=args.task,
-            steer_file=args.steer,
-            fps=args.fps,
-            confidence=args.confidence,
-            budget_s=args.budget,
-            max_steps=args.max_steps,
-            headless=args.headless,
-        )
-        if args.legacy_planner
-        else run_decide_session(
+        _mission(
             start_url=args.url,
             task=args.task,
             steer_file=args.steer,
@@ -170,6 +265,30 @@ def main() -> int:
             budget_s=args.budget,
             max_steps=args.max_steps,
             headless=args.headless,
+        )
+        if args.mission
+        else (
+            run_jev_session(
+                start_url=args.url,
+                task=args.task,
+                steer_file=args.steer,
+                fps=args.fps,
+                confidence=args.confidence,
+                budget_s=args.budget,
+                max_steps=args.max_steps,
+                headless=args.headless,
+            )
+            if args.legacy_planner
+            else run_decide_session(
+                start_url=args.url,
+                task=args.task,
+                steer_file=args.steer,
+                fps=args.fps,
+                min_confidence=args.min_confidence,
+                budget_s=args.budget,
+                max_steps=args.max_steps,
+                headless=args.headless,
+            )
         )
     )
     log(f"result steps={result['steps']} moves={result['moves']} done={result['done']} stopped={result['stopped']}")

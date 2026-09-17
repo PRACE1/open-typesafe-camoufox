@@ -6,10 +6,11 @@ from src.runner import (
     APPROVAL_FALLBACK, APPROVAL_MIN, BARE_CLICK_VETO_KINDS,
     CAPTCHA_MAX_ATTEMPTS, EFFECT_KINDS, GATE_EXEMPT_KINDS,
     OVERRIDABLE_KINDS, READING_COOLDOWN_STEPS, Phase, captcha_should_stop,
-    confidence_gated, credential_placeholder, fresh_tabs, is_blank_page,
-    loop_guard_trip, no_effect_trip, page_settled, phase_step,
-    proposal_executable, reading_cooldown_active, resolve_proposal_action,
-    should_override, should_submit_instead,
+    classify_noop, confidence_gated, credential_placeholder, fresh_tabs,
+    is_blank_page, loop_guard_trip, no_effect_trip, page_settled,
+    phase_step, proposal_executable, reading_cooldown_active,
+    resolve_proposal_action, select_recovery, should_override,
+    should_submit_instead, step_verdict, stop_limits,
 )
 from src.runner import _apply_proposal as _apply_proposal_fn
 from src.runner import _choice_is_vetoed as _vetoed_fn
@@ -305,3 +306,60 @@ def test_is_blank_page_dead_load_only():
     assert is_blank_page([_E(idx=0, kind="link")], "") is False
     assert is_blank_page([], "x" * 50) is False
     assert is_blank_page([], "x" * 49) is True
+
+
+def test_stop_limits_scale_with_budget():
+    assert stop_limits(50) == (3, 2, 6)
+    assert stop_limits(1) == (3, 2, 6)
+    assert stop_limits(100) == (3, 2, 6)
+    assert stop_limits(1000) == (20, 10, 20)
+    assert stop_limits(500) == (10, 5, 10)
+
+
+def test_classify_noop_maps_records_to_reasons():
+    assert classify_noop("wait", None) == "idle"
+    assert classify_noop("none", None) == "idle"
+    assert classify_noop("type_at #5 (writer declined)", None) == "idle"
+    assert classify_noop("challenge (no item)", None) == "idle"
+    assert classify_noop("goto (no URL)", None) == "idle"
+    assert classify_noop("anything", None, blank=True) == "blank"
+    assert classify_noop("wait", None, blocked="sorry") == "blocked"
+    assert classify_noop("loopguard wait (click_item #1)", None) == "fixation"
+    assert classify_noop("mismatch wait (click_item #1)", None) == "mismatch"
+    assert classify_noop("idle (low confidence)", None) == "lowconf"
+    assert classify_noop("DONE rejected (empty page)", None) == "notready"
+    assert classify_noop("goto rejected (reading)", None) == "cooldown"
+    assert classify_noop("whatever", "error: element #1 target covered:div.x — skipping") == "covered"
+    assert classify_noop("whatever", "error: nav failed: boom", same_fp=True) == "failed-same"
+    assert classify_noop("whatever", "error: nav failed: boom", same_fp=False) == "failed"
+    assert classify_noop("whatever", None) == "unknown"
+
+
+def test_select_recovery_first_match():
+    assert select_recovery("blank") == "refresh"
+    assert select_recovery("failed-same") == "refresh"
+    assert select_recovery("fixation") == "refresh"
+    assert select_recovery("covered") == "escape"
+    assert select_recovery("blocked") is None
+    assert select_recovery("mismatch") is None
+    assert select_recovery("lowconf") is None
+    assert select_recovery("notready") is None
+    assert select_recovery("cooldown") is None
+    assert select_recovery("idle") is None
+    assert select_recovery("failed") is None
+    assert select_recovery("unknown") is None
+
+
+def test_step_verdict_taxonomy():
+    assert step_verdict(done=True, stopped=False, acted=True,
+                        recovered=True, unresolved=False) == "complete"
+    assert step_verdict(done=False, stopped=True, acted=True,
+                        recovered=False, unresolved=False) == "terminal"
+    assert step_verdict(done=False, stopped=False, acted=True,
+                        recovered=False, unresolved=False) == "progress"
+    assert step_verdict(done=False, stopped=False, acted=False,
+                        recovered=True, unresolved=False) == "recoverable"
+    assert step_verdict(done=False, stopped=False, acted=False,
+                        recovered=False, unresolved=True) == "unresolved"
+    assert step_verdict(done=False, stopped=False, acted=False,
+                        recovered=False, unresolved=False) == "noop"

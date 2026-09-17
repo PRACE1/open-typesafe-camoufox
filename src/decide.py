@@ -370,6 +370,62 @@ async def decide_heal_action(*, error_msg: str, last_kind: str,
     return strategy, min(max(need, 0.0), 1.0)
 
 
+RECOVER_CHOICES: dict[str, str] = {
+    "refresh": "Reload the page; content is stale, blank, or half-loaded",
+    "escape": "Press Escape; a dropdown, overlay, or dialog covers the work",
+    "back": "Go back; this page is a dead end and history holds better state",
+    "none": "Do nothing further; wait for the page or continue the loop",
+}
+
+
+async def decide_recovery_action(*, reason: str, act: str, result: str,
+                                 page_excerpt: str,
+                                 timeout_s: float = 15.0) -> tuple[str, float]:
+    """Jev tie-break for ambiguous noop steps: which compensation, if any.
+
+    The heuristic selector owns the clear-cut cases (blank/failed-same/
+    fixation/covered) without spending a call; this runs only when it
+    abstains, bounded by the same recovery cap. Returns (strategy, conf)
+    where strategy is one of refresh/escape/back/none. No-key or failure
+    fallback is ("none", 0.0) — abstain, never guess.
+    """
+    base, key, model = _env()
+    if not key:
+        return "none", 0.0
+    payload: dict[str, Any] = {
+        "model": model,
+        "state": {"noop_reason": reason, "last_act": (act or "")[:200],
+                  "last_result": (result or "")[:200],
+                  "page_excerpt": (page_excerpt or "")[:400]},
+        "questions": {
+            "recovery": {
+                "type": "choice",
+                "instructions": {
+                    "question": "The last step produced no progress. Which single compensation moves the task forward?",
+                    "focus": ("Pick none when waiting or retrying the planned action is better. "
+                              "Refresh only for stale/blank/half-loaded content; escape only for "
+                              "covering overlays; back only for dead-end pages."),
+                },
+                "criteria": dict(RECOVER_CHOICES),
+            },
+        },
+    }
+    try:
+        data = await _post(payload, timeout_s, base, key)
+    except Exception:
+        return "none", 0.0
+    answers = data.get("answers", {}) if isinstance(data, dict) else {}
+    raw = answers.get("recovery", {})
+    choice = str(raw.get("choice", "none") or "none")
+    if choice not in RECOVER_CHOICES:
+        return "none", 0.0
+    try:
+        conf = float(raw.get("confidence", 0.0) or 0.0)
+    except (ValueError, TypeError):
+        conf = 0.0
+    return choice, min(max(conf, 0.0), 1.0)
+
+
 def ref_to_idx(choice: str, elements: list[ElementRef]) -> int:
     """Map a chosen item back to its positional idx.
 

@@ -25,14 +25,15 @@ import urllib.parse
 from dataclasses import replace
 from datetime import datetime
 from enum import Enum
+from typing import Any
 
 from . import perception
-from .actions import action_failed, challenge_control, click_item, goto_url, heal_target, press_key, type_at
+from .actions import action_failed, challenge_control, click_item, execute_recovery, goto_url, heal_target, press_key, type_at
 from .capability.resolve import read_input_value
 from .capability.dynamic_registry import register_capability
 from .capability.human_move import HUMANIZE_LEVEL
 from .capability.validator import validate_capability
-from .decide import HealStrategy, Kind, decide_action, decide_heal_action
+from .decide import HealStrategy, Kind, decide_action, decide_heal_action, decide_recovery_action
 from .deps import RunState
 from .machine.run_engine import EDGES as _ENGINE_EDGES
 from .machine.run_engine import RunMachine, advance, state_id
@@ -118,6 +119,87 @@ def confidence_gated(kind: Kind, conf: float, min_confidence: float) -> bool:
 # vetoed pick plus one gated wait; low enough that true fixation still ends
 # the run instead of burning the whole budget.
 STOP_AFTER_NOOPS = 3
+
+
+def stop_limits(max_steps: int) -> tuple[int, int, int]:
+    """(noop, dead-run, fixation) stop limits scaled to the step budget.
+
+    A 3-no-op guillotine fits a 50-step task, not a 1000-step mission:
+    long runs must survive transient stalls while true fixation still ends
+    them, proportionally. Base values preserved at default budgets.
+    """
+    steps = max(1, int(max_steps))
+    return (max(STOP_AFTER_NOOPS, steps // 50),
+            max(2, steps // 100),
+            max(6, steps // 50))
+
+
+def classify_noop(act: str, result: Any = None, *, blank: bool = False,
+                  blocked: str | None = None, same_fp: bool = False) -> str:
+    """Map a noop step record to a failure reason for the recovery cycle.
+
+    Reasons: blank (nothing to work with), blocked (bot-check page —
+    challenge flow owns it), fixation (loopguard repeat), mismatch
+    (escalation owns it), lowconf, notready, cooldown, covered (overlay —
+    dismiss it), failed-same / failed (action error, print equal or not),
+    idle (patience paths), unknown. Pure; first match wins.
+    """
+    a = act or ""
+    r = result if isinstance(result, str) else ""
+    if blank:
+        return "blank"
+    if blocked:
+        return "blocked"
+    if a.startswith("loopguard wait"):
+        return "fixation"
+    if a.startswith("mismatch wait"):
+        return "mismatch"
+    if a.startswith("idle (low confidence)"):
+        return "lowconf"
+    if a.startswith("DONE rejected"):
+        return "notready"
+    if a.startswith("goto rejected"):
+        return "cooldown"
+    if "covered:" in a or "covered:" in r:
+        return "covered"
+    if r.startswith("error") or "error:" in r:
+        return "failed-same" if same_fp else "failed"
+    if a in ("wait", "none") or a.startswith("type_at #") or a in (
+            "challenge (no item)", "goto (no URL)"):
+        return "idle"
+    return "unknown"
+
+
+def select_recovery(reason: str) -> str | None:
+    """Compensating action for a noop reason, or None to let rails decide.
+
+    blank/failed-same/fixation refresh the page (stale content is the
+    common cause); covered escapes once (structural overlays survive
+    per-action dismisses). Blocked pages belong to the challenge flow,
+    mismatches to escalation — recovery stays out of both. First match.
+    """
+    if reason in ("blank", "failed-same", "fixation"):
+        return "refresh"
+    if reason == "covered":
+        return "escape"
+    return None
+
+
+def step_verdict(*, done: bool, stopped: bool, acted: bool,
+                 recovered: bool, unresolved: bool) -> str:
+    """Per-step outcome in the contract taxonomy: complete / terminal /
+    progress / recoverable / unresolved / noop. Recorded on every entry."""
+    if done:
+        return "complete"
+    if stopped:
+        return "terminal"
+    if acted:
+        return "progress"
+    if recovered:
+        return "recoverable"
+    if unresolved:
+        return "unresolved"
+    return "noop"
 
 
 # Consecutive image-challenge dead-ends before an honest stop. The runner
@@ -322,6 +404,7 @@ class Phase(str, Enum):
     ACT = "act"
     VERIFY = "verify"
     HEAL = "heal"
+    RECOVER = "recover"
     DONE = "done"
     STOPPED = "stopped"
 
@@ -369,6 +452,7 @@ async def run_decide_session(
     max_steps: int = 50,
     headless: bool = False,
     steer_file: str = "steer.txt",
+    seed_visited: list[str] | None = None,
 ) -> dict:
     from camoufox.async_api import AsyncCamoufox
 
@@ -418,11 +502,19 @@ async def run_decide_session(
     escalated_urls: set[str] = set()
     last_typed: tuple | None = None  # (element idx, page url) of the last successful type
     blank_streak = 0  # consecutive blank SEEs (dead loads draw waits forever)
+    recoveries: list[dict] = []  # audited recovery attempts (bounded, never blind repeats)
+    recover_cap = max(3, max_steps // 100)
+    recover_cap = max(3, max_steps // 100)
+    # Stop rails scale with the step budget: a 3-no-op guillotine fits a
+    # 50-step task, not a 1000-step mission. Long runs must survive
+    # transient stalls; the rails still bound true fixation, proportionally.
+    noop_limit, dead_limit, fix_limit = stop_limits(max_steps)
     # Long-horizon tracking (40-50 steps): visited-URL memory, extractive
     # notes that survive the 8-line history window, and dead-run detection
-    # for actions with no observable effect.
-    visited: list[str] = []
-    visited_set: set[str] = set()
+    # for actions with no observable effect. seed_visited carries coverage
+    # across mission sessions so relaunches never re-read old pages.
+    visited: list[str] = list(seed_visited or [])
+    visited_set: set[str] = set(visited)
     notes: list[str] = []
     prev_fp: tuple | None = None
     dead_run = 0
@@ -479,6 +571,7 @@ async def run_decide_session(
             heal_abort = None
             heal_accounted = False
             step_captcha = False
+            recovered = False
             # Per-step timing: answers "why is the run slow" with data —
             # propose (writer LLM), decide (Jev), act (dispatch + settle).
             t_top = time.time()
@@ -834,7 +927,7 @@ async def run_decide_session(
                 log(f"LOOPGUARD {decision.kind.value} #{decision.element_idx} x{sig_run} — forced wait (neutral)")
                 history.append(f"step {steps}: loopguard tripped on {decision.kind.value} #{decision.element_idx}, waited")
                 entry["act"] = f"loopguard wait ({decision.kind.value} #{decision.element_idx})"
-                if sig_run >= 6:
+                if sig_run >= fix_limit:
                     stopped = True
                     stop_reason = (f"loopguard fixation on {decision.kind.value} "
                                    f"#{decision.element_idx} x{sig_run}")
@@ -1318,36 +1411,15 @@ async def run_decide_session(
                           f"appr={decision.approval:.2f}"),
                 phases=list(phase_trail),
             )
-            entry["phases"] = list(phase_trail)
-            report_mod.write_wire(run_dir, {
-                "n": steps, "t": entry.get("t"), "url": page.url, "tabs": n_tabs,
-                "see": entry.get("see"), "decide": entry.get("decide"),
-                "nouls": entry.get("nouls"), "progress": entry.get("progress"),
-                "act": entry.get("act"), "result": entry.get("result"),
-                "phases": entry.get("phases"),
-                "focused": {
-                    "role": focused.role, "label": focused.label,
-                    "placeholder": focused.placeholder,
-                    "value_len": len(focused.value),
-                    "is_credential": focused.is_credential,
-                },
-                "page_text": page_text,
-                "elements": [
-                    {"idx": e.idx, "kind": e.kind, "type": e.type,
-                     "label": e.label, "placeholder": e.placeholder,
-                     "text": e.text, "value_len": e.value_len,
-                     "href": e.href, "region": e.region,
-                     "host": perception.host_of(e.href),
-                     "ref": e.ref, "aria": e.aria,
-                     "cx": e.cx, "cy": e.cy}
-                    for e in elements
-                ],
-                "notes": notes, "visited": visited,
-            })
             report_mod.append_transcript(run_dir, entry)
             log(f"TIME   propose={t_proposed - t_top:.1f}s "
                 f"decide={t_decided - t_proposed:.1f}s "
                 f"act={t_acted_at - t_decided:.1f}s")
+
+            # Deferred reporting note: entry["phases"], the wire record,
+            # and the transcript append live AFTER the stops below, so
+            # synth verdicts, recovery audits, and final phases land in the
+            # artifacts instead of only in history.
 
             # VERIFY: fingerprint the step's outcome and evaluate the stop
             # rules. A settled page identical to the previous step means the
@@ -1374,14 +1446,62 @@ async def run_decide_session(
                 dead_run += 1
                 history.append(f"step {steps}: no observable effect from {last_effect_kind} x{dead_run}")
                 log(f"NOEFFECT {last_effect_kind} changed nothing x{dead_run}")
-                if dead_run >= 2:
+                if dead_run >= dead_limit:
                     stopped = True
-                    stop_reason = "action had no observable effect twice"
+                    stop_reason = f"action had no observable effect x{dead_run}"
                     advance(machine, phase_trail, "abort")  # verify -> stopped
             else:
                 dead_run = 0
+            same_fp = prev_fp is not None and fp == prev_fp
             prev_fp = fp
             prev_acted = acted
+
+            # RECOVER: a noop step with budget left re-enters through the
+            # recover state for exactly one compensating dispatch — observe
+            # (fresh SEE above), classify, select, execute, then continue.
+            # Heuristics own the clear-cut cases outright; Jev tie-breaks
+            # the ambiguous ones (unknown/failed with changed print).
+            # Never a blind repeat. Bounded by recover_cap; every attempt
+            # is audited below and lands in the transcript.
+            if (not done and not stopped and not acted
+                    and len(recoveries) < recover_cap):
+                reason = classify_noop(
+                    str(entry.get("act") or ""), entry.get("result"),
+                    blank=is_blank_page(elements, page_text),
+                    blocked=blocked, same_fp=same_fp)
+                strategy = select_recovery(reason)
+                triaged_by = "heuristic"
+                if strategy is None and reason in ("unknown", "failed"):
+                    choice, conf = await decide_recovery_action(
+                        reason=reason, act=str(entry.get("act") or ""),
+                        result=str(entry.get("result") or ""),
+                        page_excerpt=page_text)
+                    if choice != "none" and conf >= 0.5:
+                        strategy = choice
+                        triaged_by = f"jev({conf:.2f})"
+                    log(f"RECOVER triage -> {choice} ({conf:.2f})")
+                if strategy is not None:
+                    advance(machine, phase_trail, "recover_needed")  # verify -> recover
+                    rec_result = await execute_recovery(platform, strategy)
+                    history.append(f"step {steps}: recover {strategy} ({reason}/{triaged_by}) — {rec_result[:120]}")
+                    entry["recover"] = {
+                        "observed": f"{len(elements)} elements, {len(page_text.strip())}ch @ {page.url}",
+                        "reason": reason,
+                        "triaged_by": triaged_by,
+                        "strategy": strategy,
+                        "result": rec_result[:200],
+                    }
+                    log(f"RECOVER {strategy} ({reason}/{triaged_by}) — {rec_result[:120]}")
+                    recoveries.append({"step": steps, "reason": reason,
+                                       "strategy": strategy,
+                                       "result": rec_result[:200]})
+                    advance(machine, phase_trail, "recovered")  # recover -> see
+                    entry["recover"]["next"] = state_id(machine)
+                    acted = True
+                    last_effect_kind = {"refresh": "refresh", "back": "back",
+                                        "escape": "press_escape"}[strategy]
+                    recovered = True
+                    prev_acted = True
 
             # Last-resort synthesis: the per-step Noul never flags completion,
             # but the chat model can judge across pages. Once per run, when a
@@ -1389,7 +1509,8 @@ async def run_decide_session(
             # the task from the notes. A refusal (or failure) falls through
             # to the honest stop below.
             if (not done and not stopped and not synth_attempted
-                    and (dead_run >= 2 or noops >= STOP_AFTER_NOOPS)
+                    and not recovered
+                    and (dead_run >= dead_limit or noops >= noop_limit)
                     and notes_url_count(notes) >= 2):
                 synth_attempted = True
                 log("SYNTH  judging completion from notes...")
@@ -1407,11 +1528,11 @@ async def run_decide_session(
 
             if not step_captcha:
                 captcha_streak = 0
-            if noops >= STOP_AFTER_NOOPS and not done and not stopped:
+            if noops >= noop_limit and not done and not stopped and not recovered:
                 stopped = True
-                stop_reason = f"{STOP_AFTER_NOOPS} consecutive no-ops"
+                stop_reason = f"{noop_limit} consecutive no-ops"
                 advance(machine, phase_trail, "abort")  # verify -> stopped
-                log(f"STOP   {STOP_AFTER_NOOPS} consecutive no-ops — ending run")
+                log(f"STOP   {noop_limit} consecutive no-ops — ending run")
             if captcha_should_stop(captcha_streak) and not done and not stopped:
                 stopped = True
                 stop_reason = (f"image challenge persisted after "
@@ -1423,6 +1544,41 @@ async def run_decide_session(
                 stop_reason = heal_abort
                 advance(machine, phase_trail, "abort")  # verify -> stopped
                 log(f"STOP   heal triage aborted — ending run honestly")
+            # Step verdict in the contract taxonomy, then deferred reporting
+            # so synth/recovery outcomes land in the artifacts.
+            step_noop = not acted and not done
+            entry["verdict"] = step_verdict(
+                done=done, stopped=stopped, acted=acted,
+                recovered=recovered,
+                unresolved=(step_noop and len(recoveries) >= recover_cap))
+            entry["phases"] = list(phase_trail)
+            report_mod.write_wire(run_dir, {
+                "n": steps, "t": entry.get("t"), "url": page.url, "tabs": n_tabs,
+                "see": entry.get("see"), "decide": entry.get("decide"),
+                "nouls": entry.get("nouls"), "progress": entry.get("progress"),
+                "act": entry.get("act"), "result": entry.get("result"),
+                "verdict": entry.get("verdict"), "recover": entry.get("recover"),
+                "phases": entry.get("phases"),
+                "focused": {
+                    "role": focused.role, "label": focused.label,
+                    "placeholder": focused.placeholder,
+                    "value_len": len(focused.value),
+                    "is_credential": focused.is_credential,
+                },
+                "page_text": page_text,
+                "elements": [
+                    {"idx": e.idx, "kind": e.kind, "type": e.type,
+                     "label": e.label, "placeholder": e.placeholder,
+                     "text": e.text, "value_len": e.value_len,
+                     "href": e.href, "region": e.region,
+                     "host": perception.host_of(e.href),
+                     "ref": e.ref, "aria": e.aria,
+                     "cx": e.cx, "cy": e.cy}
+                    for e in elements
+                ],
+                "notes": notes, "visited": visited,
+            })
+            report_mod.append_transcript(run_dir, entry)
             await asyncio.sleep(interval)
 
         cursor = await platform.harvest_cursor_events()
@@ -1432,6 +1588,7 @@ async def run_decide_session(
             "finished": datetime.now().isoformat(timespec="seconds"),
             "steps": steps, "moves": moves, "task_done": done,
             "stopped": stopped, "stop_reason": stop_reason,
+            "recoveries": recoveries,
             "cursor_moves": len(cursor["moves"]),
             "cursor_clicks": len(cursor["clicks"]),
             "run_dir": run_dir,

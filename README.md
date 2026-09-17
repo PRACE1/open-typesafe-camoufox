@@ -340,6 +340,11 @@ Every run writes `runs/<timestamp>/`:
 - Element-map targeting only sees the DOM — canvas/icon-only controls are
   invisible to it (pixel fallback is future work).
 - Slow pages burn steps on `wait`; raise `--budget`/`--max-steps` for them.
+- Long collection missions use `--mission`: stopped sessions relaunch with
+  covered URLs seeded (shared step/wall-clock budget, max 10 sessions), so a
+  transient stall can never end the mission early. Stop rails scale with
+  `--max-steps`; noop steps run the recovery cycle (classify → compensate →
+  verify, audited per step) instead of just counting down.
 - Passwords are only filled from `{ENV}` placeholders declared in `--task`
   (see [`.env.example`](.env.example)); the writer will never invent credentials.
 - `runs/` and `.env.local` are git-ignored; never commit secrets.

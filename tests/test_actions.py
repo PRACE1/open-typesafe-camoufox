@@ -459,7 +459,7 @@ def test_confirm_aria_ref_ok_stale_unknown(monkeypatch):
 
 class _FakeAriaLocator:
     def __init__(self, count=1, box=None, ident=None, fail=None,
-                 self_hit=False):
+                 self_hit=False, value=""):
         self._count = count
         self._box = box if box is not None else {"x": 50, "y": 60,
                                                  "width": 120, "height": 30}
@@ -468,6 +468,7 @@ class _FakeAriaLocator:
                                                        "label": "More"}
         self._fail = fail or set()
         self._self_hit = self_hit
+        self._value = value
         self.scrolled = []
 
     async def count(self):
@@ -493,6 +494,11 @@ class _FakeAriaLocator:
         if "eval" in self._fail:
             raise RuntimeError("eval boom")
         return self._ident
+
+    async def input_value(self, timeout=None):
+        if "value" in self._fail:
+            raise RuntimeError("value boom")
+        return self._value
 
 
 class _FakeAriaPage(_FakePage):
@@ -665,6 +671,17 @@ def test_bank_box_normalizes_and_skips():
     _bank_box(els, 0, None, {})
     _bank_box(els, 9, {"x": 1, "y": 1, "width": 1, "height": 1}, {})
     assert els[0].box == (0.1, 0.1, 0.2, 0.05)
+
+
+def test_read_input_value_returns_dom_value_and_failsoft():
+    from src.capability.resolve import read_input_value
+    plat = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(value="typed query")))
+    assert _run(read_input_value(plat, "e44")) == "typed query"
+    assert _run(read_input_value(plat, "")) == ""
+    plat_gone = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(count=0)))
+    assert _run(read_input_value(plat_gone, "e44")) == ""
+    plat_boom = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(fail={"value"})))
+    assert _run(read_input_value(plat_boom, "e44")) == ""
 
 
 def test_probe_stale_gone_missing(monkeypatch):

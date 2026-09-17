@@ -23,6 +23,7 @@ from .capability.resolve import (
     _resolve_target,
     _slot_changed,
     heal_target,
+    read_input_value,
 )
 from .deps import ElementRef
 from .perception import find_elements, get_page_text

@@ -17,7 +17,7 @@ IDs used in commit messages and the run log (`EDGE #n`).
 | 9 | Stale tab listeners fire | event source ≠ bound page | generation guard in all three nav handlers | handled (`cursor_tracking.py`) |
 | 10 | Bare input click fixation | target kind in (input, textarea, select) | veto → proposal fallback → neutral idle | handled |
 | 11 | Kind/item mismatch | `fits` Noul < 0.4 | neutral idle (never executes known-dead) | handled |
-| 12 | Repetition (3× same kind+item+url) | `loop_guard_trip` | forced wait + no-op count | handled |
+| 12 | Repetition (3× same kind+item+url) | `loop_guard_trip` | forced wait, no-op-neutral (protection must not kill the run); 6× same target stops honestly as loopguard fixation | handled |
 | 13 | Dead action (no observable effect) | fingerprint equal, consecutive | stop `action had no observable effect twice` | handled |
 | 14 | Credential field | type=password / autocomplete / label hints | writer `fill:false`; `{ENV}` placeholders only | handled |
 | 15 | Low confidence (< 0.4) | kind Choice confidence | gate idle + no-op count | handled |

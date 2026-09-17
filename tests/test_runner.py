@@ -185,6 +185,9 @@ def test_should_submit_instead():
     assert should_submit_instead(6, els, (6, url), url) is False
     assert should_submit_instead(5, els, (5, "https://other.example/"), url) is False
     assert should_submit_instead(9, els, (9, url), url) is False
+    # Live DOM value covers snapshots that hide fill-state (Google).
+    assert should_submit_instead(6, els, (6, url), url, "typed query") is True
+    assert should_submit_instead(6, els, (6, url), url, "  ") is False
 
 
 def test_resolve_proposal_action_routing():

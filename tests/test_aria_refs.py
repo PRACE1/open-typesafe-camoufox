@@ -114,3 +114,24 @@ def test_resolve_ref_cascade():
         'div[role=dialog] button.close'
     assert resolve_ref("e99", known) == "e99"  # unknown e-pattern: CSS tag, empty match
     assert resolve_ref("9lives", known) == "aria-ref=9lives"  # last resort
+
+
+def test_ref_types_doc_covers_taxonomy():
+    """docs/REF_TYPES.md maps every taxonomy category to our implementation,
+    so the driving agent loads ref semantics with the session."""
+    import os
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    doc = open(os.path.join(root, "docs", "REF_TYPES.md"),
+               encoding="utf-8").read()
+    for category in ("interactive", "landmark", "content", "frame",
+                     "css_fallback", "eval_escape_hatch"):
+        assert category in doc, category
+    for ref_type in ("aria_interactive_ref", "aria_content_ref",
+                     "frame_index_ref", "css_id_selector",
+                     "css_class_selector", "css_attribute_selector",
+                     "css_tag_selector", "css_universal_selector",
+                     "js_expression_eval"):
+        assert ref_type in doc, ref_type
+    for landmark in ("contentinfo", "banner", "alertdialog", "complementary"):
+        assert f"aria_structural_landmark_{landmark}" in doc, landmark
+    assert "src/capability/aria_refs.py" in doc

@@ -28,6 +28,7 @@ from enum import Enum
 
 from . import perception
 from .actions import action_failed, challenge_control, click_item, goto_url, heal_target, press_key, type_at
+from .capability.resolve import read_input_value
 from .capability.dynamic_registry import register_capability
 from .capability.human_move import HUMANIZE_LEVEL
 from .capability.validator import validate_capability
@@ -244,17 +245,21 @@ def notes_url_count(notes: list[str]) -> int:
 
 
 def should_submit_instead(idx: int, elements: list,
-                          last_typed: tuple | None, url: str) -> bool:
+                          last_typed: tuple | None, url: str,
+                          live_value: str = "") -> bool:
     """True when type_at targets the already-filled field it just typed.
 
     Retyping replaces identical text (clear-before-type) — nothing changes.
     Pressing Enter submits the standing query instead. Scoped to the same
-    element on the same URL so multi-field forms are unaffected.
+    element on the same URL so multi-field forms are unaffected. live_value
+    is a freshly read DOM value for pages whose snapshots hide fill-state.
     """
     if last_typed is None or (idx, url) != last_typed:
         return False
     el = next((e for e in elements if e.idx == idx), None)
-    return el is not None and el.value_len > 0
+    if el is None:
+        return False
+    return el.value_len > 0 or bool((live_value or "").strip())
 
 
 # Steps a newly adopted result tab is protected from goto: the loop opened
@@ -726,14 +731,24 @@ async def run_decide_session(
                     decision = replace(decision, kind=Kind.WAIT, element_idx=None)
             # Retype intent on an already-filled field means submit: the query
             # is in the box, typing it again changes nothing — Enter does.
+            # Snapshot fill-state lies on some pages (Google hides the typed
+            # query when suggestions render), so a same-box repeat also reads
+            # the live DOM value before falling through to a retype.
             if (decision.kind == Kind.TYPE_AT and decision.element_idx is not None
-                    and should_submit_instead(decision.element_idx, elements,
-                                              last_typed, page.url)):
-                log(f"RETYPE type_at #{decision.element_idx} on filled field — submitting instead")
-                history.append(f"step {steps}: retype on filled field, submitting instead")
-                entry["decide"] += " [retype-submit]"
-                decision = replace(decision, kind=Kind.PRESS_ENTER, element_idx=None)
-                last_typed = None
+                    and last_typed is not None
+                    and (decision.element_idx, page.url) == last_typed):
+                el0 = next((e for e in elements
+                            if e.idx == decision.element_idx), None)
+                live_value = ""
+                if el0 is not None and el0.value_len == 0 and el0.aria:
+                    live_value = await read_input_value(platform, el0.aria)
+                if should_submit_instead(decision.element_idx, elements,
+                                         last_typed, page.url, live_value):
+                    log(f"RETYPE type_at #{decision.element_idx} on filled field — submitting instead")
+                    history.append(f"step {steps}: retype on filled field, submitting instead")
+                    entry["decide"] += " [retype-submit]"
+                    decision = replace(decision, kind=Kind.PRESS_ENTER, element_idx=None)
+                    last_typed = None
             report_mod.write_answers_json(run_dir, steps, decision.raw)
 
             # Loop-guard: the tab, clear, and click systems all report into
@@ -761,10 +776,19 @@ async def run_decide_session(
                 entry["act"] = "idle (low confidence)"
                 noops += 1
             elif guard_trip:
-                log(f"LOOPGUARD {decision.kind.value} #{decision.element_idx} x{sig_run} — forced wait (no-op {noops + 1})")
+                # Forced wait is a correction, not doubt: neutral like wait,
+                # so the guard's own protection can't kill the run via the
+                # no-op counter. Genuine fixation (6x same target) stops
+                # honestly with its own reason instead.
+                log(f"LOOPGUARD {decision.kind.value} #{decision.element_idx} x{sig_run} — forced wait (neutral)")
                 history.append(f"step {steps}: loopguard tripped on {decision.kind.value} #{decision.element_idx}, waited")
                 entry["act"] = f"loopguard wait ({decision.kind.value} #{decision.element_idx})"
-                noops += 1
+                if sig_run >= 6:
+                    stopped = True
+                    stop_reason = (f"loopguard fixation on {decision.kind.value} "
+                                   f"#{decision.element_idx} x{sig_run}")
+                    advance(machine, phase_trail, "abort")  # gate -> stopped
+                    log(f"STOP   {stop_reason} — ending run")
             elif decision.kind == Kind.WAIT:
                 # Patience, not doubt: the screen is still loading. Neutral —
                 # it neither resets nor advances the no-op count, so a slow

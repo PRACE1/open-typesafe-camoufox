@@ -310,6 +310,27 @@ def _remap_idx(fresh: list[ElementRef], old_label: str,
     return None
 
 
+async def read_input_value(platform, aria: str) -> str:
+    """Live DOM value of an input/combobox by its aria ref.
+
+    Snapshot `: value` suffixes are unreliable (Google hides the typed
+    query when suggestions render), so the retype guard reads the DOM
+    property directly. Aria refs only — never positional fallbacks.
+    Fail-soft "" on anything unexpected.
+    """
+    if not aria:
+        return ""
+    try:
+        locator = platform.page.locator(resolve_ref(aria, {aria}))
+        if await locator.count() == 0:
+            return ""
+        val = await asyncio.wait_for(
+            locator.input_value(timeout=3000), timeout=5.0)
+        return val or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 async def heal_target(platform, old_label: str,
                       old_kind: str | None = None,
                       old_sel: str | None = None,

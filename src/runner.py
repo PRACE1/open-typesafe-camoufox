@@ -992,6 +992,7 @@ async def run_decide_session(
                         entry["result"] = res
                         step_captcha = True
                         captcha_streak += 1
+                        history.append(f"step {steps}: image challenge dead-end x{captcha_streak} — consider alternate routes (other engine, direct URL)")
                         log(f"CAPTCHA image/puzzle dead-end x{captcha_streak}/{CAPTCHA_MAX_ATTEMPTS} — keep trying")
                     elif action_failed(res):
                         history.append(f"step {steps}: challenge failed — {res}")

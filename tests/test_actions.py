@@ -470,6 +470,7 @@ class _FakeAriaLocator:
         self._self_hit = self_hit
         self._value = value
         self.scrolled = []
+        self.clicked = []
 
     async def count(self):
         if "count" in self._fail:
@@ -500,12 +501,19 @@ class _FakeAriaLocator:
             raise RuntimeError("value boom")
         return self._value
 
+    async def click(self, timeout=None):
+        if "click" in self._fail:
+            raise RuntimeError("click boom")
+        self.clicked.append(timeout)
+        return None
+
 
 class _FakeAriaPage(_FakePage):
-    def __init__(self, locator):
-        super().__init__()
+    def __init__(self, locator, point="hit"):
+        super().__init__(point=point)
         self._locator = locator
         self.seen = []
+        self.keyboard = _FakeKeyboard()
 
     def locator(self, sel):
         self.seen.append(sel)
@@ -842,3 +850,43 @@ def test_verify_for_dispatch_escape_failure_keeps_probe(monkeypatch):
     plat = _FakePlatform2(page)
     probe, dismissed = _run(verify_for_dispatch(plat, [_el(0), _el(1), _el(2)], 2))
     assert probe["status"] == "covered" and dismissed is False
+
+
+def test_dispatch_native_aria_click(monkeypatch):
+    from src.actions import dispatch_verified_click
+    _stub_find(monkeypatch, [])
+    loc = _FakeAriaLocator()
+    plat = _FakePlatform2(_FakeAriaPage(loc))
+    res = _run(dispatch_verified_click(plat, 1, 1, native_aria="f3e7"))
+    assert res["outcome"] == "settled" and loc.clicked == [10000]
+    assert plat.page.seen == ["aria-ref=f3e7"]
+    loc2 = _FakeAriaLocator(fail={"click"})
+    plat2 = _FakePlatform2(_FakeAriaPage(loc2))
+    res = _run(dispatch_verified_click(plat2, 1, 1, native_aria="f3e7"))
+    assert res["outcome"] == "error"
+
+
+def test_click_item_framed_target_native_dispatch(monkeypatch):
+    from src.actions import click_item
+    els = [_el(0), _el(1), _aria_el()]
+    _stub_find(monkeypatch, els)
+    loc = _FakeAriaLocator(
+        ident={"kind": "link", "role": "", "label": "More"})
+    plat = _FakePlatform2(_FakeAriaPage(loc, point="covered:iframe"))
+    res = _run(click_item(plat, els, 2, expected_kind="link"))
+    assert "native locator (iframe-embedded)" in res
+    assert loc.clicked == [10000]
+    assert plat.page.keyboard.presses == ["Escape"]  # dismiss tried first
+
+
+def test_challenge_checkbox_framed_native_toggle(monkeypatch):
+    from src.actions import challenge_control
+    box_el = _aria_el(idx=6, aria="f4e7", kind="checkbox", label="I agree")
+    els = [_el(i) for i in range(6)] + [box_el]
+    _stub_find(monkeypatch, els)
+    loc = _FakeAriaLocator(
+        ident={"kind": "checkbox", "role": "checkbox", "label": "I agree"})
+    plat = _FakePlatform2(_FakeAriaPage(loc, point="covered:iframe"))
+    res = _run(challenge_control(plat, els, 6, expected_kind="checkbox"))
+    assert "challenge checkbox toggled" in res and "native locator" in res
+    assert loc.clicked == [10000]

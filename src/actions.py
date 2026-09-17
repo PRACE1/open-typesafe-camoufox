@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 
+from .capability.aria_refs import resolve_ref
 from .capability.logging_utils import log
 from .capability.resolve import (
     TEXT_ENTRY_KINDS,
@@ -303,6 +304,7 @@ async def probe_target(platform, elements: list[ElementRef], idx: int,
         status = "covered"
     return {"idx": idx, "status": status, "verdict": verdict,
             "px": px, "py": py, "box": res["box"],
+            "frame_embedded": _covering_tag(verdict) == "iframe",
             "live_kind": live_kind, "label": label}
 
 
@@ -329,11 +331,19 @@ def _bank_box(elements: list[ElementRef], idx: int,
 
 async def dispatch_verified_click(platform, px: int, py: int,
                                   timeout: float = 10.0,
-                                  harvest: bool = True) -> dict:
+                                  harvest: bool = True,
+                                  native_aria: str | None = None) -> dict:
     """Click an already-verified point, settle, and rebuild context.
 
     Lock-free: the caller must hold platform._lock and have harvested the
     buffer first (or pass harvest=True). Returns outcome/info/snapshot.
+
+    native_aria switches the dispatch to a native locator click: framed
+    targets (recaptcha checkboxes) live behind an iframe boundary that
+    elementFromPoint cannot pierce, so coordinate clicks can never verify
+    there — Playwright resolves the frame natively instead. Humanized
+    motion is skipped for these; the verified identity + settle + snapshot
+    rails still apply.
     """
     page = platform.page
     if harvest:
@@ -344,7 +354,12 @@ async def dispatch_verified_click(platform, px: int, py: int,
     except Exception:  # noqa: BLE001
         prev_url = ""
     try:
-        await asyncio.wait_for(page.mouse.click(px, py), timeout=timeout)
+        if native_aria is not None:
+            locator = page.locator(resolve_ref(native_aria, {native_aria}))
+            await asyncio.wait_for(
+                locator.click(timeout=int(timeout * 1000)), timeout=timeout)
+        else:
+            await asyncio.wait_for(page.mouse.click(px, py), timeout=timeout)
     except Exception as exc:  # noqa: BLE001
         return {"outcome": "error", "info": f"dispatch failed: {exc}",
                 "snapshot": ""}
@@ -450,12 +465,20 @@ async def click_item(platform, elements: list[ElementRef], idx: int,
             verdict, live_kind = probe["verdict"], probe["live_kind"]
             status = probe["status"]
             through = status == "through"
+            # Framed targets (recaptcha checkboxes) sit behind an iframe
+            # boundary elementFromPoint cannot pierce: dispatch natively via
+            # the aria-ref locator instead of refusing.
+            tgt = next((e for e in elements if e.idx == idx), None)
+            native = (tgt.aria if tgt is not None and status == "covered"
+                      and probe.get("frame_embedded") and tgt.aria else None)
+            if native:
+                log(f"iframe-embedded target #{idx} ({native}) — native locator dispatch")
             if status == "stale":
                 msg = (f"error: element #{idx} stale map (decided {expected_kind}, "
                        f"live {live_kind or 'gone'}) — skipping click (no dispatch)")
                 log(msg)
                 return msg
-            if status in ("gone", "covered", "error"):
+            if status in ("gone", "error") or (status == "covered" and native is None):
                 msg = (f"error: element #{idx} target {verdict} — "
                        f"skipping click (no dispatch)")
                 log(msg)
@@ -465,7 +488,8 @@ async def click_item(platform, elements: list[ElementRef], idx: int,
             # The click's own humanized move is the settle onto the center.
             vpx, vpy = probe["px"], probe["py"]
             _bank_box(elements, idx, probe.get("box"), vp)
-            res = await dispatch_verified_click(platform, vpx, vpy, harvest=False)
+            res = await dispatch_verified_click(platform, vpx, vpy, harvest=False,
+                                                native_aria=native)
             if res["outcome"] == "error":
                 msg = f"error clicking element #{idx}: {res['info']}"
                 log(msg)
@@ -474,6 +498,8 @@ async def click_item(platform, elements: list[ElementRef], idx: int,
                 f"element #{idx} scroll+circle+click at "
                 f"({vpx / vp['width']:.3f},{vpy / vp['height']:.3f}) humanize=true"
             )
+            if native:
+                msg += " via native locator (iframe-embedded)"
             if through:
                 msg += f" through {_covering_tag(verdict)}"
             if dismissed:
@@ -551,14 +577,19 @@ async def challenge_control(platform, elements: list[ElementRef], idx: int,
                 log(msg)
                 return msg
             probe, dismissed = await verify_for_dispatch(platform, elements, idx, expected_kind)
-            if probe["status"] not in ("ok", "through"):
+            framed = (probe["status"] == "covered" and probe.get("frame_embedded")
+                      and bool(el.aria))
+            if probe["status"] not in ("ok", "through") and not framed:
                 msg = (f"error: element #{idx} target {probe['verdict']} — "
                        f"skipping challenge (no dispatch)")
                 log(msg)
                 return msg
             if kind == "checkbox":
+                native = el.aria if framed else None
+                if native:
+                    log(f"iframe-embedded challenge #{idx} ({native}) — native locator dispatch")
                 res = await dispatch_verified_click(
-                    platform, probe["px"], probe["py"])
+                    platform, probe["px"], probe["py"], native_aria=native)
                 if res["outcome"] == "error":
                     msg = f"error toggling challenge checkbox #{idx}: {res['info']}"
                     log(msg)
@@ -566,6 +597,8 @@ async def challenge_control(platform, elements: list[ElementRef], idx: int,
                 _bank_box(elements, idx, probe.get("box"),
                           page.viewport_size or {"width": 1280, "height": 800})
                 msg = f"element #{idx} challenge checkbox toggled humanize=true"
+                if native:
+                    msg += " via native locator (iframe-embedded)"
                 if dismissed:
                     msg += " + cover dismissed via Escape"
                 if res["outcome"] in ("newtab", "navigated") and res["info"]:

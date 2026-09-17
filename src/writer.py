@@ -44,11 +44,14 @@ _WRITER_UA = "open-typesafe-camoufox/0.1"
 
 
 def _writer_api_kind() -> str:
-    """'responses' for OpenAI Responses-API endpoints (Muse Spark on Go),
-    anything else means classic chat/completions."""
+    """API shape: 'responses' (Muse Spark on Go), 'messages' (Anthropic
+    Messages protocol, e.g. Union Alpha Free on Go), anything else means
+    classic chat/completions."""
     raw = (os.environ.get("WRITER_API") or "chat").strip().lower()
     if raw in ("responses", "response", "responses-api", "openai-responses"):
         return "responses"
+    if raw in ("messages", "message", "anthropic", "anthropic-messages"):
+        return "messages"
     return "chat"
 
 
@@ -77,6 +80,21 @@ def _extract_responses_text(data: dict) -> str:
             return "\n".join(parts)
         if isinstance(data.get("output_text"), str):
             return data["output_text"]
+    except Exception:
+        pass
+    return ""
+
+
+def _extract_messages_text(data: dict) -> str:
+    """Pull assistant text out of an Anthropic Messages-API payload."""
+    try:
+        parts: list[str] = []
+        for block in data.get("content", []) or []:
+            if (isinstance(block, dict) and block.get("type") == "text"
+                    and block.get("text")):
+                parts.append(str(block["text"]))
+        if parts:
+            return "\n".join(parts)
     except Exception:
         pass
     return ""
@@ -136,6 +154,18 @@ async def _chat_json(system: str, user: str, timeout_s: float = 30.0) -> dict:
             "temperature": 0.2,
             "max_output_tokens": 400,
         }
+    elif kind == "messages":
+        url = base.rstrip("/") + "/messages"
+        headers = {**headers,
+                   "anthropic-version": "2023-06-01",
+                   "x-api-key": key}
+        payload = {
+            "model": model,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+            "temperature": 0.2,
+            "max_tokens": 400,
+        }
     else:
         url = base.rstrip("/") + "/chat/completions"
         payload = {
@@ -160,6 +190,12 @@ async def _chat_json(system: str, user: str, timeout_s: float = 30.0) -> dict:
         data = res.json()
     if kind == "responses":
         text = _extract_responses_text(data)
+        try:
+            return json.loads(text) if isinstance(text, str) and text else {}
+        except ValueError:
+            return {}
+    if kind == "messages":
+        text = _extract_messages_text(data)
         try:
             return json.loads(text) if isinstance(text, str) and text else {}
         except ValueError:

@@ -233,3 +233,52 @@ def test_extract_responses_text_variants():
     assert _ex({"output": [{"type": "message", "content": [
         {"type": "output_text", "text": "x"},
         {"type": "refusal", "refusal": "no"}]}]}) == "x"
+
+
+def test_messages_api_shape_and_headers(monkeypatch):
+    import src.writer as _wr
+
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+        text = "{}"
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"content": [{"type": "text",
+                                 "text": '{"fill": true, "text": "hey"}'}]}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            seen["url"] = url
+            seen["json"] = json
+            seen["headers"] = headers
+            return _Resp()
+
+    monkeypatch.setattr("httpx.AsyncClient", _Client)
+    monkeypatch.setenv("WRITER_API", "messages")
+    monkeypatch.setenv("WRITER_BASE_URL", "https://x.example/v1")
+    monkeypatch.setenv("WRITER_API_KEY", "k")
+    monkeypatch.setenv("WRITER_MODEL", "union-alpha")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    out = asyncio.run(_wr._chat_json("sys", "usr"))
+    assert out == {"fill": True, "text": "hey"}
+    assert seen["url"] == "https://x.example/v1/messages"
+    assert seen["json"]["system"] == "sys"
+    assert seen["json"]["messages"] == [{"role": "user", "content": "usr"}]
+    assert seen["json"]["max_tokens"] == 400
+    assert seen["headers"]["anthropic-version"] == "2023-06-01"
+    assert seen["headers"]["x-api-key"] == "k"
+    assert seen["headers"]["x-opencode-session"]

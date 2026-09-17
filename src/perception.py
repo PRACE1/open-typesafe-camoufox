@@ -13,13 +13,58 @@ playwright/camoufox directly.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import urllib.parse
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 from .capability.element_probe import ELEMENT_PROBE_JS
 from .deps import ElementRef, FocusedField
 
 MAX_ELEMENTS = 40  # probe cap; well under Jev's 255-option Choice cap
 PAGE_TEXT_LIMIT = 1500
+NOTES_LIMIT = 2000  # chars of extractive notes kept across the run
+
+# Query params that identify the tracker, not the page — dropped when
+# normalizing URLs for visited memory.
+_TRACKING_PARAMS = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "gclid", "fbclid", "msclkid", "sca_esv", "sxsrf", "ei", "iflsig",
+    "ved", "uact", "oq", "gs_lp", "sclient", "sei", "source", "gbv",
+})
+
+
+def norm_url(url: str) -> str:
+    """Canonical identity for visited memory: lowercase host, no fragment,
+    tracking params dropped, remaining query sorted. Keeps distinguishing
+    params (e.g. Google's q) so different searches stay distinct."""
+    try:
+        p = urllib.parse.urlparse((url or "").strip())
+    except ValueError:
+        return (url or "")[:160]
+    if not p.scheme or not p.netloc:
+        return (url or "")[:160]
+    q = urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+    q = sorted((k, v) for k, v in q if k.lower() not in _TRACKING_PARAMS)
+    return urllib.parse.urlunparse((
+        p.scheme.lower(), p.netloc.lower(), p.path or "/",
+        "", urllib.parse.urlencode(q), "",
+    ))
+
+
+def page_fingerprint(url: str, page_text: str) -> tuple[str, str]:
+    """(normalized url, hash of leading text) — equal means the action had
+    no observable effect on what the loop can read."""
+    digest = hashlib.md5(((page_text or "")[:500].strip().encode("utf-8"))).hexdigest()
+    return (norm_url(url), digest)
+
+
+def trim_notes(notes: list[str], limit: int = NOTES_LIMIT) -> list[str]:
+    """Drop oldest notes past the char budget (extractive long-horizon memory)."""
+    notes = list(notes)
+    while len(notes) > 1 and sum(len(n) for n in notes) > limit:
+        notes.pop(0)
+    return notes
 
 FOCUSED_FIELD_JS = """
 () => {
@@ -80,6 +125,11 @@ async def find_elements(platform) -> list[ElementRef]:
     except Exception:
         return []
     out: list[ElementRef] = []
+    base_url = ""
+    try:
+        base_url = platform.page.url or ""
+    except Exception:
+        pass
     for raw in (result or [])[:MAX_ELEMENTS]:
         try:
             value = str(raw.get("value", "") or "")
@@ -87,6 +137,16 @@ async def find_elements(platform) -> list[ElementRef]:
                 value_len = int(raw.get("value_len", 0) or 0)
             except (ValueError, TypeError):
                 value_len = len(value)
+            href = ""
+            href_raw = str(raw.get("href", "") or "")
+            if href_raw:
+                try:
+                    joined = urljoin(base_url, href_raw)
+                    pr = urlparse(joined)
+                    if pr.scheme in ("http", "https") and pr.netloc:
+                        href = joined[:160]
+                except ValueError:
+                    href = ""
             out.append(ElementRef(
                 idx=int(raw.get("idx", len(out))),
                 kind=str(raw.get("kind", "?")),
@@ -97,6 +157,7 @@ async def find_elements(platform) -> list[ElementRef]:
                 text=str(raw.get("text", "") or ""),
                 value=value[:80],
                 value_len=value_len,
+                href=href,
                 cx=float(raw.get("cx", 0.5)),
                 cy=float(raw.get("cy", 0.5)),
             ))
@@ -162,33 +223,39 @@ def format_elements(elements: list[ElementRef]) -> str:
     return "\n".join(lines)
 
 
-def element_criteria(e: ElementRef) -> str:
+def element_criteria(e: ElementRef, visited: set[str] | None = None) -> str:
     """One-line Choice criterion for an element idx.
 
     Inputs declare filled vs empty so the decider can reason about the
-    clear-before-type system instead of retyping blindly.
+    clear-before-type system instead of retyping blindly. Links to
+    already-visited pages are marked so multi-step exploration moves on.
     """
     label = e.label or e.placeholder or e.text or e.id or "?"
     extra = f" ({e.type})" if e.type else ""
     base = f"{e.kind}{extra} \"{label}\" at {e.cx:.3f},{e.cy:.3f}"
     if e.kind in ("input", "textarea", "select") or e.type:
         base += f" filled({e.value_len}ch)" if e.value_len else " empty"
+    if visited and e.href and norm_url(e.href) in visited:
+        base += " (visited)"
     return base
 
 
 def build_state(*, task: str, url: str, elements: list[ElementRef],
                 focused: FocusedField, page_text: str,
                 history: list[str], frame: str = "", grid: str = "",
-                tabs: int = 1) -> dict[str, Any]:
+                tabs: int = 1, notes: list[str] | None = None,
+                visited: list[str] | None = None) -> dict[str, Any]:
     """Assemble the deterministic state packet sent to Jev."""
     return {
         "task": task,
         "url": url,
         "tabs": tabs,
+        "notes": list(notes or [])[-6:],
+        "visited": list(visited or [])[-10:],
         "elements": [
             {"idx": e.idx, "kind": e.kind, "type": e.type, "label": e.label,
              "placeholder": e.placeholder, "text": e.text, "cx": e.cx, "cy": e.cy,
-             "value_len": e.value_len,
+             "value_len": e.value_len, "href": e.href,
              "sel": f'[data-jev="{e.idx}"]'}
             for e in elements
         ],

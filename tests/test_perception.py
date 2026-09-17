@@ -3,7 +3,7 @@
 from src.deps import ElementRef, FocusedField
 from src.perception import (
     build_state, element_criteria, format_elements, is_credential,
-    is_credential_element,
+    is_credential_element, norm_url, page_fingerprint, trim_notes,
 )
 
 
@@ -90,3 +90,61 @@ def test_build_state_tabs_param():
     s = build_state(task="t", url="u", elements=[], focused=FocusedField(),
                     page_text="", history=[], tabs=3)
     assert s["tabs"] == 3
+
+
+def test_norm_url_drops_tracking_keeps_query():
+    a = norm_url("https://www.google.com/search?q=moon&sca_esv=XYZ&ved=123#frag")
+    b = norm_url("https://www.google.com/search?ved=456&q=moon&sca_esv=ABC")
+    assert a == b == "https://www.google.com/search?q=moon"
+    assert norm_url("https://EXAMPLE.com/Path") == "https://example.com/Path"
+    assert norm_url("not a url") == "not a url"
+
+
+def test_page_fingerprint_equal_and_differ():
+    assert page_fingerprint("https://a.example/x", "hello world") == \
+        page_fingerprint("https://a.example/x?utm_source=t", "hello world")
+    assert page_fingerprint("https://a.example/x", "hello") != \
+        page_fingerprint("https://a.example/x", "goodbye")
+    assert page_fingerprint("https://a.example/x", "t") != \
+        page_fingerprint("https://a.example/y", "t")
+
+
+def test_trim_notes_drops_oldest():
+    notes = ["a" * 900, "b" * 900, "c" * 900]
+    trimmed = trim_notes(notes, limit=2000)
+    assert trimmed == ["c" * 900] or sum(len(n) for n in trimmed) <= 2000
+    assert trimmed[-1] == "c" * 900
+    assert trim_notes(["x"], limit=2000) == ["x"]
+
+
+def test_element_criteria_visited_marker():
+    from src.perception import norm_url as _n
+    e = ElementRef(idx=2, kind="link", text="Result", cx=0.3, cy=0.4,
+                   href="https://a.example/page?utm_source=x")
+    assert element_criteria(e).endswith("(visited)") is False
+    assert element_criteria(e, {_n("https://a.example/page")}).endswith("(visited)")
+    assert element_criteria(e, {"https://other.example/"}).endswith("(visited)") is False
+
+
+def test_build_state_notes_visited_and_href():
+    els = [ElementRef(idx=0, kind="link", text="R", href="https://a.example/p")]
+    s = build_state(task="t", url="u", elements=els, focused=FocusedField(),
+                    page_text="", history=[],
+                    notes=["n1", "n2"], visited=["https://a.example/p"])
+    assert s["notes"] == ["n1", "n2"] and s["visited"] == ["https://a.example/p"]
+    assert s["elements"][0]["href"] == "https://a.example/p"
+
+
+def test_find_elements_resolves_href():
+    import asyncio
+
+    from src.perception import find_elements
+
+    class _FakePage:
+        url = "https://base.example/dir/page"
+        async def evaluate(self, js):
+            return [{"idx": 0, "kind": "link", "text": "R",
+                     "href": "/other?q=1", "cx": 0.1, "cy": 0.1}]
+
+    els = asyncio.run(find_elements(type("P", (), {"page": _FakePage()})()))
+    assert els[0].href == "https://base.example/other?q=1"

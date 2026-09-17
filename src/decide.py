@@ -105,9 +105,11 @@ async def _post(payload: dict, timeout_s: float, base: str, key: str) -> dict:
     raise RuntimeError("unreachable")
 
 
-def build_questions(elements: list[ElementRef], sites: list[str]) -> dict[str, Any]:
+def build_questions(elements: list[ElementRef], sites: list[str],
+                    visited: list[str] | None = None) -> dict[str, Any]:
     """The three Choice questions for one Jev request."""
-    item_criteria = {str(e.idx): element_criteria(e) for e in elements[:MAX_ITEMS]}
+    vset = set(visited or [])
+    item_criteria = {str(e.idx): element_criteria(e, vset) for e in elements[:MAX_ITEMS]}
     if not item_criteria:
         item_criteria = {"-1": "No actionable elements on this page"}
     site_criteria = {str(i): url[:160] for i, url in enumerate(sites)}
@@ -192,6 +194,8 @@ async def decide_action(
     frame: str = "",
     grid: str = "",
     tabs: int = 1,
+    notes: list[str] | None = None,
+    visited: list[str] | None = None,
     timeout_s: float = 30.0,
 ) -> JevDecision:
     """One Jev request -> the single next action (+ confidence)."""
@@ -206,11 +210,11 @@ async def decide_action(
 
     state = build_state(task=task, url=url, elements=elements, focused=focused,
                         page_text=page_text, history=history, frame=frame, grid=grid,
-                        tabs=tabs)
+                        tabs=tabs, notes=notes, visited=visited)
     payload: dict[str, Any] = {
         "model": model,
         "state": state,
-        "questions": build_questions(elements, sites),
+        "questions": build_questions(elements, sites, visited),
     }
     data = await _post(payload, timeout_s, base, key)
     return _decode(data, elements, sites)

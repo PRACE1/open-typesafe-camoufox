@@ -86,7 +86,7 @@ async def run_decide_session(
     fps: float = 3.0,
     min_confidence: float = 0.4,
     budget_s: float = 120.0,
-    max_steps: int = 40,
+    max_steps: int = 50,
     headless: bool = False,
     steer_file: str = "steer.txt",
 ) -> dict:
@@ -130,6 +130,15 @@ async def run_decide_session(
     noops = 0
     last_sig: tuple | None = None
     sig_run = 0
+    # Long-horizon tracking (40-50 steps): visited-URL memory, extractive
+    # notes that survive the 8-line history window, and dead-run detection
+    # for actions with no observable effect.
+    visited: list[str] = []
+    visited_set: set[str] = set()
+    notes: list[str] = []
+    prev_fp: tuple | None = None
+    dead_run = 0
+    last_effect_kind: str | None = None
     steer_consumed = 0
     started = datetime.now().isoformat(timespec="seconds")
     t_end = time.time() + budget_s
@@ -174,6 +183,14 @@ async def run_decide_session(
             focused = await perception.get_focused_field(platform)
             page_text = await perception.get_page_text(platform)
             n_tabs = await platform.tab_count()
+            # READ + remember: first settled sighting of a page banks an
+            # extractive note (survives the history window across 40-50 steps).
+            norm = perception.norm_url(page.url)
+            if page_settled(page_text) and norm not in visited_set:
+                visited.append(norm)
+                visited_set.add(norm)
+                notes.append(f"{norm} :: {page_text.strip()[:300]}")
+                notes[:] = perception.trim_notes(notes)
             state.url = page.url
             state.elements = elements
             state.focused = focused
@@ -224,7 +241,7 @@ async def run_decide_session(
                 decision = await decide_action(
                     task=effective_task, url=page.url, start_url=start_url,
                     elements=elements, focused=focused, page_text=page_text,
-                    history=history, tabs=n_tabs,
+                    history=history, tabs=n_tabs, notes=notes, visited=visited,
                 )
             except Exception as exc:
                 log(f"DECIDE failed ({exc.__class__.__name__}); idling this step")
@@ -245,23 +262,21 @@ async def run_decide_session(
             entry["think"] = entry["decide"]
             report_mod.write_answers_json(run_dir, steps, decision.raw)
 
-            if conf < min_confidence and decision.kind not in (Kind.DONE,):
-                log(f"GATE   conf {conf:.2f} < {min_confidence} — idle (no-op {noops + 1})")
-                history.append(f"step {steps}: low conf {conf:.2f}, idled")
-                entry["act"] = "idle (low confidence)"
-                noops += 1
             # Loop-guard: the tab, clear, and click systems all report into
             # the decision, but a confident classifier can still fixate
             # (same click 5x). Three identical click/type targets in a row
             # force a wait here instead of executing again.
             guard_trip = False
             if decision.kind in (Kind.CLICK_ITEM, Kind.TYPE_AT) and decision.element_idx is not None:
-                guard_trip, sig_run = loop_guard_trip(
-                    last_sig, sig_run,
-                    (decision.kind.value, decision.element_idx, page.url),
-                )
-                last_sig = (decision.kind.value, decision.element_idx, page.url)
-            if guard_trip:
+                guard_sig = (decision.kind.value, decision.element_idx, page.url)
+                guard_trip, sig_run = loop_guard_trip(last_sig, sig_run, guard_sig)
+                last_sig = guard_sig
+            if conf < min_confidence and decision.kind not in (Kind.DONE,):
+                log(f"GATE   conf {conf:.2f} < {min_confidence} — idle (no-op {noops + 1})")
+                history.append(f"step {steps}: low conf {conf:.2f}, idled")
+                entry["act"] = "idle (low confidence)"
+                noops += 1
+            elif guard_trip:
                 log(f"LOOPGUARD {decision.kind.value} #{decision.element_idx} x{sig_run} — forced wait (no-op {noops + 1})")
                 history.append(f"step {steps}: loopguard tripped on {decision.kind.value} #{decision.element_idx}, waited")
                 entry["act"] = f"loopguard wait ({decision.kind.value} #{decision.element_idx})"
@@ -324,6 +339,7 @@ async def run_decide_session(
                 history.append(f"step {steps}: pressed Enter — {res}")
                 moves += 1
                 noops = 0
+                last_effect_kind = "press_enter"
             elif decision.kind == Kind.REFRESH:
                 log("ACT    refresh")
                 res = await platform.refresh_page()
@@ -333,6 +349,7 @@ async def run_decide_session(
                 history.append(f"step {steps}: refreshed — {res}")
                 moves += 1
                 noops = 0
+                last_effect_kind = "refresh"
             elif decision.kind == Kind.CLOSE_OTHERS:
                 log("ACT    close other tabs")
                 n_closed = await platform.close_other_tabs()
@@ -360,6 +377,7 @@ async def run_decide_session(
                     history.append(f"step {steps}: clicked element #{idx} — {res}")
                     moves += 1
                     noops = 0
+                    last_effect_kind = "click_item"
                 else:  # TYPE_AT
                     elem = by_idx[idx]
                     label = elem.label or elem.placeholder or elem.text or elem.id or f"element #{idx}"
@@ -396,6 +414,7 @@ async def run_decide_session(
                         history.append(f"step {steps}: typed at #{idx} — {res}")
                         moves += 1
                         noops = 0
+                        last_effect_kind = "type_at"
 
             # The action may have rebound the platform to a new tab
             # (click auto-adopt) — re-sync the local handle so the screenshot,
@@ -409,7 +428,7 @@ async def run_decide_session(
             state_packet = _build_state(
                 task=effective_task, url=page.url, elements=elements,
                 focused=focused, page_text=page_text, history=history,
-                tabs=n_tabs,
+                tabs=n_tabs, notes=notes, visited=visited,
             )
             sites = [u for u in (start_url, page.url) if u]
             sites = list(dict.fromkeys(sites))
@@ -423,6 +442,23 @@ async def run_decide_session(
                 f"item={decision.element_idx}",
             )
             report_mod.append_transcript(run_dir, entry)
+
+            # No-observable-effect detection: a settled page identical to the
+            # previous step means the last action changed nothing readable.
+            # Twice in a row ends the run with an honest reason instead of
+            # looping to max_steps.
+            fp = perception.page_fingerprint(page.url, page_text)
+            if (prev_fp is not None and fp == prev_fp and page_settled(page_text)
+                    and last_effect_kind in ("click_item", "type_at", "press_enter", "refresh")):
+                dead_run += 1
+                history.append(f"step {steps}: no observable effect from {last_effect_kind} x{dead_run}")
+                log(f"NOEFFECT {last_effect_kind} changed nothing x{dead_run}")
+                if dead_run >= 2:
+                    stopped = True
+                    stop_reason = "action had no observable effect twice"
+            else:
+                dead_run = 0
+            prev_fp = fp
 
             if noops >= 2 and not done:
                 stopped = True

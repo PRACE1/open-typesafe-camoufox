@@ -119,7 +119,7 @@ def main() -> int:
     ap.add_argument("--fps", type=float, default=3.0, help="Jev sample rate 2-5 (capture stays 60fps).")
     ap.add_argument("--confidence", type=float, default=0.7, help="Min Jev confidence to click.")
     ap.add_argument("--budget", type=float, default=120.0, help="Wall-clock budget seconds.")
-    ap.add_argument("--max-steps", type=int, default=40)
+    ap.add_argument("--max-steps", type=int, default=50)
     ap.add_argument("--headless", action="store_true", help="No visible window (default is HEADED).")
     ap.add_argument("--preflight", action="store_true", help="Verify keys + headed browser launch, then exit.")
     ap.add_argument("--legacy-planner", action="store_true", help="Use the legacy GPT planner loop instead of the Jev-primary decide loop.")

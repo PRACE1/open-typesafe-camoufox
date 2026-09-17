@@ -51,6 +51,12 @@ ELEMENT_PROBE_JS = """
     if ((tag === 'input' || tag === 'textarea') && typeof el.value === 'string') {
       elVal = el.value.slice(0, 80);
     }
+    // Links: capture href (resolved to absolute at parse time) so the
+    // runner can mark already-visited targets in the criteria.
+    let elHref = '';
+    if (tag === 'a' && el.getAttribute) {
+      elHref = String(el.getAttribute('href') || '').slice(0, 160);
+    }
     // Links with no own text (icon/title wrapped in headings): fall back to
     // the nearest heading text so results stay choosable instead of "?".
     if (tag === 'a' && !elText) {
@@ -68,6 +74,7 @@ ELEMENT_PROBE_JS = """
       text: elText,
       value: elVal,
       value_len: elVal.length,
+      href: elHref,
       cx: Math.round((r.left + r.width / 2) / vw * 1000) / 1000,
       cy: Math.round((r.top + r.height / 2) / vh * 1000) / 1000,
     });
@@ -86,6 +93,7 @@ ELEMENT_PROBE_JS = """
       text: o.text,
       value: o.value,
       value_len: o.value_len,
+      href: o.href,
       doc_top: o.doc_top,
       cx: o.cx,
       cy: o.cy,

@@ -455,6 +455,15 @@ async def run_decide_session(
                 notes.append(banked)
                 notes[:] = perception.trim_notes(notes)
                 report_mod.append_memory(run_dir, f"- {banked}")
+            # Blocked (bot-check/captcha) pages stay in the loop: flag the
+            # state and keep classifying positions + moving the cursor.
+            blocked = perception.is_blocked_page(page.url, page_text)
+            if blocked:
+                msg = (f"step {steps}: page flagged {blocked} — working it "
+                       "like any page (classify, move, select, repeat)")
+                log(f"BLOCKED {msg}")
+                history.append(msg)
+                entry["blocked"] = blocked
             state.url = page.url
             state.elements = elements
             state.focused = focused
@@ -554,7 +563,7 @@ async def run_decide_session(
                     task=effective_task, url=page.url, start_url=start_url,
                     elements=elements, focused=focused, page_text=page_text,
                     history=history, tabs=n_tabs, notes=notes, visited=visited,
-                    lessons=lessons,
+                    lessons=lessons, blocked=blocked,
                     approval_question=approval_struct,
                 )
             except Exception as exc:
@@ -923,6 +932,7 @@ async def run_decide_session(
                 task=effective_task, url=page.url, elements=elements,
                 focused=focused, page_text=page_text, history=history,
                 tabs=n_tabs, notes=notes, visited=visited, lessons=lessons,
+                blocked=blocked,
             )
             sites = [u for u in (start_url, page.url) if u]
             sites = list(dict.fromkeys(sites))

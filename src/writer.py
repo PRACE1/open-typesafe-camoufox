@@ -85,7 +85,14 @@ async def _chat_json(system: str, user: str, timeout_s: float = 30.0) -> dict:
             json=payload,
             headers={"Authorization": f"Bearer {key}"},
         )
-        res.raise_for_status()
+        if res.status_code != 200:
+            # Loud, key-safe provider diagnostics: a silent failure here
+            # masquerades as "model declined" and stalls runs opaquely.
+            # (Seen live: Groq 403 "Access denied" after heavy use.)
+            from .capability.logging_utils import log as _log
+            _log(f"writer model HTTP {res.status_code} (model={model}): "
+                 f"{res.text[:160]}")
+            res.raise_for_status()
         data = res.json()
     try:
         content = data["choices"][0]["message"]["content"]

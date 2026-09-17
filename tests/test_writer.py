@@ -140,3 +140,41 @@ def test_summarize_task_done_and_refusals(monkeypatch):
     bad = _fake_chat("not json shaped")
     monkeypatch.setattr(_w, "_chat_json", bad)
     assert asyncio.run(summarize_task(task="t", notes=notes)).done is False
+
+
+def test_chat_json_reports_provider_http_status(monkeypatch, capsys):
+    import httpx as _httpx
+
+    class _Resp:
+        status_code = 403
+        text = '{"error":{"message":"Access denied."}}'
+
+        def raise_for_status(self):
+            raise _httpx.HTTPStatusError("403", request=None, response=None)
+
+        def json(self):
+            return {}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            return _Resp()
+
+    monkeypatch.setattr("httpx.AsyncClient", _Client)
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    try:
+        asyncio.run(_w._chat_json("system", "user"))
+        raised = False
+    except _httpx.HTTPStatusError:
+        raised = True
+    assert raised is True
+    assert "writer model HTTP 403" in capsys.readouterr().out

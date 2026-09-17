@@ -61,6 +61,41 @@ def host_of(href: str) -> str:
         return ""
 
 
+_BLOCKED_MARKERS: tuple[tuple[str, str], ...] = (
+    ("url", "/sorry/"),
+    ("text", "unusual traffic"),
+    ("text", "press & hold to confirm"),
+    ("text", "verify you are human"),
+    ("text", "verify you're not a robot"),
+    ("text", "verify that you're not a robot"),
+    ("text", "captcha"),
+    ("text", "recaptcha"),
+    ("text", "access denied"),
+    ("text", "request blocked"),
+)
+
+
+def is_blocked_page(url: str, page_text: str) -> str | None:
+    """Detect bot-check / block pages; return a short reason or None.
+
+    Detection only — the loop keeps working such pages like any other
+    (perceive → Jev classifies X/Y → humanized cursor acts → repeat).
+    The reason rides in the state packet so Jev understands the context
+    instead of treating it as an unloadable page.
+    """
+    lowered_url = (url or "").lower()
+    for scope, marker in _BLOCKED_MARKERS:
+        if scope == "url" and marker in lowered_url:
+            return f"bot-check-by-url:{marker.strip('/')}"
+    text = (page_text or "").lower()
+    if not text.strip():
+        return None
+    for scope, marker in _BLOCKED_MARKERS:
+        if scope == "text" and marker in text:
+            return f"bot-check-by-text:{marker}"
+    return None
+
+
 def _unwrap_redirect(href: str) -> str:
     """Unwrap redirect wrappers (/url?q=<real>) to the destination URL.
 
@@ -316,13 +351,19 @@ def build_state(*, task: str, url: str, elements: list[ElementRef],
                 history: list[str], frame: str = "", grid: str = "",
                 tabs: int = 1, notes: list[str] | None = None,
                 visited: list[str] | None = None,
-                lessons: str = "") -> dict[str, Any]:
+                lessons: str = "", blocked: str | None = None) -> dict[str, Any]:
     """Assemble the deterministic state packet sent to Jev."""
     return {
         "task": task,
         "url": url,
         "tabs": tabs,
         "lessons": lessons,
+        "page_state": (
+            f"blocked:{blocked} — interact with this page's verification "
+            "controls (checkbox/button/input) like any page; classify "
+            "positions, move, select, repeat until it resolves"
+            if blocked else "normal"
+        ),
         "notes": list(notes or [])[-6:],
         "visited": list(visited or [])[-10:],
         "elements": [

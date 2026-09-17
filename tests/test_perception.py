@@ -3,8 +3,8 @@
 from src.deps import ElementRef, FocusedField
 from src.perception import (
     _unwrap_redirect, build_state, element_criteria, excerpt_for,
-    format_elements, host_of, is_credential, is_credential_element, norm_url,
-    page_fingerprint, trim_notes,
+    format_elements, host_of, is_blocked_page, is_credential,
+    is_credential_element, norm_url, page_fingerprint, trim_notes,
 )
 
 
@@ -201,3 +201,29 @@ def test_excerpt_for_anchors_on_task_keywords():
     assert excerpt_for(task, "") == ""
     chrome = "Get app Write Sign up " * 30
     assert excerpt_for("unrelated zzzqqq", chrome) == chrome[:300]
+
+
+def test_is_blocked_page_markers():
+    sorry = "https://www.google.com/sorry/index?continue=https://www.google.com/search&q=x"
+    assert is_blocked_page(sorry, "anything") == "bot-check-by-url:sorry"
+    assert is_blocked_page("https://www.google.com/", "Our systems have detected unusual traffic from your network") == \
+        "bot-check-by-text:unusual traffic"
+    assert is_blocked_page("https://a.example/", "Please complete the captcha below") == \
+        "bot-check-by-text:captcha"
+    assert is_blocked_page("https://a.example/", "Verify you are human to continue") == \
+        "bot-check-by-text:verify you are human"
+    assert is_blocked_page("https://a.example/", "Access Denied - request blocked") == \
+        "bot-check-by-text:access denied"
+    assert is_blocked_page("https://a.example/", "The Moon has water ice.") is None
+    assert is_blocked_page("https://a.example/", "   ") is None
+    assert is_blocked_page("https://a.example/", "") is None
+
+
+def test_build_state_page_state_blocked_and_normal():
+    s = build_state(task="t", url="u", elements=[], focused=FocusedField(),
+                    page_text="", history=[])
+    assert s["page_state"] == "normal"
+    s2 = build_state(task="t", url="u", elements=[], focused=FocusedField(),
+                     page_text="", history=[], blocked="bot-check-by-url:sorry")
+    assert s2["page_state"].startswith("blocked:bot-check-by-url:sorry")
+    assert "like any page" in s2["page_state"]

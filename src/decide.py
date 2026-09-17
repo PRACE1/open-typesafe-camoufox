@@ -360,6 +360,7 @@ async def decide_action(
     notes: list[str] | None = None,
     visited: list[str] | None = None,
     lessons: str = "",
+    blocked: str | None = None,
     approval_question: str | dict | None = None,
     timeout_s: float = 30.0,
 ) -> JevDecision:
@@ -375,7 +376,8 @@ async def decide_action(
 
     state = build_state(task=task, url=url, elements=elements, focused=focused,
                         page_text=page_text, history=history, frame=frame, grid=grid,
-                        tabs=tabs, notes=notes, visited=visited, lessons=lessons)
+                        tabs=tabs, notes=notes, visited=visited, lessons=lessons,
+                        blocked=blocked)
     payload: dict[str, Any] = {
         "model": model,
         "state": state,

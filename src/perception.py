@@ -244,12 +244,14 @@ def build_state(*, task: str, url: str, elements: list[ElementRef],
                 focused: FocusedField, page_text: str,
                 history: list[str], frame: str = "", grid: str = "",
                 tabs: int = 1, notes: list[str] | None = None,
-                visited: list[str] | None = None) -> dict[str, Any]:
+                visited: list[str] | None = None,
+                lessons: str = "") -> dict[str, Any]:
     """Assemble the deterministic state packet sent to Jev."""
     return {
         "task": task,
         "url": url,
         "tabs": tabs,
+        "lessons": lessons,
         "notes": list(notes or [])[-6:],
         "visited": list(visited or [])[-10:],
         "elements": [

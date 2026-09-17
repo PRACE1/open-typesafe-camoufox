@@ -1,6 +1,10 @@
-"""Runner-helper tests — settle check + credential placeholder picking (offline)."""
+"""Runner-helper tests — settle, placeholders, loop-guard, phases (offline)."""
 
-from src.runner import credential_placeholder, loop_guard_trip, page_settled
+import pytest
+
+from src.runner import (
+    Phase, credential_placeholder, loop_guard_trip, page_settled, phase_step,
+)
 
 
 def test_page_settled_blank_and_loading():
@@ -53,3 +57,29 @@ def test_loop_guard_resets_on_change():
     _, run = loop_guard_trip(sig_b, run, sig_a)
     trip, run = loop_guard_trip(sig_a, run, sig_nav)
     assert (trip, run) == (False, 1)
+
+
+def test_phase_happy_path_walk():
+    trail: list[str] = []
+    for ph in [Phase.SEE, Phase.DECIDE, Phase.GATE, Phase.ACT,
+               Phase.VERIFY, Phase.SEE, Phase.DECIDE, Phase.GATE,
+               Phase.VERIFY, Phase.STOPPED]:
+        phase_step(trail, ph)
+    assert trail[-1] == "stopped" and trail.count("see") == 2
+
+
+def test_phase_idle_path_skips_act():
+    trail: list[str] = []
+    for ph in [Phase.SEE, Phase.DECIDE, Phase.GATE, Phase.VERIFY,
+               Phase.SEE, Phase.DECIDE, Phase.GATE, Phase.DONE]:
+        phase_step(trail, ph)
+    assert trail[-1] == "done"
+
+
+def test_phase_illegal_moves_raise():
+    with pytest.raises(ValueError):
+        phase_step([], Phase.DECIDE)  # must start at SEE
+    with pytest.raises(ValueError):
+        phase_step(["see"], Phase.ACT)  # SEE -> ACT skips DECIDE+GATE
+    with pytest.raises(ValueError):
+        phase_step(["see", "decide", "gate", "done"], Phase.SEE)  # DONE terminal

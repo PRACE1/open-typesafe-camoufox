@@ -130,9 +130,11 @@ def test_build_state_notes_visited_and_href():
     els = [ElementRef(idx=0, kind="link", text="R", href="https://a.example/p")]
     s = build_state(task="t", url="u", elements=els, focused=FocusedField(),
                     page_text="", history=[],
-                    notes=["n1", "n2"], visited=["https://a.example/p"])
+                    notes=["n1", "n2"], visited=["https://a.example/p"],
+                    lessons="popups die with openers")
     assert s["notes"] == ["n1", "n2"] and s["visited"] == ["https://a.example/p"]
     assert s["elements"][0]["href"] == "https://a.example/p"
+    assert s["lessons"] == "popups die with openers"
 
 
 def test_find_elements_resolves_href():

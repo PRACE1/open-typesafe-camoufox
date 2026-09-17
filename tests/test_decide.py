@@ -18,6 +18,35 @@ def test_kinds_mutually_exclusive():
     assert set(KIND_CRITERIA) == {k.value for k in Kind}
 
 
+def test_kind_criteria_have_boundaries():
+    for kind in Kind:
+        crit = KIND_CRITERIA[kind.value]
+        assert set(crit) == {"what", "not_for"}, kind
+        assert crit["what"] and crit["not_for"]
+
+
+def test_questions_cover_choices_nouls_score():
+    q = build_questions(_els(2), ["https://a.example"])
+    assert set(q) == {"kind", "item", "site", "page_ready", "needs_text",
+                      "task_done", "progress"}
+    assert q["page_ready"]["type"] == "noul"
+    assert q["needs_text"]["type"] == "noul"
+    assert q["task_done"]["type"] == "noul"
+    assert q["progress"]["type"] == "score"
+    assert isinstance(q["progress"]["criteria"], list)
+
+
+def test_item_options_are_structured():
+    from src.deps import ElementRef as _E
+    els = [_E(idx=0, kind="input", type="text", label="Search",
+              text="", href="", cx=0.5, cy=0.4, value="q", value_len=1)]
+    q = build_questions(els, ["https://a.example"],
+                        visited=["https://other.example/"])
+    opt = q["item"]["criteria"]["0"]
+    assert opt["label"] == "Search" and opt["state"] == "filled(1ch)"
+    assert opt["sel"] == '[data-jev="0"]' and opt["visited"] is False
+
+
 def test_item_choice_caps_at_255():
     q = build_questions(_els(300), ["https://a.example"])
     assert len(q["item"]["criteria"]) == MAX_ITEMS == 255
@@ -30,7 +59,8 @@ def test_item_choice_empty_page_has_sentinel():
 
 def test_site_choice_has_other():
     q = build_questions(_els(2), ["https://a.example", "https://b.example"])
-    assert q["site"]["criteria"]["other"].startswith("A different URL")
+    other = q["site"]["criteria"]["other"]
+    assert other["what"].startswith("A different URL")
 
 
 def _raw(kind, item="1", site="0", conf=0.9):
@@ -39,6 +69,27 @@ def _raw(kind, item="1", site="0", conf=0.9):
         "item": {"choice": item},
         "site": {"choice": site},
     }}
+
+
+def _raw_full(kind, ready=0.9, text=0.1, done=0.0, prog=0.4, **kw):
+    raw = _raw(kind, **kw)
+    raw["answers"]["page_ready"] = {"noul": ready}
+    raw["answers"]["needs_text"] = {"noul": text}
+    raw["answers"]["task_done"] = {"noul": done}
+    raw["answers"]["progress"] = {"score": prog}
+    return raw
+
+
+def test_noul_and_score_decode():
+    d = _decode(_raw_full("type_at", ready=0.93, text=0.88, done=0.12, prog=0.6), n=3)
+    assert d.page_ready == 0.93 and d.needs_text == 0.88
+    assert d.task_done == 0.12 and d.progress == 0.6
+
+
+def test_noul_score_defaults_when_missing():
+    d = _decode(_raw("wait"), n=1)
+    assert d.page_ready == 0.0 and d.needs_text == 0.0
+    assert d.task_done == 0.0 and d.progress == 0.0
 
 
 def _decode(raw, n=3):
@@ -91,3 +142,4 @@ def test_no_key_fallback_is_none(monkeypatch):
         elements=_els(2), focused=FocusedField(), page_text="p", history=[],
     ))
     assert isinstance(d, JevDecision) and d.kind == Kind.NONE and d.confidence == 0.0
+    assert d.page_ready == 0.0 and d.needs_text == 0.0 and d.task_done == 0.0

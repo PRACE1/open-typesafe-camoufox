@@ -29,7 +29,7 @@ from typing import Any
 import httpx
 
 from .deps import ElementRef, FocusedField
-from .perception import build_state, element_criteria
+from .perception import build_state, norm_url
 
 
 class Kind(str, Enum):
@@ -44,23 +44,51 @@ class Kind(str, Enum):
     NONE = "none"
 
 
-KIND_CRITERIA: dict[str, str] = {
-    Kind.WAIT.value: "Page is loading or transitioning; do nothing this step and re-observe",
-    Kind.CLICK_ITEM.value: "Click the chosen element (button/link); no text needed",
-    Kind.TYPE_AT.value: "Focus the chosen input and type fresh text into it (writer composes it)",
-    Kind.PRESS_ENTER.value: "Press Enter to submit the focused field (e.g. after typing)",
-    Kind.REFRESH.value: "Reload the current tab; its content failed to load or is stale",
-    Kind.CLOSE_OTHERS.value: "Close all tabs except the current one; too many tabs are open",
-    Kind.GOTO.value: "This page is finished; navigate to the chosen site URL",
-    Kind.DONE.value: "TASK is observably complete in PAGE TEXT; stop with the outcome",
-    Kind.NONE.value: "No confident action; idle this step",
+KIND_CRITERIA: dict[str, dict[str, str]] = {
+    Kind.WAIT.value: {
+        "what": "The page is loading, transitioning, or blank; deliberately do nothing and re-observe next step",
+        "not_for": "Settled readable pages; any case another option describes",
+    },
+    Kind.CLICK_ITEM.value: {
+        "what": "Click the chosen element (link/button) to navigate or trigger it; no text needed",
+        "not_for": "Text inputs; submitting a typed query (press_enter); anything needing fresh text",
+    },
+    Kind.TYPE_AT.value: {
+        "what": "Focus the chosen text input and type fresh text the writer composes; the field is cleared first",
+        "not_for": "Buttons/links; credential fields without a task placeholder; retyping identical text into a filled field",
+    },
+    Kind.PRESS_ENTER.value: {
+        "what": "Press Enter to submit the focused field, typically right after typing a query",
+        "not_for": "Before any text was typed; dismissing dialogs",
+    },
+    Kind.REFRESH.value: {
+        "what": "Reload the current tab when its content failed to load or is visibly stale",
+        "not_for": "Pages still loading (wait); navigating to a new URL",
+    },
+    Kind.CLOSE_OTHERS.value: {
+        "what": "Close every tab except the current one and its opener; tab clutter blocks progress",
+        "not_for": "Single-tab sessions; closing the tab being read",
+    },
+    Kind.GOTO.value: {
+        "what": "Leave this page for a chosen catalog URL when the current page is finished",
+        "not_for": "In-page actions; same-page retries",
+    },
+    Kind.DONE.value: {
+        "what": "The TASK outcome is observably complete in PAGE TEXT; stop with the outcome",
+        "not_for": "Loading or blank pages; partial progress without the concrete outcome",
+    },
+    Kind.NONE.value: {
+        "what": "No confident action exists; idle one step",
+        "not_for": "Any case another option describes",
+    },
 }
 
-KIND_INSTRUCTIONS = (
-    "Which single action advances the TASK? The options are mutually exclusive: "
-    "pick exactly one. If the page is still loading, picking anything other "
-    "than wait/none is wrong."
-)
+KIND_INSTRUCTIONS = {
+    "question": "Which single action advances the TASK?",
+    "focus": "The options are mutually exclusive: pick exactly one. "
+             "If the page is still loading, picking anything other than "
+             "wait/none is wrong.",
+}
 
 MIN_CONFIDENCE = 0.4
 MAX_ITEMS = 255  # Jev Choice cardinality cap
@@ -73,6 +101,13 @@ class JevDecision:
     target_url: str | None = None
     propose_url: bool = False
     confidence: float = 0.0
+    # Noul flags (probability the answer is yes; no separate confidence —
+    # near 1 is yes, near 0 is no, near 0.5 is uncertain).
+    page_ready: float = 0.0
+    needs_text: float = 0.0
+    task_done: float = 0.0
+    # Score: position on the task-completion spectrum (0..1).
+    progress: float = 0.0
     raw: dict = field(default_factory=dict)
 
     @property
@@ -105,15 +140,45 @@ async def _post(payload: dict, timeout_s: float, base: str, key: str) -> dict:
     raise RuntimeError("unreachable")
 
 
+def _item_option(e: ElementRef, visited: set[str]) -> dict[str, Any]:
+    """Structured Choice option: the model sees what the element is, what it
+    holds, where it points, and whether it was already visited — the full
+    capability context for this selector, not just a label."""
+    label = e.label or e.placeholder or e.text or e.id or "?"
+    state = "-"
+    if e.kind in ("input", "textarea", "select") or e.type:
+        state = f"filled({e.value_len}ch)" if e.value_len else "empty"
+    return {
+        "label": label,
+        "kind": e.kind,
+        "type": e.type,
+        "text": e.text,
+        "href": e.href,
+        "state": state,
+        "at": f"{e.cx:.3f},{e.cy:.3f}",
+        "sel": f'[data-jev="{e.idx}"]',
+        "visited": bool(e.href and norm_url(e.href) in visited),
+    }
+
+
 def build_questions(elements: list[ElementRef], sites: list[str],
                     visited: list[str] | None = None) -> dict[str, Any]:
-    """The three Choice questions for one Jev request."""
+    """Three Choices plus three Noul flags plus one progress Score.
+
+    Nouls flag situations needing a decision alongside the verb choice:
+    page_ready (model-side settle check), needs_text (gate the writer),
+    task_done (completion flag independent of kind=done). The Score places
+    the run on the task-completion spectrum for long-horizon tracking.
+    """
     vset = set(visited or [])
-    item_criteria = {str(e.idx): element_criteria(e, vset) for e in elements[:MAX_ITEMS]}
+    item_criteria = {str(e.idx): _item_option(e, vset) for e in elements[:MAX_ITEMS]}
     if not item_criteria:
         item_criteria = {"-1": "No actionable elements on this page"}
-    site_criteria = {str(i): url[:160] for i, url in enumerate(sites)}
-    site_criteria["other"] = "A different URL the writer will propose from the task"
+    site_criteria: dict[str, Any] = {str(i): url[:160] for i, url in enumerate(sites)}
+    site_criteria["other"] = {
+        "what": "A different URL the writer proposes from the task",
+        "not_for": "Any listed URL",
+    }
     return {
         "kind": {
             "type": "choice",
@@ -122,19 +187,60 @@ def build_questions(elements: list[ElementRef], sites: list[str],
         },
         "item": {
             "type": "choice",
-            "instructions": (
-                "Which element should click_item/type_at act on? "
-                "Used only for those kinds; pick the best candidate anyway."
-            ),
+            "instructions": {
+                "question": "Which element should click_item/type_at act on?",
+                "focus": "Used only for those kinds; still pick the best candidate. "
+                         "Each option carries its label, text, href, fill-state, "
+                         "selector, and visited mark.",
+            },
             "criteria": item_criteria,
         },
         "site": {
             "type": "choice",
-            "instructions": (
-                "Which URL should goto navigate to? Used only for goto; "
-                "pick 'other' when the task needs a URL not listed here."
-            ),
+            "instructions": {
+                "question": "Which URL should goto navigate to?",
+                "focus": "Used only for goto; pick 'other' when the task needs a URL not listed here.",
+            },
             "criteria": site_criteria,
+        },
+        "page_ready": {
+            "type": "noul",
+            "instructions": {
+                "question": "Has the page finished loading?",
+                "focus": "Blank pages, spinners, and 'looking for results' mean NO.",
+            },
+            "criteria": {
+                "true": "Settled readable content is present",
+                "false": "Blank, spinner, or results still loading",
+            },
+        },
+        "needs_text": {
+            "type": "noul",
+            "instructions": {
+                "question": "Does the next action need fresh free text typed?",
+                "focus": "type_at almost always needs text; clicks, waits, and submits do not.",
+            },
+        },
+        "task_done": {
+            "type": "noul",
+            "instructions": {
+                "question": "Is the TASK observably complete in PAGE TEXT right now?",
+                "focus": "Requires the concrete outcome (fact, confirmation) visible — not partial progress, not a loading page.",
+            },
+        },
+        "progress": {
+            "type": "score",
+            "instructions": {
+                "question": "How close is the TASK to complete?",
+                "focus": "Judge observable page state against the task, not effort spent.",
+            },
+            "criteria": [
+                "Nothing done yet",
+                "Exploring / page loading",
+                "Acting on the page",
+                "Verifying the outcome",
+                "Complete",
+            ],
         },
     }
 
@@ -175,10 +281,23 @@ def _decode(decision_raw: dict, elements: list[ElementRef], sites: list[str]) ->
             except (ValueError, IndexError):
                 propose_url = True
 
+    def _noul(qid: str) -> float:
+        try:
+            return min(max(float(answers.get(qid, {}).get("noul", 0.0) or 0.0), 0.0), 1.0)
+        except (ValueError, TypeError):
+            return 0.0
+
+    try:
+        progress = min(max(float(answers.get("progress", {}).get("score", 0.0) or 0.0), 0.0), 1.0)
+    except (ValueError, TypeError):
+        progress = 0.0
+
     return JevDecision(
         kind=kind, element_idx=element_idx, target_url=target_url,
         propose_url=propose_url,
-        confidence=min(max(confidence, 0.0), 1.0), raw=decision_raw,
+        confidence=min(max(confidence, 0.0), 1.0),
+        page_ready=_noul("page_ready"), needs_text=_noul("needs_text"),
+        task_done=_noul("task_done"), progress=progress, raw=decision_raw,
     )
 
 
@@ -196,6 +315,7 @@ async def decide_action(
     tabs: int = 1,
     notes: list[str] | None = None,
     visited: list[str] | None = None,
+    lessons: str = "",
     timeout_s: float = 30.0,
 ) -> JevDecision:
     """One Jev request -> the single next action (+ confidence)."""
@@ -210,7 +330,7 @@ async def decide_action(
 
     state = build_state(task=task, url=url, elements=elements, focused=focused,
                         page_text=page_text, history=history, frame=frame, grid=grid,
-                        tabs=tabs, notes=notes, visited=visited)
+                        tabs=tabs, notes=notes, visited=visited, lessons=lessons)
     payload: dict[str, Any] = {
         "model": model,
         "state": state,

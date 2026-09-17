@@ -22,6 +22,7 @@ import os
 import re
 import time
 from datetime import datetime
+from enum import Enum
 
 from . import perception
 from .actions import click_item, goto_url, press_key, type_at
@@ -60,6 +61,47 @@ def loop_guard_trip(last_sig: tuple | None, run: int, sig: tuple) -> tuple[bool,
     """
     run = run + 1 if sig == last_sig else 1
     return run >= 3, run
+
+
+class Phase(str, Enum):
+    """Run-loop phases — the explicit Python state machine.
+
+    Every step walks SEE -> DECIDE -> GATE -> [ACT] -> VERIFY and ends in
+    DONE/STOPPED. Idle paths skip ACT (GATE -> VERIFY). DONE is accepted in
+    GATE; stops are decided in VERIFY (or STEER). phase_step raises on an
+    illegal move so a broken loop fails loudly instead of drifting.
+    """
+
+    SEE = "see"
+    DECIDE = "decide"
+    GATE = "gate"
+    ACT = "act"
+    VERIFY = "verify"
+    DONE = "done"
+    STOPPED = "stopped"
+
+
+_PHASE_EDGES: dict[str, set[str]] = {
+    Phase.SEE.value: {Phase.DECIDE.value, Phase.STOPPED.value},
+    Phase.DECIDE.value: {Phase.GATE.value},
+    Phase.GATE.value: {Phase.ACT.value, Phase.VERIFY.value, Phase.DONE.value, Phase.STOPPED.value},
+    Phase.ACT.value: {Phase.VERIFY.value},
+    Phase.VERIFY.value: {Phase.SEE.value, Phase.DONE.value, Phase.STOPPED.value},
+    Phase.DONE.value: set(),
+    Phase.STOPPED.value: set(),
+}
+
+
+def phase_step(phases: list[str], nxt: Phase | str) -> list[str]:
+    """Append a phase transition; raise on an illegal move."""
+    nxt_v = nxt.value if isinstance(nxt, Phase) else str(nxt)
+    if not phases:
+        if nxt_v != Phase.SEE.value:
+            raise ValueError(f"run must start at SEE, got {nxt_v}")
+    elif nxt_v not in _PHASE_EDGES.get(phases[-1], set()):
+        raise ValueError(f"illegal phase transition {phases[-1]} -> {nxt_v}")
+    phases.append(nxt_v)
+    return phases
 
 
 def credential_placeholder(task: str, *, want_password: bool) -> str | None:
@@ -106,6 +148,8 @@ async def run_decide_session(
     steer_abs = os.path.abspath(steer_file)
     run_dir = report_mod.make_run_dir()
     _log_sink.set_file(os.path.join(run_dir, "run.log"))
+    # Shared cross-run lessons (notebook model): bounded excerpt, loaded once.
+    lessons = report_mod.load_lessons(os.path.dirname(os.path.dirname(run_dir)))
 
     log("=" * 60)
     log("open-typesafe-camoufox (decide) — WATCH THE BROWSER WINDOW (headed) · hands off mouse/keyboard")
@@ -139,6 +183,7 @@ async def run_decide_session(
     prev_fp: tuple | None = None
     dead_run = 0
     last_effect_kind: str | None = None
+    phase_trail: list[str] = []
     steer_consumed = 0
     started = datetime.now().isoformat(timespec="seconds")
     t_end = time.time() + budget_s
@@ -164,6 +209,7 @@ async def run_decide_session(
             steps += 1
             entry: dict = {"n": steps, "t": round(time.time(), 1)}
             log(f"──── step {steps}/{max_steps} " + "─" * 40)
+            phase_step(phase_trail, Phase.SEE)
             effective_task = task_text + (
                 "\nNEW INSTRUCTIONS:\n" + "\n".join(instructions[-5:])
                 if instructions else ""
@@ -189,8 +235,10 @@ async def run_decide_session(
             if page_settled(page_text) and norm not in visited_set:
                 visited.append(norm)
                 visited_set.add(norm)
-                notes.append(f"{norm} :: {page_text.strip()[:300]}")
+                banked = f"{norm} :: {page_text.strip()[:300]}"
+                notes.append(banked)
                 notes[:] = perception.trim_notes(notes)
+                report_mod.append_memory(run_dir, f"- {banked}")
             state.url = page.url
             state.elements = elements
             state.focused = focused
@@ -230,6 +278,9 @@ async def run_decide_session(
                 elif kind_s == "instruction" and payload:
                     instructions.append(payload)
             if stopped or paused:
+                if stopped:
+                    phase_step(phase_trail, Phase.STOPPED)
+                entry["phases"] = list(phase_trail)
                 report_mod.append_transcript(run_dir, entry)
                 if stopped:
                     break
@@ -242,23 +293,41 @@ async def run_decide_session(
                     task=effective_task, url=page.url, start_url=start_url,
                     elements=elements, focused=focused, page_text=page_text,
                     history=history, tabs=n_tabs, notes=notes, visited=visited,
+                    lessons=lessons,
                 )
             except Exception as exc:
                 log(f"DECIDE failed ({exc.__class__.__name__}); idling this step")
                 entry["decide"] = f"failed: {exc}"
                 history.append(f"step {steps}: decide failed, idled")
                 noops += 1
+                phase_step(phase_trail, Phase.DECIDE)
+                phase_step(phase_trail, Phase.GATE)
+                phase_step(phase_trail, Phase.VERIFY)
+                entry["phases"] = list(phase_trail)
                 report_mod.append_transcript(run_dir, entry)
                 await asyncio.sleep(interval)
                 continue
             conf = decision.confidence
+            phase_step(phase_trail, Phase.DECIDE)
+            # The model-side settle flag can only add patience, never remove
+            # the regex guard: a loading verdict forces wait even on readable
+            # text, but a ready verdict never overrides a loading regex.
+            ready_now = page_settled(page_text) and decision.page_ready >= 0.35
             log(f"DECIDE {decision.kind.value} conf={conf:.2f}"
                 + (f" item=#{decision.element_idx}" if decision.element_idx is not None else "")
-                + (f" site={decision.target_url or 'other...'}" if decision.kind == Kind.GOTO else ""))
+                + (f" site={decision.target_url or 'other...'}" if decision.kind == Kind.GOTO else "")
+                + f" | ready={decision.page_ready:.2f} text?={decision.needs_text:.2f}"
+                + f" done?={decision.task_done:.2f} prog={decision.progress:.2f}")
             entry["decide"] = (
                 f"{decision.kind.value} conf={conf:.2f} "
                 f"item={decision.element_idx} site={decision.target_url or ('other' if decision.propose_url else None)}"
             )
+            entry["nouls"] = {
+                "ready": round(decision.page_ready, 2),
+                "text?": round(decision.needs_text, 2),
+                "done?": round(decision.task_done, 2),
+            }
+            entry["progress"] = round(decision.progress, 2)
             entry["think"] = entry["decide"]
             report_mod.write_answers_json(run_dir, steps, decision.raw)
 
@@ -271,6 +340,8 @@ async def run_decide_session(
                 guard_sig = (decision.kind.value, decision.element_idx, page.url)
                 guard_trip, sig_run = loop_guard_trip(last_sig, sig_run, guard_sig)
                 last_sig = guard_sig
+            phase_step(phase_trail, Phase.GATE)
+            acted = False
             if conf < min_confidence and decision.kind not in (Kind.DONE,):
                 log(f"GATE   conf {conf:.2f} < {min_confidence} — idle (no-op {noops + 1})")
                 history.append(f"step {steps}: low conf {conf:.2f}, idled")
@@ -294,12 +365,19 @@ async def run_decide_session(
                 entry["act"] = "none"
                 noops += 1
             elif decision.kind == Kind.DONE:
-                if not page_settled(page_text):
-                    msg = (f"step {steps}: DONE REJECTED (page not settled) — "
+                if not ready_now:
+                    msg = (f"step {steps}: DONE REJECTED (page not settled — "
+                           f"regex={page_settled(page_text)}, model ready={decision.page_ready:.2f}) — "
                            "wait one step and re-observe")
                     log(f"DONE denied: {msg}")
                     history.append(msg)
                     entry["act"] = "DONE rejected (page not settled)"
+                elif decision.task_done < 0.5:
+                    msg = (f"step {steps}: DONE REJECTED (model completion flag "
+                           f"{decision.task_done:.2f} < 0.5) — keep working")
+                    log(f"DONE denied: {msg}")
+                    history.append(msg)
+                    entry["act"] = "DONE rejected (model flag)"
                 elif not page_text.strip():
                     msg = f"step {steps}: DONE REJECTED (empty page text)"
                     log(f"DONE denied: {msg}")
@@ -308,6 +386,7 @@ async def run_decide_session(
                 else:
                     note = page_text.strip()[:200]
                     done = True
+                    phase_step(phase_trail, Phase.DONE)
                     entry["act"] = f"DONE ({note[:80]})"
                     history.append(f"step {steps}: DONE — {note[:80]}")
                     log(f"DONE   {note[:120]}")
@@ -330,6 +409,7 @@ async def run_decide_session(
                     history.append(f"step {steps}: goto {target} — {res}")
                     moves += 1
                     noops = 0
+                    acted = True
             elif decision.kind == Kind.PRESS_ENTER:
                 log("ACT    key=Enter")
                 res = await press_key(platform, "Enter")
@@ -339,6 +419,7 @@ async def run_decide_session(
                 history.append(f"step {steps}: pressed Enter — {res}")
                 moves += 1
                 noops = 0
+                acted = True
                 last_effect_kind = "press_enter"
             elif decision.kind == Kind.REFRESH:
                 log("ACT    refresh")
@@ -349,6 +430,7 @@ async def run_decide_session(
                 history.append(f"step {steps}: refreshed — {res}")
                 moves += 1
                 noops = 0
+                acted = True
                 last_effect_kind = "refresh"
             elif decision.kind == Kind.CLOSE_OTHERS:
                 log("ACT    close other tabs")
@@ -360,6 +442,7 @@ async def run_decide_session(
                 history.append(f"step {steps}: {res}")
                 moves += 1
                 noops = 0
+                acted = True
             else:  # CLICK_ITEM / TYPE_AT
                 idx = decision.element_idx
                 by_idx = {e.idx: e for e in elements}
@@ -377,19 +460,29 @@ async def run_decide_session(
                     history.append(f"step {steps}: clicked element #{idx} — {res}")
                     moves += 1
                     noops = 0
+                    acted = True
                     last_effect_kind = "click_item"
                 else:  # TYPE_AT
                     elem = by_idx[idx]
                     label = elem.label or elem.placeholder or elem.text or elem.id or f"element #{idx}"
                     cred = is_credential_element(elem)
                     log(f"ACT    element #{idx} type (credential={cred})")
-                    composed = await compose_text(
-                        task=effective_task, field_label=label,
-                        placeholder=elem.placeholder, nearby_text=page_text,
-                        history=history, is_credential=cred,
-                    )
+                    if not cred and decision.needs_text < 0.35:
+                        msg = (f"step {steps}: model says no text needed at #{idx} "
+                               f"(needs_text={decision.needs_text:.2f}) — skipping compose")
+                        log(msg)
+                        history.append(msg)
+                        entry["act"] = f"type_at #{idx} (no text needed)"
+                        noops += 1
+                        composed = None  # type: ignore[assignment]
+                    else:
+                        composed = await compose_text(
+                            task=effective_task, field_label=label,
+                            placeholder=elem.placeholder, nearby_text=page_text,
+                            history=history, is_credential=cred,
+                        )
                     text_to_type: str | None = None
-                    if composed.fill and composed.text.strip():
+                    if composed is not None and composed.fill and composed.text.strip():
                         text_to_type = composed.text.strip()
                     elif cred:
                         ph = credential_placeholder(effective_task, want_password=True)
@@ -403,9 +496,11 @@ async def run_decide_session(
                             entry["act"] = f"type_at #{idx} (credential, no placeholder)"
                             noops += 1
                     else:
-                        history.append(f"step {steps}: writer declined to fill #{idx}")
-                        entry["act"] = f"type_at #{idx} (writer declined)"
-                        noops += 1
+                        if composed is not None:
+                            history.append(f"step {steps}: writer declined to fill #{idx}")
+                            entry["act"] = f"type_at #{idx} (writer declined)"
+                            noops += 1
+                        # composed None = model said no text needed (recorded above).
                     if text_to_type is not None:
                         res = await type_at(platform, elements, idx, text_to_type)
                         log(f"RESULT {res}")
@@ -414,6 +509,7 @@ async def run_decide_session(
                         history.append(f"step {steps}: typed at #{idx} — {res}")
                         moves += 1
                         noops = 0
+                        acted = True
                         last_effect_kind = "type_at"
 
             # The action may have rebound the platform to a new tab
@@ -428,7 +524,7 @@ async def run_decide_session(
             state_packet = _build_state(
                 task=effective_task, url=page.url, elements=elements,
                 focused=focused, page_text=page_text, history=history,
-                tabs=n_tabs, notes=notes, visited=visited,
+                tabs=n_tabs, notes=notes, visited=visited, lessons=lessons,
             )
             sites = [u for u in (start_url, page.url) if u]
             sites = list(dict.fromkeys(sites))
@@ -439,14 +535,21 @@ async def run_decide_session(
             report_mod.write_payload_txt(
                 run_dir, steps, state_packet, build_questions(elements, sites),
                 f"{decision.kind.value} conf={decision.confidence:.2f} "
-                f"item={decision.element_idx}",
+                f"item={decision.element_idx} "
+                f"ready={decision.page_ready:.2f} text?={decision.needs_text:.2f} "
+                f"done?={decision.task_done:.2f} prog={decision.progress:.2f}",
             )
+            entry["phases"] = list(phase_trail)
             report_mod.append_transcript(run_dir, entry)
 
-            # No-observable-effect detection: a settled page identical to the
-            # previous step means the last action changed nothing readable.
-            # Twice in a row ends the run with an honest reason instead of
-            # looping to max_steps.
+            # VERIFY: fingerprint the step's outcome and evaluate the stop
+            # rules. A settled page identical to the previous step means the
+            # last action changed nothing readable. Twice in a row ends the
+            # run with an honest reason instead of looping to max_steps.
+            if not done:
+                if acted:
+                    phase_step(phase_trail, Phase.ACT)
+                phase_step(phase_trail, Phase.VERIFY)
             fp = perception.page_fingerprint(page.url, page_text)
             if (prev_fp is not None and fp == prev_fp and page_settled(page_text)
                     and last_effect_kind in ("click_item", "type_at", "press_enter", "refresh")):
@@ -456,6 +559,7 @@ async def run_decide_session(
                 if dead_run >= 2:
                     stopped = True
                     stop_reason = "action had no observable effect twice"
+                    phase_step(phase_trail, Phase.STOPPED)
             else:
                 dead_run = 0
             prev_fp = fp
@@ -463,6 +567,7 @@ async def run_decide_session(
             if noops >= 2 and not done:
                 stopped = True
                 stop_reason = "two consecutive no-ops"
+                phase_step(phase_trail, Phase.STOPPED)
                 log("STOP   two consecutive no-ops — ending run")
             await asyncio.sleep(interval)
 
@@ -478,6 +583,9 @@ async def run_decide_session(
             "run_dir": run_dir,
         }
         report_mod.write_run_json(run_dir, summary)
+        outcome = (f"OUTCOME done={done} stopped={stopped} "
+                   f"({summary.get('stop_reason', '')}) steps={steps} moves={moves}")
+        report_mod.append_memory(run_dir, outcome)
         report_mod.append_transcript(run_dir, {"final": summary})
 
     log("=" * 60)

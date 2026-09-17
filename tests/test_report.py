@@ -8,7 +8,7 @@ from PIL import Image
 
 from src.deps import ElementRef
 from src.report import (
-    annotate_png, make_run_dir, replay_payload,
+    annotate_png, append_memory, load_lessons, make_run_dir, replay_payload,
     write_answers_json, write_payload_txt, write_raw_png,
 )
 
@@ -58,3 +58,22 @@ def test_make_run_dir(tmp_path, monkeypatch):
     d = make_run_dir()
     assert os.path.isdir(d) and os.path.isdir(os.path.join(d))
     assert json.dumps({"ok": True})
+
+
+def test_append_memory_notebook(tmp_path):
+    from src.report import append_memory as _am
+    p = _am(str(tmp_path), "- https://a.example/ :: excerpt")
+    body = open(p, encoding="utf-8").read()
+    assert "- https://a.example/ :: excerpt\n" in body
+    _am(str(tmp_path), "OUTCOME done=True")
+    assert open(p, encoding="utf-8").read().count("\n") == 2
+
+
+def test_load_lessons_bounded_and_missing(tmp_path):
+    mem = tmp_path / ".agent-memory"
+    mem.mkdir()
+    (mem / "MEMORY.md").write_text("line1\nline2\nline3\n", encoding="utf-8")
+    assert load_lessons(str(tmp_path), limit=100) == "line1\nline2\nline3"
+    short = load_lessons(str(tmp_path), limit=8)
+    assert len(short) <= 8 and short.startswith("line1")
+    assert load_lessons(str(tmp_path / "nope")) == ""

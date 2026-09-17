@@ -102,18 +102,22 @@ screenshot ─► element map (DOM probe, reading order, data-jev tags)
               page text (visible words — the reading ground truth)
                           │
                           ▼
-             one Jev request, three Choices
+             one Jev request: Choices, Noul flags, and a Score
              ┌───────────────────────────────────────────────┐
              │ kind : wait | click_item | type_at |          │
              │        press_enter | refresh | close_others | │
              │        goto | done | none                     │
-             │ item : which element idx (click/type targets) │
+             │        (each with a what/not-for boundary)    │
+             │ item : which element idx — structured options │
+             │        (label/text/href/fill-state/selector)  │
              │ site : which catalog URL (goto targets)       │
+             │ Noul : page_ready? needs_text? task_done?     │
+             │ Score: progress on the task spectrum          │
              └───────────────────────────────────────────────┘
                           │  conf < 0.4 → idle (no-op)
                           │  two doubt no-ops → stop
                           ▼
-             deterministic action ─► wait ─► next step
+             deterministic action ─► verify ─► next step
 ```
 
 `wait` is patience, not doubt: a loading page idles without counting
@@ -125,6 +129,34 @@ so the next step reads the new content instead of re-clicking; `refresh`
 reloads a stale tab and `close_others` trims tabs while always keeping the
 current tab and its opener (a click-opened popup dies with its opener in
 this build — verified live).
+
+Each step walks an explicit phase machine —
+`see → decide → gate → [act] → verify`, ending `done`/`stopped`
+(idle paths skip `act`; illegal transitions raise instead of drifting).
+`verify` fingerprints the outcome: a settled page identical to the last
+step means the action changed nothing, twice in a row ends the run
+honestly. The three Noul flags ride along: `page_ready` can only add
+patience (never override the loading check), `needs_text` gates the
+writer call, `task_done` must agree before `done` is accepted. `progress`
+scores the run on the task-completion spectrum for long-horizon tracking.
+
+## What fires when (capability trigger map)
+
+Decide path (default, `otc --url … --task …`):
+
+| phase | module | fires |
+|---|---|---|
+| see | `perception` | element map, focused field, page text, tabs; banks notes + visited |
+| decide | `decide` (Jev) | kind/item/site Choices + page_ready/needs_text/task_done Nouls + progress Score |
+| gate | `runner` | confidence gate, loop-guard, Noul gates |
+| act | `actions` → `platform` | click/type/enter/refresh/goto/close; auto-adopts new tabs |
+| act | `writer` | only on `type_at` (non-credential) and off-catalog `goto` |
+| verify | `runner` | fingerprint vs last step, no-op and dead-run stops |
+
+Legacy path (`--legacy-planner`): `read_frame` → braille → `decide_cursor`
+hint; `build_step_agent` planner → `JevStep`; `JevCapability.move_cursor`
+executes. Uses `jev_agent`, `jev_tools`, `jev_actions`, `agent_runner`.
+Shared by both: the `platform` adapter, tracker, human motion, run folder.
 
 ## Run folder
 

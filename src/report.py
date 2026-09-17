@@ -135,3 +135,39 @@ def replay_payload(run_dir: str, n: int) -> dict[str, Any]:
         with open(answers_path, encoding="utf-8") as f:
             out["answers"] = json.load(f)
     return out
+
+
+def append_memory(run_dir: str, line: str) -> str:
+    """Append one finding to the run's notebook (runs/<ts>/MEMORY.md).
+
+    The per-run notebook: extractive findings banked as the loop reads new
+    pages, plus the final outcome. Survives the process for replay/debugging,
+    unlike the in-memory notes buffer.
+    """
+    path = os.path.join(run_dir, "MEMORY.md")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line.rstrip() + "\n")
+    return path
+
+
+LESSONS_LIMIT = 1200  # chars of the shared lessons file injected per call
+
+
+def load_lessons(root: str, limit: int = LESSONS_LIMIT) -> str:
+    """Bounded excerpt of the shared cross-run lessons notebook.
+
+    `.agent-memory/MEMORY.md` holds durable hard-won facts (this build's
+    quirks, gate thresholds, loop shapes). Bounded like the doc's notebook
+    model: latest snapshot per run, never dumped whole, so the packet can't
+    bloat across 40-50 steps.
+    """
+    path = os.path.join(root, ".agent-memory", "MEMORY.md")
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read().strip()
+    except OSError:
+        return ""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit("\n", 1)[0]
+    return cut if cut else text[:limit]

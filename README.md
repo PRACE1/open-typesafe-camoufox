@@ -246,5 +246,10 @@ npx lefthook install # one-time per clone: wires .git/hooks
 
 - `pre-commit` classifies/maps staged `.py` files (advisory; `--strict` to block).
 - `pre-push` ranks pushed `.py` files by Jev issue score and blocks on
-  ≥ 0.75. Bypass with `git push --no-verify` or `JEV_HOOKS_OFF=1`.
+  ≥ 0.75. Files scoring ≥ 0.35 get a per-window Noul scan, and hot
+  windows (≥ 0.6) get an issue-kind Choice, so the report names exact
+  line ranges (`L102-L150 (0.81): race-condition`). Tune with
+  `--line-floor`, `--line-hot`, `--window`, or target files directly
+  with `--files` (skips scope detection).
+- Bypass with `git push --no-verify` or `JEV_HOOKS_OFF=1`.
 - No key / no network → heuristic fallback, never blocks.

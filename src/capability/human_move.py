@@ -102,7 +102,11 @@ async def human_move(
     (sx, sy), (ex, ey) = (float(start[0]), float(start[1])), (float(end[0]), float(end[1]))
     dist = math.hypot(ex - sx, ey - sy)
     if dist < 150 or (k is not None and k == 0):
-        await _move_with_timeout(page, ex, ey)
+        try:
+            await _move_with_timeout(page, ex, ey)
+        except Exception as exc:  # noqa: BLE001 - same False contract as below
+            log(f"[human-move] move failed: {exc}")
+            return False
         return True
 
     mid = None
@@ -165,8 +169,7 @@ async def human_loop(
     cursor is. Returns the start point on success; None on failure.
     """
     hops = max(3, int(hops))
-    t = np.linspace(0.0, 2 * np.pi, hops, endpoint=False)
-    t[0] = 0.0
+    t = np.linspace(0.0, 2 * np.pi, hops, endpoint=False)  # t[0] is 0.0 already
     pts = np.stack([cx + np.cos(t) * rx, cy + np.sin(t) * ry], axis=1)
     vp_w, vp_h = (vp["width"], vp["height"]) if vp else (1280, 800)
     try:

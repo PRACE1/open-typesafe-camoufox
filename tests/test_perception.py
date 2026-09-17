@@ -2,8 +2,8 @@
 
 from src.deps import ElementRef, FocusedField
 from src.perception import (
-    _unwrap_redirect, build_state, element_criteria, format_elements,
-    host_of, is_credential, is_credential_element, norm_url,
+    _unwrap_redirect, build_state, element_criteria, excerpt_for,
+    format_elements, host_of, is_credential, is_credential_element, norm_url,
     page_fingerprint, trim_notes,
 )
 
@@ -189,3 +189,15 @@ def test_find_elements_parses_region():
 
     els = asyncio.run(find_elements(type("P", (), {"page": _FakePage()})()))
     assert els[0].region == "main"
+
+
+def test_excerpt_for_anchors_on_task_keywords():
+    task = "Search for Europa water ocean facts"
+    text = "Get app Write Sign up " + ("filler words here. " * 40) + \
+        "Europa hides a salty water ocean beneath ice. " + ("more filler. " * 40)
+    out = excerpt_for(task, text)
+    assert len(out) == 300 and "salty water ocean" in out
+    assert excerpt_for(task, "short text") == "short text"
+    assert excerpt_for(task, "") == ""
+    chrome = "Get app Write Sign up " * 30
+    assert excerpt_for("unrelated zzzqqq", chrome) == chrome[:300]

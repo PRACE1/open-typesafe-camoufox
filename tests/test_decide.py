@@ -29,7 +29,7 @@ def test_kind_criteria_have_boundaries():
 def test_questions_cover_choices_nouls_score():
     q = build_questions(_els(2), ["https://a.example"])
     assert set(q) == {"kind", "item", "site", "page_ready", "needs_text",
-                      "task_done", "progress"}
+                      "task_done", "fits", "progress"}
     assert q["page_ready"]["type"] == "noul"
     assert q["needs_text"]["type"] == "noul"
     assert q["task_done"]["type"] == "noul"
@@ -110,6 +110,10 @@ def test_noul_and_score_decode():
     d = _decode(_raw_full("type_at", ready=0.93, text=0.88, done=0.12, prog=0.6), n=3)
     assert d.page_ready == 0.93 and d.needs_text == 0.88
     assert d.task_done == 0.12 and d.progress == 0.6
+    assert d.fits == 1.0  # absent Noul defaults to trust
+    raw = _raw_full("click_item")
+    raw["answers"]["fits"] = {"noul": 0.2}
+    assert _decode(raw, n=3).fits == 0.2
 
 
 def test_noul_score_defaults_when_missing():

@@ -32,7 +32,7 @@ from .capability.human_move import HUMANIZE_LEVEL
 from .decide import Kind, decide_action
 from .deps import RunState
 from .perception import is_credential_element
-from .writer import ProposedAction, compose_text, propose_action, propose_url
+from .writer import ProposedAction, compose_text, propose_action, propose_url, summarize_task
 
 _LOADING_RE = re.compile(r"looking for results|loading|^\\s*$", re.IGNORECASE)
 
@@ -126,6 +126,33 @@ def should_override(*, approval: float, proposed: ProposedAction | None,
     return approval >= APPROVAL_MIN
 
 
+def resolve_proposal_action(*, choice_kind: str, choice_item: int | None,
+                            elements: list, fits: float,
+                            proposed: ProposedAction | None,
+                            executable: bool, approval: float) -> str:
+    """Route between the Choice vote and the LLM proposal.
+
+    Returns 'override' (disagree + lean-yes: execute proposal),
+    'fallback' (Choice pick vetoed/mismatched + viable proposal),
+    'mismatch-idle' (vetoed/mismatched with no viable proposal: wait
+    neutrally instead of executing known-dead), or 'none'.
+    """
+    if should_override(approval=approval, proposed=proposed,
+                       choice_kind=choice_kind, choice_item=choice_item,
+                       executable=executable):
+        return "override"
+    vetoed = (choice_kind == "click_item"
+              and _choice_is_vetoed(elements, choice_item))
+    mismatched = (choice_kind in ("click_item", "type_at")
+                  and choice_item is not None and fits < 0.4)
+    if (vetoed or mismatched) and proposed is not None and executable \
+            and approval >= APPROVAL_FALLBACK:
+        return "fallback"
+    if vetoed or mismatched:
+        return "mismatch-idle"
+    return "none"
+
+
 def _choice_is_vetoed(elements: list, idx: int | None) -> bool:
     """True when the Choice pick is a bare input click (would be vetoed)."""
     if idx is None:
@@ -159,6 +186,42 @@ def fresh_tabs(known: set[int], current: set[int]) -> set[int]:
     a stale tab while a fresh result sits unopened beside it.
     """
     return current - known
+
+
+def no_effect_trip(prev_acted: bool, prev_fp: tuple | None, fp: tuple,
+                   settled: bool, last_effect_kind: str | None) -> bool:
+    """True when the previous step acted yet the page is observably identical.
+
+    Strictly consecutive only: idle/wait/gate steps neither advance nor
+    reset the count — they are patience, and only back-to-back dead actions
+    end the run. (Loop-guard separately covers repeated identical intents.)
+    """
+    return bool(prev_acted and prev_fp is not None and fp == prev_fp
+                and settled and last_effect_kind in EFFECT_KINDS)
+
+
+def notes_url_count(notes: list[str]) -> int:
+    """Distinct page URLs banked in the notes buffer (notes store norms)."""
+    urls = set()
+    for line in notes or []:
+        url = line.split(" :: ", 1)[0].strip()
+        if url:
+            urls.add(url)
+    return len(urls)
+
+
+def should_submit_instead(idx: int, elements: list,
+                          last_typed: tuple | None, url: str) -> bool:
+    """True when type_at targets the already-filled field it just typed.
+
+    Retyping replaces identical text (clear-before-type) — nothing changes.
+    Pressing Enter submits the standing query instead. Scoped to the same
+    element on the same URL so multi-field forms are unaffected.
+    """
+    if last_typed is None or (idx, url) != last_typed:
+        return False
+    el = next((e for e in elements if e.idx == idx), None)
+    return el is not None and el.value_len > 0
 
 
 # Steps a newly adopted result tab is protected from goto: the loop opened
@@ -284,6 +347,7 @@ async def run_decide_session(
     noops = 0
     last_sig: tuple | None = None
     sig_run = 0
+    last_typed: tuple | None = None  # (element idx, page url) of the last successful type
     # Long-horizon tracking (40-50 steps): visited-URL memory, extractive
     # notes that survive the 8-line history window, and dead-run detection
     # for actions with no observable effect.
@@ -292,6 +356,8 @@ async def run_decide_session(
     notes: list[str] = []
     prev_fp: tuple | None = None
     dead_run = 0
+    prev_acted = False
+    synth_attempted = False
     last_effect_kind: str | None = None
     known_tab_ids: set[int] = set()
     reading_until_step: int = 0
@@ -385,7 +451,7 @@ async def run_decide_session(
             if page_settled(page_text) and norm not in visited_set:
                 visited.append(norm)
                 visited_set.add(norm)
-                banked = f"{norm} :: {page_text.strip()[:300]}"
+                banked = f"{norm} :: {perception.excerpt_for(task_text, page_text)}"
                 notes.append(banked)
                 notes[:] = perception.trim_notes(notes)
                 report_mod.append_memory(run_dir, f"- {banked}")
@@ -514,7 +580,7 @@ async def run_decide_session(
                 + (f" site={decision.target_url or 'other...'}" if decision.kind == Kind.GOTO else "")
                 + f" | ready={decision.page_ready:.2f} text?={decision.needs_text:.2f}"
                 + f" done?={decision.task_done:.2f} prog={decision.progress:.2f}"
-                + f" appr={decision.approval:.2f}")
+                + f" appr={decision.approval:.2f} fit={decision.fits:.2f}")
             entry["decide"] = (
                 f"{decision.kind.value} conf={conf:.2f} "
                 f"item={decision.element_idx} site={decision.target_url or ('other' if decision.propose_url else None)}"
@@ -524,16 +590,21 @@ async def run_decide_session(
                 "text?": round(decision.needs_text, 2),
                 "done?": round(decision.task_done, 2),
                 "approve": round(decision.approval, 2),
+                "fit": round(decision.fits, 2),
             }
             entry["progress"] = round(decision.progress, 2)
             entry["think"] = entry["decide"]
             # Approval override: the LLM reasoned over all elements + URLs
             # and the Noul leans yes on a DIFFERENT target than the Choice
             # vote — execute the proposal. Agreement runs the normal path.
-            if should_override(approval=decision.approval, proposed=proposed,
-                               choice_kind=decision.kind.value,
-                               choice_item=decision.element_idx,
-                               executable=proposal_executable(proposed, elements)):
+            # A vetoed/mismatched Choice pick falls back to a viable proposal,
+            # or idles neutrally when none exists (never execute known-dead).
+            route = resolve_proposal_action(
+                choice_kind=decision.kind.value, choice_item=decision.element_idx,
+                elements=elements, fits=decision.fits, proposed=proposed,
+                executable=proposal_executable(proposed, elements),
+                approval=decision.approval)
+            if route == "override":
                 log(f"APPROVED {proposed.kind}"
                     + (f" #{proposed.item}" if proposed.item is not None else "")
                     + f" (approval={decision.approval:.2f}) — executing proposal over Choice")
@@ -541,17 +612,30 @@ async def run_decide_session(
                 entry["decide"] += " [approved-override]"
                 decision = _apply_proposal(decision, proposed)
                 conf = decision.confidence
-            elif (decision.kind == Kind.CLICK_ITEM and decision.element_idx is not None
-                    and _choice_is_vetoed(elements, decision.element_idx)
-                    and proposed is not None and proposal_executable(proposed, elements)
-                    and decision.approval >= APPROVAL_FALLBACK):
+            elif route == "fallback":
                 log(f"VETO-FALLBACK {proposed.kind}"
                     + (f" #{proposed.item}" if proposed.item is not None else "")
-                    + f" (approval={decision.approval:.2f}) — Choice pick vetoed, trying proposal")
+                    + f" (approval={decision.approval:.2f}) — Choice pick vetoed/mismatched, trying proposal")
                 history.append(f"step {steps}: veto fallback — {proposed.rationale[:100]}")
                 entry["decide"] += " [veto-fallback]"
                 decision = _apply_proposal(decision, proposed)
                 conf = decision.confidence
+            elif route == "mismatch-idle":
+                log(f"MISMATCH {decision.kind.value} #{decision.element_idx} "
+                    f"(fit={decision.fits:.2f}) — waiting neutrally")
+                history.append(f"step {steps}: pick mismatched its verb (fit={decision.fits:.2f}), waited")
+                entry["act"] = f"mismatch wait ({decision.kind.value} #{decision.element_idx})"
+                decision = replace(decision, kind=Kind.WAIT, element_idx=None)
+            # Retype intent on an already-filled field means submit: the query
+            # is in the box, typing it again changes nothing — Enter does.
+            if (decision.kind == Kind.TYPE_AT and decision.element_idx is not None
+                    and should_submit_instead(decision.element_idx, elements,
+                                              last_typed, page.url)):
+                log(f"RETYPE type_at #{decision.element_idx} on filled field — submitting instead")
+                history.append(f"step {steps}: retype on filled field, submitting instead")
+                entry["decide"] += " [retype-submit]"
+                decision = replace(decision, kind=Kind.PRESS_ENTER, element_idx=None)
+                last_typed = None
             report_mod.write_answers_json(run_dir, steps, decision.raw)
 
             # Loop-guard: the tab, clear, and click systems all report into
@@ -824,6 +908,7 @@ async def run_decide_session(
                             noops = 0
                             acted = True
                             last_effect_kind = "type_at"
+                            last_typed = (idx, page.url)
 
             # The action may have rebound the platform to a new tab
             # (click auto-adopt) — re-sync the local handle so the screenshot,
@@ -889,9 +974,12 @@ async def run_decide_session(
                 if acted:
                     phase_step(phase_trail, Phase.ACT)
                 phase_step(phase_trail, Phase.VERIFY)
+            # VERIFY: fingerprint the step's outcome and evaluate the stop
+            # rules. Only a step that ACTED can prove the previous action
+            # dead: idle/wait/gate steps are patience, not evidence.
             fp = perception.page_fingerprint(page.url, page_text)
-            if (prev_fp is not None and fp == prev_fp and page_settled(page_text)
-                    and last_effect_kind in EFFECT_KINDS):
+            if no_effect_trip(prev_acted, prev_fp, fp, page_settled(page_text),
+                              last_effect_kind):
                 dead_run += 1
                 history.append(f"step {steps}: no observable effect from {last_effect_kind} x{dead_run}")
                 log(f"NOEFFECT {last_effect_kind} changed nothing x{dead_run}")
@@ -902,6 +990,29 @@ async def run_decide_session(
             else:
                 dead_run = 0
             prev_fp = fp
+            prev_acted = acted
+
+            # Last-resort synthesis: the per-step Noul never flags completion,
+            # but the chat model can judge across pages. Once per run, when a
+            # stop is imminent and 2+ distinct pages were read, ask it to call
+            # the task from the notes. A refusal (or failure) falls through
+            # to the honest stop below.
+            if (not done and not stopped and not synth_attempted
+                    and (dead_run >= 2 or noops >= STOP_AFTER_NOOPS)
+                    and notes_url_count(notes) >= 2):
+                synth_attempted = True
+                log("SYNTH  judging completion from notes...")
+                try:
+                    verdict = await summarize_task(task=effective_task, notes=notes)
+                except Exception as exc:  # noqa: BLE001
+                    verdict = None
+                    log(f"SYNTH  failed ({exc.__class__.__name__})")
+                if verdict is not None and verdict.done:
+                    done = True
+                    phase_step(phase_trail, Phase.DONE)
+                    entry["act"] = f"DONE ({verdict.note[:80]})"
+                    history.append(f"step {steps}: DONE (synthesized) — {verdict.note[:80]}")
+                    log(f"DONE   {verdict.note[:120]}")
 
             if noops >= STOP_AFTER_NOOPS and not done and not stopped:
                 stopped = True

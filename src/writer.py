@@ -160,6 +160,47 @@ async def propose_url(*, task: str, history: list[str]) -> WriterUrl:
     return WriterUrl(ok=True, url=cleaned)
 
 
+@dataclass
+class TaskVerdict:
+    """Writer's judgment over the accumulated notes: done + note, or not."""
+
+    done: bool
+    note: str
+
+
+async def summarize_task(*, task: str, notes: list[str]) -> TaskVerdict:
+    """Judge from the pages read (notes) whether the task is accomplished.
+
+    Called at most once per run, only when the loop is stalling with rich
+    notes — the per-step Noul never flags completion, but the chat model can
+    synthesize across pages. A non-empty note is required; anything else is
+    a refusal and the run stops honestly.
+    """
+    excerpt = "\n".join(notes[-6:])[:1500]
+    user = (
+        f"TASK: {task}\nPAGES READ (url :: excerpt):\n{excerpt}\n"
+        'Has the task been accomplished from these pages? Reply JSON: '
+        '{"done": true/false, "note": "<outcome in 300 chars or empty>"}. '
+        "done=true only when the task's concrete ask is answered above; "
+        "never invent facts not present in the excerpts."
+    )
+    try:
+        data = await _chat_json(
+            "You judge task completion from page excerpts. Reply with JSON only.",
+            user,
+        )
+    except Exception:
+        return TaskVerdict(done=False, note="")
+    if not isinstance(data, dict):
+        return TaskVerdict(done=False, note="")
+    note = data.get("note", "")
+    if not isinstance(note, str) or not note.strip():
+        return TaskVerdict(done=False, note="")
+    if not bool(data.get("done", False)):
+        return TaskVerdict(done=False, note="")
+    return TaskVerdict(done=True, note=note.strip()[:300])
+
+
 PROPOSE_SYSTEM = (
     "You propose the single best next browser action. Reply with JSON only: "
     '{"question": "Should the browser ...?", "kind": "<verb>", '
@@ -173,14 +214,18 @@ PROPOSE_SYSTEM = (
     "Never propose done; completion is decided separately. "
     "Research tasks complete in the main content region — "
     "header/nav chrome rarely advances the task once results show. "
-    "Never propose typing credentials; credential fields are handled separately."
+    "Never propose typing credentials; credential fields are handled separately. "
+    "Prefer pages not yet visited (their URLs appear in NOTES); revisit a page "
+    "only to read what was missed. "
+    "If recent clicks were blocked by overlays, propose press_escape to dismiss "
+    "them. If this page is read and offers nothing more, propose back to return "
+    "to results (prefer back over goto-search)."
 )
 
 
 @dataclass
 class ProposedAction:
     """One LLM-proposed candidate + the yes/no question the Noul answers."""
-
     question: str
     kind: str
     item: int | None

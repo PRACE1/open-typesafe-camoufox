@@ -5,8 +5,9 @@ import asyncio
 import src.writer as _w
 from src.deps import ElementRef
 from src.writer import (
-    ProposedAction, WriterText, WriterUrl, compose_text, propose_action,
-    propose_url, summarize_elements, validate_url,
+    ProposedAction, TaskVerdict, WriterText, WriterUrl, compose_text,
+    propose_action, propose_url, summarize_elements, summarize_task,
+    validate_url,
 )
 
 
@@ -121,3 +122,21 @@ def test_propose_reading_note_reaches_prompt(monkeypatch):
                                    reading_note="CURRENTLY READING: https://a.example/"))
     assert isinstance(p, ProposedAction) and p.kind == "wait"
     assert "CURRENTLY READING" in fake.calls[0][1]
+
+
+def test_summarize_task_done_and_refusals(monkeypatch):
+    notes = ["https://a.example/ :: Europa has a salty ocean",
+             "https://b.example/ :: Enceladus vents water"]
+    ok = _fake_chat({"done": True, "note": "Europa: salty ocean; Enceladus: vents"})
+    monkeypatch.setattr(_w, "_chat_json", ok)
+    v = asyncio.run(summarize_task(task="find water facts", notes=notes))
+    assert isinstance(v, TaskVerdict) and v.done is True and "Europa" in v.note
+    empty = _fake_chat({"done": True, "note": "   "})
+    monkeypatch.setattr(_w, "_chat_json", empty)
+    assert asyncio.run(summarize_task(task="t", notes=notes)).done is False
+    no = _fake_chat({"done": False, "note": "not yet"})
+    monkeypatch.setattr(_w, "_chat_json", no)
+    assert asyncio.run(summarize_task(task="t", notes=notes)).done is False
+    bad = _fake_chat("not json shaped")
+    monkeypatch.setattr(_w, "_chat_json", bad)
+    assert asyncio.run(summarize_task(task="t", notes=notes)).done is False

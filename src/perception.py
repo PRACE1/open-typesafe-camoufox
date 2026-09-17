@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import urllib.parse
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -94,6 +95,40 @@ def trim_notes(notes: list[str], limit: int = NOTES_LIMIT) -> list[str]:
     while len(notes) > 1 and sum(len(n) for n in notes) > limit:
         notes.pop(0)
     return notes
+
+
+_EXCERPT_STOPWORDS = frozenset({
+    "about", "after", "before", "being", "could", "would", "should",
+    "with", "from", "that", "this", "they", "them", "then", "than",
+    "when", "where", "which", "while", "other", "these", "those",
+    "into", "under", "between", "through", "during", "using", "make",
+    "best", "most", "more", "such", "like", "what", "with",
+})
+
+
+def excerpt_for(task: str, page_text: str, width: int = 300) -> str:
+    """Task-anchored excerpt: center on the first task keyword hit.
+
+    Page heads are usually nav chrome ("Get app Write Sign up..."), so a
+    head slice banks junk while the article body — what synthesis needs —
+    goes unremembered. Anchoring on task keywords banks the meat instead;
+    falls back to the head when nothing hits.
+    """
+    text = (page_text or "").strip().replace("\n", " ")
+    if len(text) <= width:
+        return text
+    keywords = sorted({w.lower() for w in re.findall(r"[A-Za-z]{5,}", task or "")}
+                      - _EXCERPT_STOPWORDS)
+    lowered = text.lower()
+    hit = -1
+    for kw in keywords:
+        i = lowered.find(kw)
+        if i >= 0 and (hit < 0 or i < hit):
+            hit = i
+    if hit < 0:
+        return text[:width]
+    start = max(0, hit - width // 3)
+    return text[start:start + width]
 
 FOCUSED_FIELD_JS = """
 () => {

@@ -5,8 +5,9 @@ import pytest
 from src.runner import (
     APPROVAL_FALLBACK, APPROVAL_MIN, BARE_CLICK_VETO_KINDS, EFFECT_KINDS,
     OVERRIDABLE_KINDS, READING_COOLDOWN_STEPS, Phase, credential_placeholder,
-    fresh_tabs, loop_guard_trip, page_settled, phase_step,
-    proposal_executable, reading_cooldown_active, should_override,
+    fresh_tabs, loop_guard_trip, no_effect_trip, page_settled, phase_step,
+    proposal_executable, reading_cooldown_active, resolve_proposal_action,
+    should_override, should_submit_instead,
 )
 from src.runner import _apply_proposal as _apply_proposal_fn
 from src.runner import _choice_is_vetoed as _vetoed_fn
@@ -158,6 +159,69 @@ def test_fresh_tabs_reconciliation():
     assert fresh_tabs({1, 2}, {1, 2, 3}) == {3}
     assert fresh_tabs({1, 2}, {1, 2}) == set()
     assert fresh_tabs(set(), {1}) == {1}  # first sighting lists all
+
+
+def test_no_effect_trip_strictly_consecutive():
+    fp = ("https://a.example/", "abc123")
+    other = ("https://a.example/", "def456")
+    assert no_effect_trip(True, fp, fp, True, "click_item") is True
+    assert no_effect_trip(False, fp, fp, True, "click_item") is False
+    assert no_effect_trip(True, None, fp, True, "click_item") is False
+    assert no_effect_trip(True, fp, other, True, "click_item") is False
+    assert no_effect_trip(True, fp, fp, False, "click_item") is False
+    assert no_effect_trip(True, fp, fp, True, "type_at") is False
+    assert no_effect_trip(True, fp, fp, True, None) is False
+
+
+def test_should_submit_instead():
+    from src.deps import ElementRef
+    els = [ElementRef(idx=5, kind="textarea", value_len=24),
+           ElementRef(idx=6, kind="textarea", value_len=0)]
+    url = "https://www.google.com/"
+    assert should_submit_instead(5, els, (5, url), url) is True
+    assert should_submit_instead(5, els, None, url) is False
+    assert should_submit_instead(6, els, (6, url), url) is False
+    assert should_submit_instead(5, els, (5, "https://other.example/"), url) is False
+    assert should_submit_instead(9, els, (9, url), url) is False
+
+
+def test_resolve_proposal_action_routing():
+    from src.runner import resolve_proposal_action
+    from src.deps import ElementRef
+    els = [ElementRef(idx=0, kind="textarea"), ElementRef(idx=7, kind="link")]
+    good = ProposedAction(question="q?", kind="click_item", item=7,
+                          url=None, rationale="r")
+    # disagree + lean-yes -> override
+    assert resolve_proposal_action(choice_kind="click_item", choice_item=0,
+                                   elements=els, fits=0.9, proposed=good,
+                                   executable=True, approval=0.6) == "override"
+    # vetoed pick + viable proposal, weak approval -> fallback
+    assert resolve_proposal_action(choice_kind="click_item", choice_item=0,
+                                   elements=els, fits=0.9, proposed=good,
+                                   executable=True, approval=0.45) == "fallback"
+    # vetoed pick, no viable proposal -> neutral idle
+    assert resolve_proposal_action(choice_kind="click_item", choice_item=0,
+                                   elements=els, fits=0.9, proposed=None,
+                                   executable=False, approval=0.1) == "mismatch-idle"
+    # mismatched verb (low fits), no proposal -> neutral idle
+    assert resolve_proposal_action(choice_kind="type_at", choice_item=0,
+                                   elements=els, fits=0.2, proposed=None,
+                                   executable=False, approval=0.0) == "mismatch-idle"
+    # agreement, sound pick -> none
+    assert resolve_proposal_action(choice_kind="click_item", choice_item=7,
+                                   elements=els, fits=0.9, proposed=good,
+                                   executable=True, approval=0.9) == "none"
+
+
+def test_notes_url_count():
+    from src.runner import notes_url_count
+    notes = ["https://a.example/x :: excerpt one",
+             "https://a.example/x :: excerpt two",
+             "https://b.example/ :: other",
+             "garbage without separator",
+             ""]
+    assert notes_url_count(notes) == 3
+    assert notes_url_count([]) == 0
 
 
 def test_choice_is_vetoed():

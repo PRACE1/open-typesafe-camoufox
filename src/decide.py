@@ -86,7 +86,7 @@ KIND_CRITERIA: dict[str, dict[str, str]] = {
     Kind.DONE.value: {
         "what": "The TASK outcome is observably complete in PAGE TEXT; stop with the outcome",
         "not_for": "Loading or blank pages; partial progress without the concrete outcome",
-        "note": "You do not write the outcome note — the harness assembles it from the pages you have read (your notes); your job is only to flag that you have read enough to name the outcome",
+        "note": "You do not write the outcome note — the harness assembles it from the pages you have read (your notes); your job is only to flag that you have read enough to name the outcome, even when the facts span several pages",
     },
     Kind.NONE.value: {
         "what": "No confident action exists; idle one step",
@@ -121,6 +121,8 @@ class JevDecision:
     task_done: float = 0.0
     # Approval Noul on the LLM-posed question (0.0 when none was posed).
     approval: float = 0.0
+    # Fits Noul on kind+item compatibility (defaults to trust).
+    fits: float = 1.0
     # Score: position on the task-completion spectrum (0..1).
     progress: float = 0.0
     raw: dict = field(default_factory=dict)
@@ -243,7 +245,18 @@ def build_questions(elements: list[ElementRef], sites: list[str],
             "type": "noul",
             "instructions": {
                 "question": "Is the TASK observably complete in PAGE TEXT right now?",
-                "focus": "Requires the concrete outcome (fact, confirmation) visible — not partial progress, not a loading page. You do not compose any text; flagging is enough, the harness assembles the note from the pages you have read.",
+                "focus": "Requires the concrete outcome (fact, confirmation) visible — not partial progress, not a loading page. Consider the NOTES from pages already read together with this page: if they collectively contain the outcome, answer YES. You do not compose any text; flagging is enough, the harness assembles the note from the pages you have read.",
+            },
+        },
+        "fits": {
+            "type": "noul",
+            "instructions": {
+                "question": "Does the chosen element suit the chosen action?",
+                "focus": "click_item needs a link or button; type_at needs an empty or refillable text input. A text field about to be clicked, or a button about to be typed into, means NO.",
+            },
+            "criteria": {
+                "true": "The element fits the verb",
+                "false": "Wrong element kind for the verb",
             },
         },
         "progress": {
@@ -309,11 +322,12 @@ def _decode(decision_raw: dict, elements: list[ElementRef], sites: list[str]) ->
             except (ValueError, IndexError):
                 propose_url = True
 
-    def _noul(qid: str) -> float:
+    def _noul(qid: str, default: float = 0.0) -> float:
         try:
-            return min(max(float(answers.get(qid, {}).get("noul", 0.0) or 0.0), 0.0), 1.0)
+            raw_v = answers.get(qid, {}).get("noul", default)
+            return min(max(float(raw_v if raw_v is not None else default), 0.0), 1.0)
         except (ValueError, TypeError):
-            return 0.0
+            return default
 
     try:
         progress = min(max(float(answers.get("progress", {}).get("score", 0.0) or 0.0), 0.0), 1.0)
@@ -326,6 +340,7 @@ def _decode(decision_raw: dict, elements: list[ElementRef], sites: list[str]) ->
         confidence=min(max(confidence, 0.0), 1.0),
         page_ready=_noul("page_ready"), needs_text=_noul("needs_text"),
         task_done=_noul("task_done"), approval=_noul("approval"),
+        fits=_noul("fits", default=1.0),
         progress=progress, raw=decision_raw,
     )
 

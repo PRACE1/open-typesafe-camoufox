@@ -104,6 +104,15 @@ BARE_CLICK_VETO_KINDS = ("input", "textarea", "select")
 # keeps retypes idempotent).
 EFFECT_KINDS = ("click_item", "press_enter", "press_escape", "refresh", "back", "challenge")
 
+# Kinds the confidence gate never blocks: history reloads and dialog
+# dismissal cannot type, post, pay, or navigate externally.
+GATE_EXEMPT_KINDS = (Kind.DONE, Kind.BACK, Kind.REFRESH, Kind.PRESS_ESCAPE)
+
+
+def confidence_gated(kind: Kind, conf: float, min_confidence: float) -> bool:
+    """True when a low-confidence decision must idle instead of acting."""
+    return conf < min_confidence and kind not in GATE_EXEMPT_KINDS
+
 
 # Consecutive doubt no-ops before the run ends. High enough to survive a
 # vetoed pick plus one gated wait; low enough that true fixation still ends
@@ -785,7 +794,11 @@ async def run_decide_session(
                 last_sig = guard_sig
             advance(machine, phase_trail, "decided")  # decide -> gate
             acted = False
-            if conf < min_confidence and decision.kind not in (Kind.DONE,):
+            # Confidence gates risky actions only: back/refresh/escape cannot
+            # type, post, pay, or navigate externally, so gating them strands
+            # the loop (seen live: low-conf back idled 3x and killed a run
+            # that had more pages to read). DONE is always exempt.
+            if confidence_gated(decision.kind, conf, min_confidence):
                 log(f"GATE   conf {conf:.2f} < {min_confidence} — idle (no-op {noops + 1})")
                 history.append(f"step {steps}: low conf {conf:.2f}, idled")
                 entry["act"] = "idle (low confidence)"

@@ -4,8 +4,9 @@ import pytest
 
 from src.runner import (
     APPROVAL_FALLBACK, APPROVAL_MIN, BARE_CLICK_VETO_KINDS,
-    CAPTCHA_MAX_ATTEMPTS, EFFECT_KINDS,
+    CAPTCHA_MAX_ATTEMPTS, EFFECT_KINDS, GATE_EXEMPT_KINDS,
     OVERRIDABLE_KINDS, READING_COOLDOWN_STEPS, Phase, captcha_should_stop,
+    confidence_gated,
     credential_placeholder,
     fresh_tabs, loop_guard_trip, no_effect_trip, page_settled, phase_step,
     proposal_executable, reading_cooldown_active, resolve_proposal_action,
@@ -184,6 +185,20 @@ def test_captcha_budget_try_then_honest_stop():
     assert captcha_should_stop(8) is True
     assert captcha_should_stop(12) is True
     assert captcha_should_stop(8, cap=9) is False
+
+
+def test_confidence_gate_exempts_safe_navigation():
+    from src.decide import Kind
+    # Risky verbs idle below the floor ...
+    assert confidence_gated(Kind.CLICK_ITEM, 0.2, 0.4) is True
+    assert confidence_gated(Kind.GOTO, 0.2, 0.4) is True
+    assert confidence_gated(Kind.PRESS_ENTER, 0.2, 0.4) is True
+    assert confidence_gated(Kind.CHALLENGE, 0.2, 0.4) is True
+    # ... but history reloads and dismissal can never exfiltrate, so the
+    # gate lets them through (seen live: gated back idles killed a run).
+    for kind in GATE_EXEMPT_KINDS:
+        assert confidence_gated(kind, 0.0, 0.4) is False
+    assert confidence_gated(Kind.CLICK_ITEM, 0.9, 0.4) is False
 
 
 def test_should_submit_instead():

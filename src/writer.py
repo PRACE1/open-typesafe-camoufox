@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.parse
+import uuid
 from dataclasses import dataclass
 
 import httpx
@@ -36,6 +37,50 @@ __all__ = [
 
 DEFAULT_WRITER_MODEL = "llama-3.1-8b-instant"
 
+# Stable per-process session id (= per otc run): Go asks clients to send a
+# stable x-opencode-session per conversation for routing/prompt caching.
+_SESSION_ID = uuid.uuid4().hex
+_WRITER_UA = "open-typesafe-camoufox/0.1"
+
+
+def _writer_api_kind() -> str:
+    """'responses' for OpenAI Responses-API endpoints (Muse Spark on Go),
+    anything else means classic chat/completions."""
+    raw = (os.environ.get("WRITER_API") or "chat").strip().lower()
+    if raw in ("responses", "response", "responses-api", "openai-responses"):
+        return "responses"
+    return "chat"
+
+
+def _writer_headers(key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {key}",
+        "User-Agent": _WRITER_UA,
+        "x-opencode-session": _SESSION_ID,
+    }
+
+
+def _extract_responses_text(data: dict) -> str:
+    """Pull assistant text out of an OpenAI Responses-API payload."""
+    try:
+        parts: list[str] = []
+        for item in data.get("output", []) or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message":
+                for chunk in item.get("content", []) or []:
+                    if (isinstance(chunk, dict)
+                            and chunk.get("type") == "output_text"
+                            and chunk.get("text")):
+                        parts.append(str(chunk["text"]))
+        if parts:
+            return "\n".join(parts)
+        if isinstance(data.get("output_text"), str):
+            return data["output_text"]
+    except Exception:
+        pass
+    return ""
+
 
 @dataclass
 class WriterText:
@@ -50,7 +95,13 @@ class WriterUrl:
 
 
 def _writer_config() -> tuple[str, str, str]:
-    """(base_url, api_key, model) — Groq default, Anthropic override."""
+    """(base_url, api_key, model) — fully provider-driven from env.
+
+    WRITER_* wins; falls back to GROQ_* (legacy default backend). Any
+    OpenAI-compatible endpoint works: set WRITER_BASE_URL to point at it,
+    WRITER_API_KEY for its key, WRITER_MODEL for the model id. The optional
+    ANTHROPIC_* override (haiku-class writer) is preserved as-is.
+    """
     if os.environ.get("ANTHROPIC_API_KEY"):
         return (
             os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"),
@@ -58,8 +109,10 @@ def _writer_config() -> tuple[str, str, str]:
             os.environ.get("WRITER_MODEL", "claude-haiku-4-5"),
         )
     return (
-        os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
-        os.environ.get("GROQ_API_KEY", ""),
+        os.environ.get("WRITER_BASE_URL")
+        or os.environ.get("GROQ_BASE_URL")
+        or "https://api.groq.com/openai/v1",
+        os.environ.get("WRITER_API_KEY") or os.environ.get("GROQ_API_KEY", ""),
         os.environ.get("WRITER_MODEL")
         or os.environ.get("GROQ_MODEL")
         or DEFAULT_WRITER_MODEL,
@@ -70,21 +123,32 @@ async def _chat_json(system: str, user: str, timeout_s: float = 30.0) -> dict:
     base, key, model = _writer_config()
     if not key:
         return {}
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.2,
-    }
+    kind = _writer_api_kind()
+    headers = _writer_headers(key)
+    if kind == "responses":
+        url = base.rstrip("/") + "/responses"
+        payload: dict = {
+            "model": model,
+            "input": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.2,
+            "max_output_tokens": 400,
+        }
+    else:
+        url = base.rstrip("/") + "/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.2,
+        }
     async with httpx.AsyncClient(timeout=timeout_s) as client:
-        res = await client.post(
-            f"{base.rstrip('/')}/chat/completions",
-            json=payload,
-            headers={"Authorization": f"Bearer {key}"},
-        )
+        res = await client.post(url, json=payload, headers=headers)
         if res.status_code != 200:
             # Loud, key-safe provider diagnostics: a silent failure here
             # masquerades as "model declined" and stalls runs opaquely.
@@ -94,6 +158,12 @@ async def _chat_json(system: str, user: str, timeout_s: float = 30.0) -> dict:
                  f"{res.text[:160]}")
             res.raise_for_status()
         data = res.json()
+    if kind == "responses":
+        text = _extract_responses_text(data)
+        try:
+            return json.loads(text) if isinstance(text, str) and text else {}
+        except ValueError:
+            return {}
     try:
         content = data["choices"][0]["message"]["content"]
         return json.loads(content) if isinstance(content, str) else {}

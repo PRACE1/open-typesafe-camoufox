@@ -178,3 +178,58 @@ def test_chat_json_reports_provider_http_status(monkeypatch, capsys):
         raised = True
     assert raised is True
     assert "writer model HTTP 403" in capsys.readouterr().out
+
+
+def test_responses_api_shape_and_headers(monkeypatch):
+    import src.writer as _wr
+
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+        text = "{}"
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"output": [{"type": "message", "content": [
+                {"type": "output_text", "text": '{"fill": true, "text": "hi"}'}]}]}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            seen["url"] = url
+            seen["json"] = json
+            seen["headers"] = headers
+            return _Resp()
+
+    monkeypatch.setattr("httpx.AsyncClient", _Client)
+    monkeypatch.setenv("WRITER_API", "response")
+    monkeypatch.setenv("WRITER_BASE_URL", "https://x.example/v1")
+    monkeypatch.setenv("WRITER_API_KEY", "k")
+    monkeypatch.setenv("WRITER_MODEL", "m")
+    out = asyncio.run(_wr._chat_json("sys", "usr"))
+    assert out == {"fill": True, "text": "hi"}
+    assert seen["url"] == "https://x.example/v1/responses"
+    assert isinstance(seen["json"]["input"], list)
+    assert seen["headers"]["x-opencode-session"]
+    assert seen["headers"]["User-Agent"].startswith("open-typesafe-camoufox")
+
+
+def test_extract_responses_text_variants():
+    from src.writer import _extract_responses_text as _ex
+    assert _ex({}) == ""
+    assert _ex({"output_text": "abc"}) == "abc"
+    assert _ex({"output": [{"type": "reasoning"}]}) == ""
+    assert _ex({"output": [{"type": "message", "content": [
+        {"type": "output_text", "text": "x"},
+        {"type": "refusal", "refusal": "no"}]}]}) == "x"

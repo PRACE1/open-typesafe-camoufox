@@ -573,13 +573,37 @@ def test_resolve_target_aria_stale_and_fallback(monkeypatch):
     from src.actions import _resolve_target
     _stub_find(monkeypatch, [_el(0), _el(1), _el(2)])
     plat = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(
-        ident={"kind": "div", "label": "Other"})))
+        ident={"kind": "div", "role": "", "label": "Other"})))
+    # Aria tier alone says stale, but nth-match confirms the decided node:
+    # first ok across tiers wins over one tier's phantom.
     res = _run(_resolve_target(plat, [_aria_el()], 2))
-    assert res["status"] == "stale" and res["live_kind"] == "div"
+    assert res["status"] == "ok" and res["live_kind"] == "link"
     # aria gone -> falls through to sel/nth tiers
     plat2 = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(count=0)))
     res = _run(_resolve_target(plat2, [_aria_el()], 2))
     assert res["status"] == "ok"
+
+
+def test_resolve_target_aria_phantom_yields_to_nth(monkeypatch):
+    """One tier's phantom verdict must not veto: aria says stale (h3),
+    nth-match finds the decided link intact -> ok."""
+    from src.actions import _resolve_target
+    good = [_el(0), _el(1), _el(2, kind="link", label="More")]
+    _stub_find(monkeypatch, good)
+    plat = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(
+        ident={"kind": "h3", "role": "", "label": "More"})))
+    res = _run(_resolve_target(plat, [_aria_el()], 2))
+    assert res["status"] == "ok" and res["live_kind"] == "link"
+
+
+def test_resolve_target_all_tiers_stale_reports_first(monkeypatch):
+    from src.actions import _resolve_target
+    bad = [_el(0), _el(1), _el(2, kind="div", label="Other")]
+    _stub_find(monkeypatch, bad)
+    plat = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(
+        ident={"kind": "h3", "role": "", "label": "Other"})))
+    res = _run(_resolve_target(plat, [_aria_el()], 2))
+    assert res["status"] == "stale" and res["live_kind"] == "h3"
 
 
 def test_bank_box_normalizes_and_skips():

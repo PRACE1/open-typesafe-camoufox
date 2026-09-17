@@ -315,14 +315,15 @@ async def _resolve_by_selector(platform, sel: str) -> dict | None:
 
 async def _resolve_target(platform, elements: list[ElementRef],
                           idx: int) -> dict:
-    """Resolve positional idx to its live element: selector first, nth fallback.
+    """Resolve positional idx to its live element across tiers.
 
-    Refs die with their probe, so resolution is order-independent first:
-    the probe-generated durable selector addresses the SAME node even when
-    the page re-renders between decide and act (seen live: Google homepage
-    shuffles slots in seconds). Only when the node is gone does resolution
-    fall back to the nth match of a fresh probe, strictly cross-checked
-    (kind + label/text) against the decided element.
+    Tier order is priority order: native aria identity, durable selector,
+    positional nth-match. Returns the FIRST ok verdict — acting on a
+    verified-present node beats refusing on one tier's phantom verdict
+    (seen live: an aria ref briefly resolving to a sibling heading while
+    the anchor hydrated). Stale only when no tier resolves ok; gone when
+    nothing resolves at all. The coordinate point check downstream stays
+    the final misclick guard either way.
 
     Returns status ok (box, element, live_kind, live_label), stale (same
     slot or same selector, different element), or gone. Pure lookup — no
@@ -333,6 +334,14 @@ async def _resolve_target(platform, elements: list[ElementRef],
     old = next((e for e in elements if e.idx == idx), None)
     if old is None:
         return blank
+    stale_info: dict | None = None
+
+    def _stale(info: dict) -> dict:
+        nonlocal stale_info
+        if stale_info is None:
+            stale_info = {"status": "stale", **info}
+        return stale_info
+
     # Tier 0 — native identity: the same a11y node regardless of DOM order.
     # Kind is strict up to vocabulary (role-mapped vs tag); labels are
     # lenient (node identity is already strong, hydration text drift must
@@ -340,30 +349,29 @@ async def _resolve_target(platform, elements: list[ElementRef],
     if old.aria:
         hit = await _resolve_by_aria_ref(platform, old.aria)
         if hit is not None:
-            live = ElementRef(idx=idx, kind=hit["kind"], label=hit["label"])
             info = {"box": hit["box"], "element": old,
                     "live_kind": hit["kind"], "live_label": hit["label"],
                     "self_hit": hit.get("self_hit", False)}
-            if not _kinds_compatible(old.kind, hit["kind"]) or not _labels_compatible(
+            if _kinds_compatible(old.kind, hit["kind"]) and _labels_compatible(
                     old.label or old.placeholder or old.text or old.id or "",
                     hit["label"]):
-                return {"status": "stale", **info}
-            return {"status": "ok", **info}
+                return {"status": "ok", **info}
+            _stale(info)
     if old.sel:
         hit = await _resolve_by_selector(platform, old.sel)
         if hit is not None:
             live = ElementRef(idx=idx, kind=hit["kind"], label=hit["label"])
             info = {"box": hit["box"], "element": old,
                     "live_kind": hit["kind"], "live_label": hit["label"]}
-            if _slot_changed(old, live):
-                return {"status": "stale", **info}
-            return {"status": "ok", **info}
+            if not _slot_changed(old, live):
+                return {"status": "ok", **info}
+            _stale(info)
     try:
         fresh = await find_elements(platform)
     except Exception:  # noqa: BLE001
-        return blank
+        return stale_info if stale_info is not None else blank
     if idx < 0 or idx >= len(fresh):
-        return blank
+        return stale_info if stale_info is not None else blank
     cand = fresh[idx]
     box = None
     if cand.box is not None:
@@ -381,9 +389,9 @@ async def _resolve_target(platform, elements: list[ElementRef],
     info = {"box": box, "element": cand, "live_kind": cand.kind,
             "live_label": live_label}
     if box is None:
-        return {**blank, **info}
+        return stale_info if stale_info is not None else {**blank, **info}
     if _slot_changed(old, cand):
-        return {"status": "stale", **info}
+        return _stale(info)
     return {"status": "ok", **info}
 
 

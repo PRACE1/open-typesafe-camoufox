@@ -250,3 +250,19 @@ def test_reading_cooldown_window():
     assert reading_cooldown_active(10, 10) is True  # boundary inclusive
     assert reading_cooldown_active(11, 10) is False
     assert reading_cooldown_active(3, 0) is False  # never adopted
+
+
+def test_escalation_target():
+    from src.runner import escalation_target
+    assert escalation_target(1, "https://a.example/x", "https://g.example/", set()) is None
+    assert escalation_target(2, "https://a.example/x", "https://g.example/", set()) is None
+    assert escalation_target(3, None, "https://g.example/", set()) is None
+    assert escalation_target(3, "", "https://g.example/", set()) is None
+    assert escalation_target(3, "https://a.example/x", "https://g.example/",
+                             {"https://a.example/x"}) is None  # already tried
+    assert escalation_target(3, "https://g.example/", "https://g.example/",
+                             set()) is None  # self-target
+    assert escalation_target(3, "https://a.example/x", "https://g.example/",
+                             set()) == "https://a.example/x"
+    assert escalation_target(5, "https://a.example/x", "https://g.example/",
+                             set()) == "https://a.example/x"

@@ -70,6 +70,33 @@ reading cooldown (`goto refused until step N`). `close_others`
 always keeps the current tab and its opener. Every step walks
 `see → decide → gate → [act] → verify` (transcript `phases`); `NOEFFECT` means a settled page identical to the last step, twice ends the run.
 
+## Primitive / LLM contract (how decisions become actions, exactly)
+
+Three layers, strict direction. Camoufox primitives never see model output
+directly; LLM capabilities never touch the browser directly; the harness in
+`src/runner.py` enforces every crossing:
+
+1. **LLM proposes + classifies.** Writer proposes one action (`PROPOSE`, with
+   rationale + selectors from the current map). Jev classifies kind/item/site
+   (Choice), flags (Nouls: `ready`/`text?`/`done?`/`fit`/`approve`), progress
+   (Score). All state Jev sees is in the packet: elements (idx/kind/label/
+   text/href/host/region/selector), focused field, page text, tabs, notes,
+   visited, lessons. Nothing else exists for it.
+2. **Harness routes.** `resolve_proposal_action` picks override / fallback /
+   mismatch-idle / none. Gate (`conf`), loop-guard (3× identical intents),
+   Noul gates, veto (bare input clicks), stale-map check (live kind must
+   match decided kind), point check (`elementFromPoint` must hit target or
+   clickable cover) run in order; the first that fires wins.
+3. **Primitives execute against the live DOM only.** `click_item`/`type_at`/
+   `goto_url`/etc. in `src/actions.py` re-measure the box, verify the point,
+   then dispatch — never on stale coordinates. Failures return `error:` and
+   count as no-ops, never moves.
+4. **Stuck escalation.** An identical mismatch 3× in a row (`MISMATCH x3`)
+   escalates once per situation to a writer-proposed destination goto
+   (`ESCALATE goto <url>`); with no fresh destination it counts no-ops and
+   the run stops honestly. The loop can idle on patience (`wait`,
+   cooldowns) but never on a known-dead pick.
+
 ## Caveats (do not work around these)
 
 - Headed by default: hands off mouse/keyboard/focus while it runs.

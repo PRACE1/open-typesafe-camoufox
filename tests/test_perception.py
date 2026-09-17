@@ -203,6 +203,20 @@ def test_excerpt_for_anchors_on_task_keywords():
     assert excerpt_for("unrelated zzzqqq", chrome) == chrome[:300]
 
 
+def test_excerpt_prefers_dense_body_over_chrome_head():
+    # Regression: generic words ("search") hit nav chrome first; the dense
+    # article window must win anyway.
+    task = "Search English Wikipedia for Europa moon water facts"
+    chrome = "Jump to content Main menu Search Donate Create account Log in "
+    body = ("Europa is an icy moon of Jupiter. " * 8
+            + "Its subsurface water ocean may hold twice the water of Earth. "
+            + ("orbital resonance details. " * 20))
+    text = chrome + body
+    out = excerpt_for(task, text)
+    assert "subsurface water ocean" in out
+    assert not out.startswith("Jump to content")
+
+
 def test_is_blocked_page_markers():
     sorry = "https://www.google.com/sorry/index?continue=https://www.google.com/search&q=x"
     assert is_blocked_page(sorry, "anything") == "bot-check-by-url:sorry"

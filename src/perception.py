@@ -142,28 +142,38 @@ _EXCERPT_STOPWORDS = frozenset({
 
 
 def excerpt_for(task: str, page_text: str, width: int = 300) -> str:
-    """Task-anchored excerpt: center on the first task keyword hit.
+    """Task-anchored excerpt: the window densest in task keywords.
 
-    Page heads are usually nav chrome ("Get app Write Sign up..."), so a
-    head slice banks junk while the article body — what synthesis needs —
-    goes unremembered. Anchoring on task keywords banks the meat instead;
-    falls back to the head when nothing hits.
+    Page heads are usually nav chrome, and generic task words ("search",
+    "article") hit inside that chrome first — so first-hit anchoring still
+    banks junk. Density wins instead: the window containing the most
+    DISTINCT task keywords is the meat (article body), chrome rarely holds
+    more than one or two. Falls back to the head when nothing hits.
     """
     text = (page_text or "").strip().replace("\n", " ")
     if len(text) <= width:
         return text
     keywords = sorted({w.lower() for w in re.findall(r"[A-Za-z]{5,}", task or "")}
                       - _EXCERPT_STOPWORDS)
-    lowered = text.lower()
-    hit = -1
-    for kw in keywords:
-        i = lowered.find(kw)
-        if i >= 0 and (hit < 0 or i < hit):
-            hit = i
-    if hit < 0:
+    if not keywords:
         return text[:width]
-    start = max(0, hit - width // 3)
-    return text[start:start + width]
+    lowered = text.lower()
+    best_score, best_start = 0, 0
+    step = max(25, width // 6)
+    for start in range(0, len(text) - width + 1, step):
+        window = lowered[start:start + width]
+        score = sum(1 for kw in keywords if kw in window)
+        if score > best_score or (
+                score == best_score and score > 0
+                and best_start < width <= start):
+            # Tie-break away from the head: nav chrome lives in the first
+            # window, so a tied later window is likelier to be article body.
+            # A head window that strictly outscores everything still wins
+            # (short pages whose content really is up front).
+            best_score, best_start = score, start
+    if best_score == 0:
+        return text[:width]
+    return text[best_start:best_start + width]
 
 FOCUSED_FIELD_JS = """
 () => {

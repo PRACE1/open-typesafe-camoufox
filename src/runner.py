@@ -65,6 +65,25 @@ def loop_guard_trip(last_sig: tuple | None, run: int, sig: tuple) -> tuple[bool,
     return run >= 3, run
 
 
+def escalation_target(mismatch_run: int, candidate_url: str | None,
+                      current_url: str, escalated: set[str]) -> str | None:
+    """Writer-proposed URL to escalate to after repeated identical mismatches.
+
+    When the classifier fixates on a mismatched pick, the structurally sound
+    move is a destination goto — not another idle, not a low-approval click
+    on a possibly-wrong target. Fires once per distinct URL, never the page
+    we're already on; anything else returns None (keep waiting / stop).
+    """
+    if mismatch_run < 3 or not candidate_url:
+        return None
+    target = perception.norm_url(candidate_url)
+    if not target or target in escalated:
+        return None
+    if target == perception.norm_url(current_url):
+        return None
+    return candidate_url
+
+
 APPROVAL_MIN = 0.5
 # Lower bar used ONLY when the Choice pick is vetoed (bare input click):
 # a dead-certain dead click loses to an uncertain live proposal.
@@ -347,6 +366,10 @@ async def run_decide_session(
     noops = 0
     last_sig: tuple | None = None
     sig_run = 0
+    mismatch_sig: tuple | None = None
+    mismatch_run = 0
+    escalated_sigs: set[tuple] = set()
+    escalated_urls: set[str] = set()
     last_typed: tuple | None = None  # (element idx, page url) of the last successful type
     # Long-horizon tracking (40-50 steps): visited-URL memory, extractive
     # notes that survive the 8-line history window, and dead-run detection
@@ -630,11 +653,42 @@ async def run_decide_session(
                 decision = _apply_proposal(decision, proposed)
                 conf = decision.confidence
             elif route == "mismatch-idle":
+                m_sig = (
+                    decision.kind.value, decision.element_idx,
+                    next(((e.label or e.text or "")[:40] for e in elements
+                          if e.idx == decision.element_idx), ""),
+                    next((perception.host_of(e.href) for e in elements
+                          if e.idx == decision.element_idx), ""),
+                    page.url,
+                )
+                if m_sig == mismatch_sig:
+                    mismatch_run += 1
+                else:
+                    mismatch_sig, mismatch_run = m_sig, 1
                 log(f"MISMATCH {decision.kind.value} #{decision.element_idx} "
-                    f"(fit={decision.fits:.2f}) — waiting neutrally")
+                    f"(fit={decision.fits:.2f}) x{mismatch_run} — waiting neutrally")
                 history.append(f"step {steps}: pick mismatched its verb (fit={decision.fits:.2f}), waited")
                 entry["act"] = f"mismatch wait ({decision.kind.value} #{decision.element_idx})"
-                decision = replace(decision, kind=Kind.WAIT, element_idx=None)
+                esc_url = None
+                if mismatch_run >= 3 and m_sig not in escalated_sigs:
+                    escalated_sigs.add(m_sig)
+                    cand = await propose_url(task=effective_task, history=history)
+                    esc_url = escalation_target(
+                        mismatch_run,
+                        cand.url if cand.ok else None,
+                        page.url, escalated_urls)
+                if esc_url is not None:
+                    escalated_urls.add(perception.norm_url(esc_url))
+                    log(f"ESCALATE goto {esc_url} — stuck pick yields to writer destination")
+                    history.append(f"step {steps}: escalated to goto {esc_url}")
+                    entry["decide"] += " [escalated-goto]"
+                    decision = replace(decision, kind=Kind.GOTO, element_idx=None,
+                                       target_url=esc_url, propose_url=False,
+                                       confidence=0.99)
+                else:
+                    if mismatch_run >= 3:
+                        noops += 1
+                    decision = replace(decision, kind=Kind.WAIT, element_idx=None)
             # Retype intent on an already-filled field means submit: the query
             # is in the box, typing it again changes nothing — Enter does.
             if (decision.kind == Kind.TYPE_AT and decision.element_idx is not None

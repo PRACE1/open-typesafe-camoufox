@@ -38,3 +38,10 @@ def test_covered_urls_tolerates_missing_and_corrupt(tmp_path):
 
 def test_mission_session_cap_is_bounded():
     assert MISSION_MAX_SESSIONS == 10
+
+
+def test_humanize_defaults_off_with_opt_in_flag():
+    import inspect
+    from src.runner import run_decide_session
+    assert inspect.signature(run_decide_session).parameters[
+        "humanize"].default is False

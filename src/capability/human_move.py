@@ -1,25 +1,25 @@
 """
 human_move: human path primitives for the browser cursor.
 
-Speed model (measured on live Camoufox 152.0.4): each page.mouse.move()
-CDP dispatch pays a humanize cost that scales with the browser's
-humanize level:
+Speed model (measured on live Camoufox): each page.mouse.move() CDP
+dispatch pays a humanize cost that scales with the browser's
+humanize level (historical: 1.0 ~1.35s, 0.4 ~0.50s, 0.15 ~0.18s,
+0.3 ~0.3-0.4s per dispatch).
 
-    humanize=True (1.0)  ~1.35s per dispatch
-    humanize=0.4         ~0.50s per dispatch
-    humanize=0.15        ~0.18s per dispatch
+WARNING (2026-09-18): browser-level humanize currently degrades per
+dispatch at ANY level (measured: 2.1s -> 8.4s -> timeouts within 3
+moves), wedging every mouse op until nothing dispatches. The runner
+therefore defaults humanize OFF (see --humanize to opt back in); our
+own multi-hop loops still draw human-like paths, and the per-dispatch
+timeout guards below stay as the tripwire.
 
-So the per-call count is the time budget and HUMANIZE_LEVEL below sets the
-per-call price. The HumanMoveMouse statistical model (bundled PCA/GMM,
-trained on 300 real human samples) picks lateral waypoints; for a long
-move that's a single mid-path point at ~55% arc. Between waypoints the
-browser's own per-dispatch bezier renders the curve — we do NOT stack
-extra wobble on top (double-stacking two wobble sources produced the
-inconsistent jittery loops we removed).
-
-The pyautogui playback backend is never touched: quiesce, the JS cursor
+Path shape (independent of the browser flag): the HumanMoveMouse
+statistical model (bundled PCA/GMM, 300 real human samples) picks lateral
+waypoints; our multi-hop loops draw the curve point to point. The
+pyautogui playback backend is never touched: quiesce, the JS cursor
 tracker, and cursor.json all keep working.
 """
+
 from __future__ import annotations
 
 import asyncio

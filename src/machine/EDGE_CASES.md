@@ -36,6 +36,7 @@ IDs used in commit messages and the run log (`EDGE #n`).
 | 28 | Off-snapshot element (portal, unmounted dropdown) | ref missing from snapshot map | 3-tier cascade: known `aria-ref=` → `fN` iframe → raw CSS passthrough; eval hatch via synthesized `page.evaluate` | handled (`capability/aria_refs.py`, `runner.py`) |
 | 29 | Noop stall (idle/wait/gate with budgets left) | step ends without acting or completing | recovery cycle: classify → select (heuristic, Jev tie-break) → one compensating dispatch (refresh/escape/back) → reread → verify; bounded, audited in `entry["recover"]` | handled (`runner.py`, `decide.py`, engine `recover` state) |
 | 30 | Wedged capture pipe (screenshot timeouts) | `shot_streak` 3/6/9 | Jev-scored restart (back vs recent visited URLs); streak 12+ stops honestly for mission relaunch; per-step verdict `unresolved` | handled (`runner.py`, `decide.py`) |
+| 31 | Camoufox humanize per-dispatch degradation | mouse.move 2s → 8s → timeouts within ~3 dispatches at any level | runner defaults humanize OFF (`--humanize` opts back in); own multi-hop loops keep human-like paths; 5s per-point timeout guards stay as tripwire | worked around, upstream issue pending (`src/capability/human_move.py`) |
 
 ## Notes on #6 (blocked pages)
 

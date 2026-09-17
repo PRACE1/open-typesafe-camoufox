@@ -48,7 +48,7 @@ def _check_placeholders(task: str) -> list[str]:
     return sorted({n for n in names if not os.environ.get(n)})
 
 
-async def _preflight(url: str) -> int:
+async def _preflight(url: str, humanize: bool | float) -> int:
     """Prove everything resolves and the HEADED window actually opens.
 
     1) API keys present (typesafe tolerated — Jev has an offline fallback)
@@ -68,7 +68,7 @@ async def _preflight(url: str) -> int:
     log("PREFLIGHT: launching headed Camoufox (watch for the window)...")
     try:
         async with asyncio.timeout(90):
-            async with AsyncCamoufox(headless=False, humanize=HUMANIZE_LEVEL) as browser:
+            async with AsyncCamoufox(headless=False, humanize=humanize) as browser:
                 page = await browser.new_page()
                 await page.goto("about:blank")
                 vp = page.viewport_size or {}
@@ -113,7 +113,7 @@ MISSION_MAX_SESSIONS = 10
 
 async def _mission(start_url: str, task: str, steer_file: str, fps: float,
                    min_confidence: float, budget_s: float, max_steps: int,
-                   headless: bool) -> dict:
+                   headless: bool, humanize: bool | float = False) -> dict:
     """Resume-until-done driver: stopped sessions relaunch with coverage.
 
     Each session shares the total step budget and wall-clock deadline;
@@ -164,6 +164,7 @@ async def _mission(start_url: str, task: str, steer_file: str, fps: float,
             budget_s=remaining,
             max_steps=remaining_steps,
             headless=headless,
+            humanize=humanize,
             steer_file=steer_file,
             seed_visited=covered,
         )
@@ -229,6 +230,7 @@ def main() -> int:
     ap.add_argument("--replay", default="", help="Run dir to replay offline, e.g. runs/20260917-092647.")
     ap.add_argument("--replay-step", type=int, default=0, help="Step number to replay (0 = list available steps).")
     ap.add_argument("--mission", action="store_true", help="Resume-until-done: stopped sessions relaunch with covered URLs seeded, sharing the step/wall-clock budget (max 10 sessions). For long collection missions that must not die on transient stalls.")
+    ap.add_argument("--humanize", action="store_true", help="Opt into Camoufox browser-level mouse smoothing (default OFF: measured per-dispatch degradation wedging mouse ops within ~3 moves).")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     set_verbose(args.verbose)
@@ -241,7 +243,7 @@ def main() -> int:
         if missing:
             log(f"PREFLIGHT FAIL: task references unset env vars: {missing}")
             return 4
-        return asyncio.run(_preflight(args.url))
+        return asyncio.run(_preflight(args.url, HUMANIZE_LEVEL if args.humanize else False))
 
     if not os.environ.get("GROQ_API_KEY"):
         log("FATAL: GROQ_API_KEY missing. Refusing to start. Run --preflight to check the browser too.")
@@ -265,6 +267,7 @@ def main() -> int:
             budget_s=args.budget,
             max_steps=args.max_steps,
             headless=args.headless,
+            humanize=HUMANIZE_LEVEL if args.humanize else False,
         )
         if args.mission
         else (
@@ -288,6 +291,7 @@ def main() -> int:
                 budget_s=args.budget,
                 max_steps=args.max_steps,
                 headless=args.headless,
+                humanize=HUMANIZE_LEVEL if args.humanize else False,
             )
         )
     )

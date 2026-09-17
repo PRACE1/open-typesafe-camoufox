@@ -31,7 +31,6 @@ from . import perception
 from .actions import action_failed, challenge_control, click_item, execute_recovery, goto_url, heal_target, press_key, type_at
 from .capability.resolve import read_input_value
 from .capability.dynamic_registry import register_capability
-from .capability.human_move import HUMANIZE_LEVEL
 from .capability.validator import validate_capability
 from .decide import HealStrategy, Kind, decide_action, decide_heal_action, decide_recovery_action, decide_restart_action
 from .deps import RunState
@@ -471,7 +470,11 @@ async def run_decide_session(
     *,
     start_url: str,
     task: str = "",
-    humanize: bool | float = HUMANIZE_LEVEL,
+    # Default OFF: Camoufox browser-level humanize degrades per dispatch
+    # (measured 2026-09-18: 2.1s -> 8.4s -> timeouts within 3 moves at any
+    # level, wedging every mouse op). Our own multi-hop loops still draw
+    # human-like paths; pass --humanize to opt back into browser smoothing.
+    humanize: bool | float = False,
     fps: float = 3.0,
     min_confidence: float = 0.4,
     budget_s: float = 120.0,

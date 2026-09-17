@@ -6,9 +6,8 @@ from src.runner import (
     APPROVAL_FALLBACK, APPROVAL_MIN, BARE_CLICK_VETO_KINDS,
     CAPTCHA_MAX_ATTEMPTS, EFFECT_KINDS, GATE_EXEMPT_KINDS,
     OVERRIDABLE_KINDS, READING_COOLDOWN_STEPS, Phase, captcha_should_stop,
-    confidence_gated,
-    credential_placeholder,
-    fresh_tabs, loop_guard_trip, no_effect_trip, page_settled, phase_step,
+    confidence_gated, credential_placeholder, fresh_tabs, is_blank_page,
+    loop_guard_trip, no_effect_trip, page_settled, phase_step,
     proposal_executable, reading_cooldown_active, resolve_proposal_action,
     should_override, should_submit_instead,
 )
@@ -297,3 +296,12 @@ def test_escalation_target():
                              set()) == "https://a.example/x"
     assert escalation_target(5, "https://a.example/x", "https://g.example/",
                              set()) == "https://a.example/x"
+
+
+def test_is_blank_page_dead_load_only():
+    from src.deps import ElementRef as _E
+    assert is_blank_page([], "") is True
+    assert is_blank_page([], "   ") is True
+    assert is_blank_page([_E(idx=0, kind="link")], "") is False
+    assert is_blank_page([], "x" * 50) is False
+    assert is_blank_page([], "x" * 49) is True

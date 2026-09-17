@@ -240,6 +240,15 @@ def fresh_tabs(known: set[int], current: set[int]) -> set[int]:
     return current - known
 
 
+def is_blank_page(elements: list, page_text: str) -> bool:
+    """True when SEE found nothing to work with (dead load, blank tab).
+
+    A stuck loader draws confident waits forever; the runner answers with
+    a periodic refresh instead (see the blank-refresh override).
+    """
+    return not elements and len((page_text or "").strip()) < 50
+
+
 def no_effect_trip(prev_acted: bool, prev_fp: tuple | None, fp: tuple,
                    settled: bool, last_effect_kind: str | None) -> bool:
     """True when the previous step acted yet the page is observably identical.
@@ -408,6 +417,7 @@ async def run_decide_session(
     escalated_sigs: set[tuple] = set()
     escalated_urls: set[str] = set()
     last_typed: tuple | None = None  # (element idx, page url) of the last successful type
+    blank_streak = 0  # consecutive blank SEEs (dead loads draw waits forever)
     # Long-horizon tracking (40-50 steps): visited-URL memory, extractive
     # notes that survive the 8-line history window, and dead-run detection
     # for actions with no observable effect.
@@ -564,6 +574,10 @@ async def run_decide_session(
             if page_text.strip():
                 log(f"TEXT   {page_text.strip()[:160]}")
             entry["page_text"] = page_text[:400]
+            if is_blank_page(elements, page_text):
+                blank_streak += 1
+            else:
+                blank_streak = 0
 
             # STEER
             new_steers, steer_consumed = read_steers(steer_abs, steer_consumed)
@@ -773,6 +787,15 @@ async def run_decide_session(
                     entry["decide"] += " [retype-submit]"
                     decision = replace(decision, kind=Kind.PRESS_ENTER, element_idx=None)
                     last_typed = None
+            # Blank-page recovery: a dead load draws confident waits forever
+            # (seen live: 14 straight waits on an empty tab). Every third
+            # blank step with an idle verdict becomes a refresh instead.
+            if (blank_streak >= 3 and blank_streak % 3 == 0
+                    and decision.kind in (Kind.WAIT, Kind.NONE)):
+                log(f"BLANKREFRESH blank SEE x{blank_streak} — reloading instead of waiting")
+                history.append(f"step {steps}: blank page x{blank_streak}, refreshing instead of waiting")
+                entry["decide"] += " [blank-refresh]"
+                decision = replace(decision, kind=Kind.REFRESH, element_idx=None)
             report_mod.write_answers_json(run_dir, steps, decision.raw)
 
             # Loop-guard: the tab, clear, and click systems all report into

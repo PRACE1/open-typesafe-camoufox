@@ -37,7 +37,9 @@ class Kind(str, Enum):
     CLICK_ITEM = "click_item"
     TYPE_AT = "type_at"
     PRESS_ENTER = "press_enter"
+    PRESS_ESCAPE = "press_escape"
     REFRESH = "refresh"
+    BACK = "back"
     CLOSE_OTHERS = "close_others"
     GOTO = "goto"
     DONE = "done"
@@ -61,9 +63,17 @@ KIND_CRITERIA: dict[str, dict[str, str]] = {
         "what": "Press Enter to submit the focused field, typically right after typing a query",
         "not_for": "Before any text was typed; dismissing dialogs",
     },
+    Kind.PRESS_ESCAPE.value: {
+        "what": "Press Escape once to dismiss an overlay, popup, or dialog covering the page",
+        "not_for": "Submitting forms; any other key",
+    },
     Kind.REFRESH.value: {
         "what": "Reload the current tab when its content failed to load or is visibly stale",
         "not_for": "Pages still loading (wait); navigating to a new URL",
+    },
+    Kind.BACK.value: {
+        "what": "Browser-back to the previous page (e.g. article -> results) to continue hopping",
+        "not_for": "First page of the run (empty history); reloading the same page",
     },
     Kind.CLOSE_OTHERS.value: {
         "what": "Close every tab except the current one and its opener; tab clutter blocks progress",
@@ -76,6 +86,7 @@ KIND_CRITERIA: dict[str, dict[str, str]] = {
     Kind.DONE.value: {
         "what": "The TASK outcome is observably complete in PAGE TEXT; stop with the outcome",
         "not_for": "Loading or blank pages; partial progress without the concrete outcome",
+        "note": "You do not write the outcome note — the harness assembles it from the pages you have read (your notes); your job is only to flag that you have read enough to name the outcome",
     },
     Kind.NONE.value: {
         "what": "No confident action exists; idle one step",
@@ -232,7 +243,7 @@ def build_questions(elements: list[ElementRef], sites: list[str],
             "type": "noul",
             "instructions": {
                 "question": "Is the TASK observably complete in PAGE TEXT right now?",
-                "focus": "Requires the concrete outcome (fact, confirmation) visible — not partial progress, not a loading page.",
+                "focus": "Requires the concrete outcome (fact, confirmation) visible — not partial progress, not a loading page. You do not compose any text; flagging is enough, the harness assembles the note from the pages you have read.",
             },
         },
         "progress": {

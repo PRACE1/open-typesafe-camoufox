@@ -66,6 +66,9 @@ def loop_guard_trip(last_sig: tuple | None, run: int, sig: tuple) -> tuple[bool,
 
 
 APPROVAL_MIN = 0.5
+# Lower bar used ONLY when the Choice pick is vetoed (bare input click):
+# a dead-certain dead click loses to an uncertain live proposal.
+APPROVAL_FALLBACK = 0.4
 OVERRIDABLE_KINDS = ("click_item", "type_at", "goto")
 # Bare-clicking a text field never advances anything (no navigation, no state
 # change — focusing happens inside type_at). Five straight runs fixated on the
@@ -75,7 +78,13 @@ BARE_CLICK_VETO_KINDS = ("input", "textarea", "select")
 # on purpose: typing never changes body text, so every type would read as
 # "no effect" (repeat-typing is the loop-guard's job, and clear-before-type
 # keeps retypes idempotent).
-EFFECT_KINDS = ("click_item", "press_enter", "refresh")
+EFFECT_KINDS = ("click_item", "press_enter", "press_escape", "refresh", "back")
+
+
+# Consecutive doubt no-ops before the run ends. High enough to survive a
+# vetoed pick plus one gated wait; low enough that true fixation still ends
+# the run instead of burning the whole budget.
+STOP_AFTER_NOOPS = 3
 
 
 def proposal_executable(proposed: ProposedAction | None, elements: list) -> bool:
@@ -115,6 +124,31 @@ def should_override(*, approval: float, proposed: ProposedAction | None,
     if (proposed.kind, proposed.item) == (choice_kind, choice_item):
         return False
     return approval >= APPROVAL_MIN
+
+
+def _choice_is_vetoed(elements: list, idx: int | None) -> bool:
+    """True when the Choice pick is a bare input click (would be vetoed)."""
+    if idx is None:
+        return False
+    el = next((e for e in elements if e.idx == idx), None)
+    return el is not None and el.kind in BARE_CLICK_VETO_KINDS
+
+
+def _apply_proposal(decision, proposed: ProposedAction):
+    """Rewrite the decision to the approved/fallback proposal.
+
+    Confidence is boosted past the gate; guard/verify rails still apply
+    downstream, so a bad proposal costs ~one step, not the run.
+    """
+    return replace(
+        decision,
+        kind=Kind(proposed.kind),
+        element_idx=proposed.item
+        if proposed.kind in ("click_item", "type_at") else None,
+        target_url=proposed.url if proposed.kind == "goto" else None,
+        propose_url=proposed.kind == "goto" and proposed.url is None,
+        confidence=max(decision.confidence, decision.approval),
+    )
 
 
 def fresh_tabs(known: set[int], current: set[int]) -> set[int]:
@@ -505,15 +539,18 @@ async def run_decide_session(
                     + f" (approval={decision.approval:.2f}) — executing proposal over Choice")
                 history.append(f"step {steps}: approved proposal — {proposed.rationale[:100]}")
                 entry["decide"] += " [approved-override]"
-                decision = replace(
-                    decision,
-                    kind=Kind(proposed.kind),
-                    element_idx=proposed.item
-                    if proposed.kind in ("click_item", "type_at") else None,
-                    target_url=proposed.url if proposed.kind == "goto" else None,
-                    propose_url=proposed.kind == "goto" and proposed.url is None,
-                    confidence=max(decision.confidence, decision.approval),
-                )
+                decision = _apply_proposal(decision, proposed)
+                conf = decision.confidence
+            elif (decision.kind == Kind.CLICK_ITEM and decision.element_idx is not None
+                    and _choice_is_vetoed(elements, decision.element_idx)
+                    and proposed is not None and proposal_executable(proposed, elements)
+                    and decision.approval >= APPROVAL_FALLBACK):
+                log(f"VETO-FALLBACK {proposed.kind}"
+                    + (f" #{proposed.item}" if proposed.item is not None else "")
+                    + f" (approval={decision.approval:.2f}) — Choice pick vetoed, trying proposal")
+                history.append(f"step {steps}: veto fallback — {proposed.rationale[:100]}")
+                entry["decide"] += " [veto-fallback]"
+                decision = _apply_proposal(decision, proposed)
                 conf = decision.confidence
             report_mod.write_answers_json(run_dir, steps, decision.raw)
 
@@ -523,7 +560,14 @@ async def run_decide_session(
             # force a wait here instead of executing again.
             guard_trip = False
             if decision.kind in (Kind.CLICK_ITEM, Kind.TYPE_AT) and decision.element_idx is not None:
-                guard_sig = (decision.kind.value, decision.element_idx, page.url)
+                guard_sig = (
+                    decision.kind.value, decision.element_idx,
+                    next(((e.label or e.text or "")[:40] for e in elements
+                          if e.idx == decision.element_idx), ""),
+                    next((perception.host_of(e.href) for e in elements
+                          if e.idx == decision.element_idx), ""),
+                    page.url,
+                )
                 guard_trip, sig_run = loop_guard_trip(last_sig, sig_run, guard_sig)
                 last_sig = guard_sig
             phase_step(phase_trail, Phase.GATE)
@@ -570,7 +614,8 @@ async def run_decide_session(
                     history.append(msg)
                     entry["act"] = "DONE rejected (empty page)"
                 else:
-                    note = page_text.strip()[:200]
+                    full_note = " | ".join(notes[-3:]) or page_text.strip()
+                    note = full_note[:300]
                     done = True
                     phase_step(phase_trail, Phase.DONE)
                     entry["act"] = f"DONE ({note[:80]})"
@@ -626,6 +671,23 @@ async def run_decide_session(
                     noops = 0
                     acted = True
                     last_effect_kind = "press_enter"
+            elif decision.kind == Kind.PRESS_ESCAPE:
+                log("ACT    key=Escape")
+                res = await press_key(platform, "Escape")
+                log(f"RESULT {res}")
+                if action_failed(res):
+                    history.append(f"step {steps}: Escape failed — {res}")
+                    entry["act"] = "key=Escape"
+                    entry["result"] = res
+                    noops += 1
+                else:
+                    entry["act"] = "key=Escape"
+                    entry["result"] = res
+                    history.append(f"step {steps}: pressed Escape — {res}")
+                    moves += 1
+                    noops = 0
+                    acted = True
+                    last_effect_kind = "press_escape"
             elif decision.kind == Kind.REFRESH:
                 log("ACT    refresh")
                 res = await platform.refresh_page()
@@ -643,6 +705,23 @@ async def run_decide_session(
                     noops = 0
                     acted = True
                     last_effect_kind = "refresh"
+            elif decision.kind == Kind.BACK:
+                log("ACT    back")
+                res = await platform.go_back()
+                log(f"RESULT {res}")
+                if action_failed(res):
+                    history.append(f"step {steps}: back failed — {res}")
+                    entry["act"] = "back"
+                    entry["result"] = res
+                    noops += 1
+                else:
+                    entry["act"] = "back"
+                    entry["result"] = res
+                    history.append(f"step {steps}: went back — {res}")
+                    moves += 1
+                    noops = 0
+                    acted = True
+                    last_effect_kind = "back"
             elif decision.kind == Kind.CLOSE_OTHERS:
                 log("ACT    close other tabs")
                 n_closed = await platform.close_other_tabs()
@@ -673,7 +752,8 @@ async def run_decide_session(
                         noops += 1
                     else:
                         log(f"ACT    element #{idx} (scroll+circle+click)")
-                        res = await click_item(platform, elements, idx)
+                        res = await click_item(platform, elements, idx,
+                                                     expected_kind=by_idx[idx].kind)
                         log(f"RESULT {res}")
                         if action_failed(res):
                             history.append(f"step {steps}: click failed — {res}")
@@ -728,7 +808,8 @@ async def run_decide_session(
                             noops += 1
                         # composed None = model said no text needed (recorded above).
                     if text_to_type is not None:
-                        res = await type_at(platform, elements, idx, text_to_type)
+                        res = await type_at(platform, elements, idx, text_to_type,
+                                                  expected_kind=elem.kind)
                         log(f"RESULT {res}")
                         if action_failed(res):
                             history.append(f"step {steps}: type failed — {res}")
@@ -822,11 +903,11 @@ async def run_decide_session(
                 dead_run = 0
             prev_fp = fp
 
-            if noops >= 2 and not done and not stopped:
+            if noops >= STOP_AFTER_NOOPS and not done and not stopped:
                 stopped = True
-                stop_reason = "two consecutive no-ops"
+                stop_reason = f"{STOP_AFTER_NOOPS} consecutive no-ops"
                 phase_step(phase_trail, Phase.STOPPED)
-                log("STOP   two consecutive no-ops — ending run")
+                log(f"STOP   {STOP_AFTER_NOOPS} consecutive no-ops — ending run")
             await asyncio.sleep(interval)
 
         cursor = await platform.harvest_cursor_events()

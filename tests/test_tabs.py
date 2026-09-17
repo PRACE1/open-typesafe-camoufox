@@ -18,6 +18,7 @@ class FakePage:
         self._opener = opener
         self.closed = False
         self.reloaded = False
+        self.went_back = False
         self.fronted = False
 
     async def bring_to_front(self):
@@ -28,6 +29,9 @@ class FakePage:
 
     async def reload(self, **kwargs):
         self.reloaded = True
+
+    async def go_back(self, **kwargs):
+        self.went_back = True
 
     async def opener(self):
         return self._opener
@@ -154,6 +158,66 @@ def test_refresh_page_reloads_and_restarts():
     assert p._calls == ["harvest", "restart"]
 
 
+def test_go_back_navigates_history():
+    pg = FakePage("https://r.example/page2")
+    pg.context = FakeContext([pg])
+    p = _platform(pg)
+    msg = asyncio.run(p.go_back())
+    assert pg.went_back is True
+    assert msg == "went back to https://r.example/page2"
+    assert p._calls == ["harvest", "restart"]
+
+
+def test_settle_detects_newtab():
+    async def _run():
+        a = FakePage("https://a.example/")
+        ctx = FakeContext([a])
+        a.context = ctx
+        p = _platform(a)
+        before = p.tab_ids()
+
+        async def _opener():
+            await asyncio.sleep(0.2)
+            b = FakePage("https://b.example/")
+            b.context = ctx
+            ctx.pages.append(b)
+
+        t = asyncio.create_task(_opener())
+        out = await p.settle_after_action(a.url, before, timeout_s=2.0)
+        await t
+        return out, p
+
+    (outcome, info), p = asyncio.run(_run())
+    assert outcome == "newtab" and info == "https://b.example/"
+    assert p._page.url == "https://b.example/"
+
+
+def test_settle_detects_sametab_nav():
+    async def _run():
+        a = FakePage("https://a.example/")
+        b = FakePage("https://a.example/next")
+        ctx = FakeContext([a, b])
+        a.context = ctx
+        b.context = ctx
+        p = _platform(a)
+        before = p.tab_ids()
+        p._page = b  # navigation swapped the document, same tab set
+        return await p.settle_after_action(a.url, before, timeout_s=1.0), p
+
+    (outcome, info), p = asyncio.run(_run())
+    assert outcome == "navigated" and info == "https://a.example/next"
+    assert p._last_url == "https://a.example/next"
+    assert "restart" in p._calls
+
+
+def test_settle_same_on_timeout():
+    a = FakePage("https://a.example/")
+    ctx = FakeContext([a])
+    a.context = ctx
+    p = _platform(a)
+    assert asyncio.run(p.settle_after_action(a.url, p.tab_ids(), timeout_s=0.3)) == ("same", None)
+
+
 def test_new_kinds_decode():
     from src.decide import _decode
     from src.deps import ElementRef
@@ -164,3 +228,7 @@ def test_new_kinds_decode():
     assert _decode(raw, els, sites).kind == Kind.REFRESH
     raw["answers"]["kind"]["choice"] = "close_others"
     assert _decode(raw, els, sites).kind == Kind.CLOSE_OTHERS
+    raw["answers"]["kind"]["choice"] = "back"
+    assert _decode(raw, els, sites).kind == Kind.BACK
+    raw["answers"]["kind"]["choice"] = "press_escape"
+    assert _decode(raw, els, sites).kind == Kind.PRESS_ESCAPE

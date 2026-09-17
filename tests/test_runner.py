@@ -3,11 +3,13 @@
 import pytest
 
 from src.runner import (
-    APPROVAL_MIN, BARE_CLICK_VETO_KINDS, EFFECT_KINDS, OVERRIDABLE_KINDS,
-    READING_COOLDOWN_STEPS, Phase, credential_placeholder, fresh_tabs,
-    loop_guard_trip, page_settled, phase_step, proposal_executable,
-    reading_cooldown_active, should_override,
+    APPROVAL_FALLBACK, APPROVAL_MIN, BARE_CLICK_VETO_KINDS, EFFECT_KINDS,
+    OVERRIDABLE_KINDS, READING_COOLDOWN_STEPS, Phase, credential_placeholder,
+    fresh_tabs, loop_guard_trip, page_settled, phase_step,
+    proposal_executable, reading_cooldown_active, should_override,
 )
+from src.runner import _apply_proposal as _apply_proposal_fn
+from src.runner import _choice_is_vetoed as _vetoed_fn
 from src.writer import ProposedAction
 
 
@@ -94,7 +96,9 @@ def test_approval_threshold_and_overridable_kinds():
     assert set(OVERRIDABLE_KINDS) == {"click_item", "type_at", "goto"}
     assert set(BARE_CLICK_VETO_KINDS) == {"input", "textarea", "select"}
     assert "type_at" not in EFFECT_KINDS  # typing never changes body text
-    assert set(EFFECT_KINDS) == {"click_item", "press_enter", "refresh"}
+    assert set(EFFECT_KINDS) == {"click_item", "press_enter", "press_escape", "refresh", "back"}
+    from src.runner import STOP_AFTER_NOOPS
+    assert STOP_AFTER_NOOPS == 3
 
 
 def test_proposal_executable():
@@ -154,6 +158,26 @@ def test_fresh_tabs_reconciliation():
     assert fresh_tabs({1, 2}, {1, 2, 3}) == {3}
     assert fresh_tabs({1, 2}, {1, 2}) == set()
     assert fresh_tabs(set(), {1}) == {1}  # first sighting lists all
+
+
+def test_choice_is_vetoed():
+    from src.deps import ElementRef
+    els = [ElementRef(idx=0, kind="textarea"), ElementRef(idx=1, kind="link")]
+    assert _vetoed_fn(els, 0) is True
+    assert _vetoed_fn(els, 1) is False
+    assert _vetoed_fn(els, 9) is False
+    assert _vetoed_fn(els, None) is False
+
+
+def test_apply_proposal_rewrites_decision():
+    from src.decide import JevDecision, Kind
+    d = JevDecision(kind=Kind.WAIT, confidence=0.4, approval=0.62)
+    p = ProposedAction(question="q?", kind="click_item", item=7,
+                       url=None, rationale="r")
+    out = _apply_proposal_fn(d, p)
+    assert out.kind == Kind.CLICK_ITEM and out.element_idx == 7
+    assert out.confidence == 0.62
+    assert out.page_ready == d.page_ready  # Nouls preserved
 
 
 def test_reading_cooldown_window():

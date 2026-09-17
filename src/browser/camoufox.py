@@ -216,6 +216,42 @@ class CamoufoxPlatform(CursorTrackingMixin, BrowserActionsMixin):
         log(f"[tabs] adopted new tab ({len(pages)} open): {old_url} -> {new_page.url}")
         return new_page.url
 
+    async def settle_after_action(self, prev_url: str, before_ids: set[int],
+                                  timeout_s: float = 4.0) -> tuple[str, str | None]:
+        """Poll for the effect of a navigation-ish action (click, Enter).
+
+        Replaces the blind fixed sleep: watches for a fresh tab (adopts it),
+        a same-tab URL change (restarts the tracker on it), or nothing.
+        Returns ("newtab"|"navigated"|"same", url-or-None). Breaks early on
+        the first observed effect so fast pages cost ~0.5s, not the timeout.
+        """
+        import time as _time
+
+        end = _time.monotonic() + max(0.5, timeout_s)
+        while True:
+            try:
+                pages = list(self.page.context.pages)
+            except Exception:
+                pages = []
+            fresh = [p for p in pages if id(p) not in before_ids]
+            if fresh:
+                adopted = await self.adopt_new_tab(before_ids)
+                return ("newtab", adopted)
+            try:
+                cur = self.page.url
+            except Exception:
+                cur = prev_url
+            if cur != prev_url:
+                self._last_url = cur
+                try:
+                    await self._restart_tracker_on_new_page()
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[tabs] tracker restart after nav: {exc}")
+                return ("navigated", cur)
+            if _time.monotonic() >= end:
+                return ("same", None)
+            await asyncio.sleep(0.5)
+
     async def close_other_tabs(self) -> int:
         """Close other tabs, keeping the current tab and its opener.
 
@@ -294,5 +330,31 @@ class CamoufoxPlatform(CursorTrackingMixin, BrowserActionsMixin):
             except Exception as exc:  # noqa: BLE001
                 log(f"[tabs] tracker restart after refresh: {exc}")
             msg = f"refreshed {self._last_url}"
+            log(msg)
+            return msg
+
+    async def go_back(self) -> str:
+        """Browser-back in the current tab (result hopping: article -> SERP).
+
+        Harvests first (back destroys the document), then restarts the
+        tracker on the restored page. Empty history reports an error.
+        """
+        async with self._lock:
+            try:
+                await self._harvest_and_accumulate(quiet=True)
+            except Exception as exc:  # noqa: BLE001
+                log(f"[tabs] pre-back harvest: {exc}")
+            try:
+                await self.page.go_back(wait_until="load", timeout=20000)
+            except Exception as exc:  # noqa: BLE001
+                msg = f"error: back failed (empty history?): {exc}"
+                log(msg)
+                return msg
+            self._last_url = self.page.url
+            try:
+                await self._restart_tracker_on_new_page()
+            except Exception as exc:  # noqa: BLE001
+                log(f"[tabs] tracker restart after back: {exc}")
+            msg = f"went back to {self._last_url}"
             log(msg)
             return msg

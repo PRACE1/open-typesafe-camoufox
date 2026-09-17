@@ -3,8 +3,8 @@
 import asyncio
 
 from src.actions import (
-    _point_status, _refresh_snapshot, _verified_center, action_failed,
-    may_click_through,
+    _inspect_point, _point_status, _refresh_snapshot, _sample_points,
+    _verified_center, action_failed, may_click_through, stale_mismatch,
 )
 
 
@@ -69,7 +69,7 @@ def test_point_status_passthrough():
 def test_verified_center_hit_first_try():
     box = {"x": 100, "y": 100, "width": 200, "height": 40}
     pg = _FakePage(box, point="hit")
-    px, py, verdict = _run(_verified_center(_FakePlatform(pg), [], 1))
+    px, py, verdict, live = _run(_verified_center(_FakePlatform(pg), [], 1))
     assert verdict == "hit" and (px, py) == (200, 120)
     assert len(pg._loc.scrolls) == 1
 
@@ -87,9 +87,10 @@ def test_verified_center_retries_covered_then_hits():
             return "covered:div.banner" if self.calls == 1 else "hit"
 
     pg = _Flaky()
-    px, py, verdict = _run(_verified_center(_FakePlatform(pg), [], 1))
+    px, py, verdict, live = _run(_verified_center(_FakePlatform(pg), [], 1))
     assert verdict == "hit"
-    assert len(pg._loc.scrolls) == 2
+    # sampling hits a clear corner within the first scroll (no re-scroll)
+    assert len(pg._loc.scrolls) == 1 and pg.calls == 2
 
 
 def test_verified_center_gone_when_no_box():
@@ -100,9 +101,42 @@ def test_verified_center_gone_when_no_box():
 def test_verified_center_reports_persistent_cover():
     box = {"x": 100, "y": 100, "width": 200, "height": 40}
     pg = _FakePage(box, point="covered:div.consent")
-    px, py, verdict = _run(_verified_center(_FakePlatform(pg), [], 1))
+    px, py, verdict, live = _run(_verified_center(_FakePlatform(pg), [], 1))
     assert verdict == "covered:div.consent"
     assert len(pg._loc.scrolls) == 2
+
+
+def test_verified_center_samples_corners_past_center_overlay():
+    box = {"x": 100, "y": 100, "width": 200, "height": 100}
+
+    class _Overlay(_FakePage):
+        async def evaluate(self, js, arg=None):
+            x = (arg or {}).get("x", 0)
+            # center covered, left side clear
+            return "covered:span.V9tjod" if x >= 200 else "hit"
+
+    pg = _Overlay(box)
+    px, py, verdict, live = _run(_verified_center(_FakePlatform(pg), [], 1))
+    assert verdict == "hit" and px < 200
+
+
+def test_stale_mismatch():
+    assert stale_mismatch(None, "link") is False
+    assert stale_mismatch("link", "") is False
+    assert stale_mismatch("link", "link") is False
+    assert stale_mismatch("link", "textarea") is True
+    assert stale_mismatch("textarea", "input") is True
+
+
+def test_sample_points_center_first_and_clamped():
+    box = {"x": 100, "y": 100, "width": 200, "height": 100}
+    from src.actions import _sample_points
+    pts = _sample_points(box, {"width": 1000, "height": 800})
+    assert pts[0] == (200, 150) and len(pts) == 5
+    tiny = _sample_points({"x": 0, "y": 0, "width": 2, "height": 2},
+                          {"width": 1000, "height": 800})
+    assert tiny[0] == (1, 1) and len(tiny) <= 5
+    assert all(0 <= x < 1000 and 0 <= y < 800 for x, y in tiny)
 
 
 def test_may_click_through_only_actionable_cover():

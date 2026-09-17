@@ -165,7 +165,7 @@ PROPOSE_SYSTEM = (
     '{"question": "Should the browser ...?", "kind": "<verb>", '
     '"item": <element idx or null>, "url": "<absolute https URL or null>", '
     '"rationale": "<one sentence>"}. '
-    "Verbs: wait, click_item, type_at, press_enter, refresh, close_others, "
+    "Verbs: wait, click_item, type_at, press_enter, press_escape, refresh, back, close_others, "
     "goto, done, none. click_item/type_at need a valid item idx from the map; "
     "goto needs an absolute https url or null; other verbs take item null "
     "and url null. click_item targets links/buttons only — never propose "

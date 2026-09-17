@@ -14,15 +14,16 @@ def _els(n):
 
 
 def test_kinds_mutually_exclusive():
-    assert len(KIND_CRITERIA) == len({k.value for k in Kind}) == 9
+    assert len(KIND_CRITERIA) == len({k.value for k in Kind}) == 11
     assert set(KIND_CRITERIA) == {k.value for k in Kind}
 
 
 def test_kind_criteria_have_boundaries():
     for kind in Kind:
         crit = KIND_CRITERIA[kind.value]
-        assert set(crit) == {"what", "not_for"}, kind
+        assert set(crit) >= {"what", "not_for"}, kind
         assert crit["what"] and crit["not_for"]
+    assert "harness assembles" in KIND_CRITERIA[Kind.DONE.value]["note"]
 
 
 def test_questions_cover_choices_nouls_score():

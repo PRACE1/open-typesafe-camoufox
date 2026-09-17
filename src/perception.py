@@ -1,10 +1,11 @@
 """
 perception.py — deterministic screen state (typesafe's perception.py equivalent).
 
-Builds the structured state packet the Jev classifier decides over. The DOM
-element map is our "numbered OCR blocks": inputs/buttons/links in reading
-order with stable per-page-load idx tags, labels, and normalized centers.
-Nothing here calls a model — capture, probe, merge, filter only.
+Builds the structured state packet the Jev classifier decides over. Element
+identity comes from the accessibility snapshot first (ephemeral aria refs,
+zero DOM writes); a DOM probe is the fallback when snapshots fail. Reading
+order, labels, hrefs, regions — never model calls. Capture, probe, merge,
+filter only.
 
 Only depends on the platform adapter's page handle; never imports
 playwright/camoufox directly.
@@ -19,7 +20,13 @@ import urllib.parse
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+from .capability.aria_refs import (
+    ROLE_TO_KIND,
+    interactive_nodes,
+    parse_aria_snapshot,
+)
 from .capability.element_probe import ELEMENT_PROBE_JS
+from .capability.logging_utils import log
 from .deps import ElementRef, FocusedField
 
 MAX_ELEMENTS = 128  # probe cap; well under Jev's 255-option Choice cap
@@ -225,7 +232,50 @@ def is_credential_element(e: ElementRef) -> bool:
 
 
 async def find_elements(platform) -> list[ElementRef]:
-    """Probe the live DOM; return the element map in reading order."""
+    """Probe the live page; return the element map in snapshot order.
+
+    Aria-first: the accessibility snapshot gives stable native refs with
+    zero DOM writes. The DOM probe (positional refs + boxes) is the
+    fallback when snapshots fail or yield nothing actionable.
+    """
+    try:
+        text = await asyncio.wait_for(
+            platform.page.aria_snapshot(mode="ai"), timeout=15.0)
+    except Exception as exc:
+        log(f"SEE    aria snapshot failed ({exc.__class__.__name__}) — DOM probe fallback")
+        text = ""
+    if (text or "").strip():
+        els = _elements_from_aria(text)
+        if els:
+            return els
+        log("SEE    aria snapshot empty — DOM probe fallback")
+    return await _elements_from_probe(platform)
+
+
+def _elements_from_aria(text: str) -> list[ElementRef]:
+    """Interactive snapshot nodes -> element map (refs are native aria refs)."""
+    out: list[ElementRef] = []
+    for node in interactive_nodes(parse_aria_snapshot(text))[:MAX_ELEMENTS]:
+        value = node.value or ""
+        href = (node.url or "")[:160]
+        out.append(ElementRef(
+            idx=len(out),
+            kind=ROLE_TO_KIND.get(node.role, node.role),
+            ref=node.ref,
+            aria=node.ref,
+            label=node.name or "",
+            value=value[:80],
+            value_len=len(value),
+            href=href,
+            region=node.region,
+        ))
+    for i, e in enumerate(out):
+        e.idx = i
+    return out
+
+
+async def _elements_from_probe(platform) -> list[ElementRef]:
+    """DOM-probe fallback: positional refs, boxes, full labels/hrefs."""
     page = platform.page
     try:
         result = await asyncio.wait_for(

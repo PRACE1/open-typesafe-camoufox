@@ -293,3 +293,58 @@ def test_build_state_page_state_blocked_and_normal():
                      page_text="", history=[], blocked="bot-check-by-url:sorry")
     assert s2["page_state"].startswith("blocked:bot-check-by-url:sorry")
     assert "like any page" in s2["page_state"]
+
+
+ARIA_FIXTURE = """\
+- generic [ref=e2]:
+  - navigation [ref=e3]:
+    - link "Gmail" [ref=e8] [cursor=pointer]:
+      - /url: https://mail.google.com/mail
+  - search [ref=e30]:
+    - combobox "Search" [active] [ref=e44]: hello
+"""
+
+
+def test_find_elements_prefers_aria_snapshot():
+    import asyncio
+
+    from src.perception import find_elements
+
+    class _FakePage:
+        url = "https://a.example/"
+
+        async def aria_snapshot(self, mode="ai"):
+            assert mode == "ai"
+            return ARIA_FIXTURE
+
+        async def evaluate(self, js):
+            raise AssertionError("probe must not run on the aria path")
+
+    els = asyncio.run(find_elements(type("P", (), {"page": _FakePage()})()))
+    assert [(e.idx, e.ref, e.kind) for e in els] == [
+        (0, "e8", "link"), (1, "e44", "input")]
+    assert all(e.aria == e.ref for e in els)
+    assert els[0].href == "https://mail.google.com/mail"
+    assert els[0].region == "navigation"
+    assert els[1].value == "hello" and els[1].value_len == 5
+    assert els[1].box is None  # boxes resolve lazily at ACT
+
+
+def test_find_elements_falls_back_to_probe():
+    import asyncio
+
+    from src.perception import find_elements
+
+    class _FakePage:
+        url = "https://base.example/"
+
+        async def aria_snapshot(self, mode="ai"):
+            raise RuntimeError("no snapshot")
+
+        async def evaluate(self, js):
+            return [{"kind": "link", "text": "R",
+                     "box": [0.05, 0.05, 0.2, 0.05]}]
+
+    els = asyncio.run(find_elements(type("P", (), {"page": _FakePage()})()))
+    assert len(els) == 1 and els[0].aria == "" and els[0].ref == "e0"
+    assert els[0].box == (0.05, 0.05, 0.2, 0.05)

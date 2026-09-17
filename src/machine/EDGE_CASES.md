@@ -33,6 +33,7 @@ IDs used in commit messages and the run log (`EDGE #n`).
 | 25 | Ref shift after re-render | nth slot holds a different kind/label | `_resolve_target` cross-check → `stale` verdict, no dispatch; heal triage remaps by label | handled (`actions.py`, `decide.py`, `runner.py`) |
 | 26 | Hover-opened menu covers click | `covered:` verdict right after highlight | `verify_for_dispatch` dismisses once via Escape and re-verifies before refusing | handled (`actions.py`) |
 | 27 | Novel widget (wallet popup, canvas) | triage `expand_capability` + novelty ≥ 0.70 | writer synthesizes `execute(platform, ref, ctx)`; AST + signature + 3s dry-run gates; register `heal_step<N>`, execute once, audit to run dir | handled (`writer.py`, `capability/validator.py`, `capability/dynamic_registry.py`, `runner.py`) |
+| 28 | Off-snapshot element (portal, unmounted dropdown) | ref missing from snapshot map | 3-tier cascade: known `aria-ref=` → `fN` iframe → raw CSS passthrough; eval hatch via synthesized `page.evaluate` | handled (`capability/aria_refs.py`, `runner.py`) |
 
 ## Notes on #6 (blocked pages)
 

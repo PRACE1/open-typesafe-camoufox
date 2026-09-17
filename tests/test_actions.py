@@ -102,6 +102,37 @@ def test_verified_center_retries_covered_then_hits(monkeypatch):
     assert pg.calls == 2
 
 
+def test_verified_center_proceeds_on_compatible_drift(monkeypatch):
+    import src.actions as _actions_mod
+
+    async def _stale(platform, elements, idx):
+        return {"status": "stale",
+                "box": {"x": 10, "y": 40, "width": 100, "height": 40},
+                "element": None, "live_kind": "textarea",
+                "live_label": "Search"}
+
+    monkeypatch.setattr(_actions_mod, "_resolve_target", _stale)
+    pg = _FakePage(point="hit")
+    old = _el(1, kind="input", label="Search")
+    px, py, verdict, live = _run(_verified_center(_FakePlatform(pg), [old], 1))
+    assert verdict == "hit" and (px, py) == (60, 60)
+
+
+def test_verified_center_refuses_incompatible_stale(monkeypatch):
+    import src.actions as _actions_mod
+
+    async def _stale(platform, elements, idx):
+        return {"status": "stale",
+                "box": {"x": 10, "y": 40, "width": 100, "height": 40},
+                "element": None, "live_kind": "link",
+                "live_label": "Other"}
+
+    monkeypatch.setattr(_actions_mod, "_resolve_target", _stale)
+    pg = _FakePage(point="hit")
+    old = _el(1, kind="input", label="Search")
+    assert _run(_verified_center(_FakePlatform(pg), [old], 1))[2] == "stale:link"
+
+
 def test_verified_center_gone_when_no_box(monkeypatch):
     _stub_find(monkeypatch, [])
     pg = _FakePage(None)
@@ -135,7 +166,10 @@ def test_stale_mismatch():
     assert stale_mismatch("link", "") is False
     assert stale_mismatch("link", "link") is False
     assert stale_mismatch("link", "textarea") is True
-    assert stale_mismatch("textarea", "input") is True
+    # Text-entry granularity drift across vocabularies is not staleness.
+    assert stale_mismatch("input", "textarea") is False
+    assert stale_mismatch("textarea", "input") is False
+    assert stale_mismatch("combobox", "input") is False
 
 
 def test_sample_points_center_first_and_clamped():
@@ -378,6 +412,185 @@ def test_remap_prefers_selector():
     assert _remap_idx(fresh, "missing-label", "link", "a#go") == 1
     assert _remap_idx(fresh, "more", "link", None) == 1
     assert _remap_idx(fresh, "", None, "a#go") == 1
+
+
+def test_remap_prefers_aria_ref():
+    fresh = [_el(0, kind="link", label="Changed", sel="x",
+                 box=(0.01, 0.05, 0.1, 0.05))]
+    fresh[0].aria = "f3e7"
+    assert _remap_idx(fresh, "Old label", "link", None, "f3e7") == 0
+    assert _remap_idx(fresh, "Old label", "link", None, "e99") is None
+
+
+class _FakeAriaLocator:
+    def __init__(self, count=1, box=None, ident=None, fail=None,
+                 self_hit=False):
+        self._count = count
+        self._box = box if box is not None else {"x": 50, "y": 60,
+                                                 "width": 120, "height": 30}
+        self._ident = ident if ident is not None else {"kind": "link",
+                                                       "role": "",
+                                                       "label": "More"}
+        self._fail = fail or set()
+        self._self_hit = self_hit
+        self.scrolled = []
+
+    async def count(self):
+        if "count" in self._fail:
+            raise RuntimeError("count boom")
+        return self._count
+
+    async def scroll_into_view_if_needed(self, timeout=None):
+        self.scrolled.append(1)
+        if "scroll" in self._fail:
+            raise RuntimeError("scroll boom")
+
+    async def bounding_box(self):
+        if "box" in self._fail:
+            raise RuntimeError("box boom")
+        return self._box
+
+    async def evaluate(self, js, arg=None):
+        if isinstance(arg, dict) and "x" in arg:  # SELF_HIT_JS center check
+            if "selfhit" in self._fail:
+                raise RuntimeError("selfhit boom")
+            return self._self_hit
+        if "eval" in self._fail:
+            raise RuntimeError("eval boom")
+        return self._ident
+
+
+class _FakeAriaPage(_FakePage):
+    def __init__(self, locator):
+        super().__init__()
+        self._locator = locator
+        self.seen = []
+
+    def locator(self, sel):
+        self.seen.append(sel)
+        return self._locator
+
+
+def _aria_el(idx=2, aria="e25", kind="link", label="More"):
+    e = _el(idx, kind=kind, label=label)
+    e.aria = aria
+    return e
+
+
+def test_resolve_by_aria_ref_ok_gone_and_failures():
+    from src.actions import _resolve_by_aria_ref
+    plat = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator()))
+    hit = _run(_resolve_by_aria_ref(plat, "e25"))
+    assert hit is not None and hit["box"]["x"] == 50
+    assert hit["kind"] == "link" and hit["label"] == "More"
+    assert plat.page.seen == ["aria-ref=e25"]
+    assert _run(_resolve_by_aria_ref(plat, "")) is None
+    plat_gone = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(count=0)))
+    assert _run(_resolve_by_aria_ref(plat_gone, "e25")) is None
+    plat_tall = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(
+        box={"x": 0, "y": 0, "width": 100, "height": 5000})))
+    assert _run(_resolve_by_aria_ref(plat_tall, "e25")) is None
+    for fail in ("count", "scroll", "box", "eval"):
+        plat_f = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(fail={fail})))
+        assert _run(_resolve_by_aria_ref(plat_f, "e25")) is None, fail
+    # Self-hit is an optimization: its failure degrades to sampling, not refusal.
+    plat_s = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(fail={"selfhit"})))
+    hit = _run(_resolve_by_aria_ref(plat_s, "e25"))
+    assert hit is not None and hit.get("self_hit", False) is False
+
+
+def test_verified_center_self_hit_short_circuits(monkeypatch):
+    """A resolver self-hit returns hit immediately: sampled point checks
+    (with their coarser kind expectations) cannot false-cover it."""
+    import src.actions as _actions_mod
+
+    async def _selfhit(platform, elements, idx):
+        return {"status": "ok",
+                "box": {"x": 10, "y": 40, "width": 100, "height": 40},
+                "element": _el(1), "live_kind": "link",
+                "live_label": "More", "self_hit": True}
+
+    monkeypatch.setattr(_actions_mod, "_resolve_target", _selfhit)
+    pg = _FakePage(point="covered:div.wall")
+    old = _el(1)
+    px, py, verdict, live = _run(_verified_center(
+        _FakePlatform(pg), [old], 1))
+    assert verdict == "hit" and (px, py) == (60, 60)
+
+
+def test_resolve_by_aria_ref_prefers_role_over_tag(monkeypatch):
+    """textarea[role=combobox] resolves as input (the live Google failure)."""
+    from src.actions import _resolve_by_aria_ref, _resolve_target
+    _stub_find(monkeypatch, [])
+    plat = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(
+        ident={"kind": "textarea", "role": "combobox", "label": "Search"})))
+    hit = _run(_resolve_by_aria_ref(plat, "e44"))
+    assert hit is not None and hit["kind"] == "input"
+    old = _el(5, kind="input", label="Search")
+    old.aria = "e44"
+    res = _run(_resolve_target(plat, [old], 5))
+    assert res["status"] == "ok"
+
+
+def test_labels_compatible_lenient():
+    from src.actions import _labels_compatible
+    assert _labels_compatible("Search", "Search") is True
+    assert _labels_compatible("", "Anything") is True
+    assert _labels_compatible("More", "") is True
+    assert _labels_compatible("Crypto Bounties", "Crypto Bounties, Web3 Jobs") is True
+    assert _labels_compatible("Sign in", "Log in") is False
+
+
+def test_kinds_compatible_text_entry_granularity():
+    from src.actions import _kinds_compatible, _slot_changed
+    from src.deps import ElementRef as _E
+    assert _kinds_compatible("input", "textarea") is True
+    assert _kinds_compatible("combobox", "input") is True
+    assert _kinds_compatible("link", "link") is True
+    assert _kinds_compatible("link", "button") is False
+    assert _kinds_compatible("input", "div") is False
+    old = _E(idx=0, kind="input", label="Search")
+    same_widget = _E(idx=0, kind="textarea", label="Search")
+    assert _slot_changed(old, same_widget) is False
+    other = _E(idx=0, kind="link", label="Search")
+    assert _slot_changed(old, other) is True
+
+
+def test_resolve_target_aria_tier_skips_probe(monkeypatch):
+    from src.actions import _resolve_target
+    import src.actions as _actions_mod
+
+    async def _boom(platform):
+        raise AssertionError("aria tier must not re-probe")
+
+    monkeypatch.setattr(_actions_mod, "find_elements", _boom)
+    plat = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator()))
+    res = _run(_resolve_target(plat, [_aria_el()], 2))
+    assert res["status"] == "ok" and res["live_kind"] == "link"
+
+
+def test_resolve_target_aria_stale_and_fallback(monkeypatch):
+    from src.actions import _resolve_target
+    _stub_find(monkeypatch, [_el(0), _el(1), _el(2)])
+    plat = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(
+        ident={"kind": "div", "label": "Other"})))
+    res = _run(_resolve_target(plat, [_aria_el()], 2))
+    assert res["status"] == "stale" and res["live_kind"] == "div"
+    # aria gone -> falls through to sel/nth tiers
+    plat2 = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator(count=0)))
+    res = _run(_resolve_target(plat2, [_aria_el()], 2))
+    assert res["status"] == "ok"
+
+
+def test_bank_box_normalizes_and_skips():
+    from src.actions import _bank_box
+    els = [_el(0)]
+    _bank_box(els, 0, {"x": 100, "y": 80, "width": 200, "height": 40},
+              {"width": 1000, "height": 800})
+    assert els[0].box == (0.1, 0.1, 0.2, 0.05)
+    _bank_box(els, 0, None, {})
+    _bank_box(els, 9, {"x": 1, "y": 1, "width": 1, "height": 1}, {})
+    assert els[0].box == (0.1, 0.1, 0.2, 0.05)
 
 
 def test_probe_stale_gone_missing(monkeypatch):

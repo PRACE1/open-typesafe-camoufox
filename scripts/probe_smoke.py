@@ -64,22 +64,40 @@ async def check_page(browser, url):
     tall = [it.get("ref") for it in items if _is_tall(it.get("box"))]
     if tall:
         print(f"[INFO] {len(tall)} multi-viewport spans (unaimable, refused at resolve): {tall[:5]}")
-    # Perception-level contract: capped, deduped, refs reassigned, no markers.
+    # Perception-level contract, aria-first with probe fallback.
     els = await find_elements(type("Shim", (), {"page": page})())
     ok &= check("capped under Jev ceiling", len(els) <= MAX_ELEMENTS,
                 f"n={len(els)} (raw {len(items)})")
-    refs_ok = all(e.ref == f"e{e.idx}" for e in els)
-    idx_ok = [e.idx for e in els] == list(range(len(els)))
-    ok &= check("refs positional after dedup/cap", refs_ok and idx_ok)
-    sels = [e.sel for e in els]
-    ok &= check("durable selectors generated", all(sels),
-                f"empty={sum(1 for s in sels if not s)}")
-    links = [e for e in els if e.kind == "link" and e.href]
-    href_sels = [e for e in links if e.sel.startswith("a[href=")]
-    ok &= check("anchors prefer href selectors", len(href_sels) >= len(links) // 2,
-                f"{len(href_sels)}/{len(links)}")
-    ok &= check("no 80pct overlap dupes", not _has_dupes(
-        [{"box": list(e.box)} for e in els if e.box is not None]))
+    if els and els[0].aria:
+        import re as _re
+        aria_ok = all(_re.fullmatch(r"(?:f\d+)?e\d+", e.aria or "") for e in els)
+        ok &= check("native aria refs", aria_ok)
+        ok &= check("no 80pct overlap dupes", not _has_dupes(
+            [{"box": list(e.box)} for e in els if e.box is not None]))
+        # Live native resolution of the first link.
+        link = next((e for e in els if e.kind == "link"), None)
+        if link is not None:
+            try:
+                loc = page.locator("aria-ref=" + link.aria)
+                n = await loc.count()
+                box = await loc.bounding_box() if n else None
+                ok &= check("aria-ref resolves live", bool(box), link.aria)
+            except Exception as exc:
+                ok &= check("aria-ref resolves live", False, str(exc)[:80])
+    else:
+        refs_ok = all(e.ref == f"e{e.idx}" for e in els)
+        idx_ok = [e.idx for e in els] == list(range(len(els)))
+        ok &= check("refs positional after dedup/cap (fallback)", refs_ok and idx_ok)
+        sels = [e.sel for e in els]
+        ok &= check("durable selectors generated (fallback)", all(sels),
+                    f"empty={sum(1 for s in sels if not s)}")
+        links = [e for e in els if e.kind == "link" and e.href]
+        href_sels = [e for e in links if e.sel.startswith("a[href=")]
+        ok &= check("anchors prefer href selectors (fallback)",
+                    len(href_sels) >= len(links) // 2,
+                    f"{len(href_sels)}/{len(links)}")
+        ok &= check("no 80pct overlap dupes", not _has_dupes(
+            [{"box": list(e.box)} for e in els if e.box is not None]))
     try:
         markers = await page.evaluate(
             "() => document.querySelectorAll('[data-jev]').length")

@@ -69,18 +69,21 @@ below is grounded in this repo — file paths given.
 
 ## Ref-based element handles (playwright-cli contract)
 
-- Refs `eN` are ephemeral per-probe handles (`src/capability/element_probe.py`,
-  `src/perception.py`); the probe NEVER mutates the DOM (no `setAttribute`,
-  no markers) — stealth rule. Python-side `SnapshotElement` equivalents are
-  `ElementRef(ref, box)` with viewport-normalized boxes.
-- Context control: viewport filter + parent/child 80%-overlap dedup + 128
-  cap (inside Jev's 255 ceiling). Jev item Choice keys are refs, decoded via
-  `ref_to_idx` (bare ints accepted for cached-prompt compat).
-- Resolution re-runs the deterministic probe and takes the nth match,
-  cross-checked by kind + label (`_resolve_target`); `generate-locator`
-  equivalent is the role/name fallback in `dispatch_verified_click`.
-- Smells to flag: any DOM mutation in probe code, selectors stored on
-  elements, refs surviving across probes, caps above 255.
+- Identity comes from `page.aria_snapshot(mode="ai")` first: ephemeral
+  native refs (`eN`, framed `fNeM`) parsed in `src/capability/aria_refs.py`
+  (role + quoted name + `/url:` + `: value` + landmark regions). Zero DOM
+  writes, ever. Actions resolve via native `aria-ref=eN` locators
+  (scroll + box + identity in ~0.1s); framed refs resolve at page level.
+- 3-tier cascade (`resolve_ref`): known ref → `aria-ref=`; bare `fN` →
+  `iframe:nth-of-type(N+1)`; raw CSS passthrough; last-resort `aria-ref=`.
+  Anything outside the snapshot (portals, canvas) goes through synthesized
+  `page.evaluate` (the eval hatch, already in the EXPAND toolbox).
+- Boxes resolve lazily at ACT (bulk `bounding_box` is ~3.5s/ref — measured);
+  Jev options carry no coords. The DOM probe
+  (`src/capability/element_probe.py`) is the fallback when snapshots fail,
+  with positional refs + read-only durable selectors + nth-match.
+- Smells to flag: any DOM mutation in probe code, refs surviving across
+  probes, caps above 255, per-ref box calls at SEE time.
 
 ## httpx / python-dotenv / Pillow / humanmovemouse
 

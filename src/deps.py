@@ -41,6 +41,13 @@ class ElementRef:
     ref: str = ""
     box: tuple[float, float, float, float] | None = None
     sel: str = ""
+    aria: str = ""
+    """Native accessibility ref (e6, f3e7) when resolved from a snapshot.
+
+    Empty on the DOM-probe fallback path. Resolution prefers aria-ref
+    locators, then durable selectors, then positional nth-match.
+    """
+    type: str = ""
     type: str = ""
     id: str = ""
     label: str = ""

@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import asyncio
 
-from .capability.logging_utils import log
+from .capability.aria_refs import ROLE_TO_KIND, resolve_ref
 from .capability.element_probe import RESOLVE_JS
+from .capability.logging_utils import log
 from .deps import ElementRef
 from .perception import find_elements, get_page_text
 from .writer import _mask, _resolve_placeholders
@@ -103,14 +104,13 @@ async def _inspect_point(page, px: int, py: int,
 
 
 def stale_mismatch(expected: str | None, live: str) -> bool:
-    """True when the live element is no longer what was decided on.
+    """True when the live element is incompatibly different from decided.
 
-    Refs are positional and re-assigned every probe; when the page
-    re-renders between decide and act, ref eN can point at a different
-    element (seen live: result link became the search box). Refuse to act
-    on a stale reference.
+    Delegates to _kinds_compatible: text-entry granularity drift between
+    the aria and DOM vocabularies (input vs textarea for one widget) is
+    not staleness. Empty sides carry no signal.
     """
-    return bool(expected) and bool(live) and expected != live
+    return bool(expected) and bool(live) and not _kinds_compatible(expected, live)
 
 
 def _sample_points(box: dict, vp: dict, n: int = 5) -> list[tuple[int, int]]:
@@ -161,17 +161,121 @@ async def _refresh_snapshot(platform) -> str:
     return digest + ")"
 
 
+TEXT_ENTRY_KINDS = frozenset({
+    "input", "textarea", "select", "combobox", "searchbox", "spinbutton",
+})
+
+
+def _kinds_compatible(a: str, b: str) -> bool:
+    """Same kind, or same text-entry widget under two vocabularies.
+
+    The aria path reports role-mapped kinds (`input`) where the DOM probe
+    reports tags (`textarea`); that granularity drift must never veto an
+    action on its own.
+    """
+    return a == b or (a in TEXT_ENTRY_KINDS and b in TEXT_ENTRY_KINDS)
+
+
 def _slot_changed(old: ElementRef, new: ElementRef) -> bool:
     """True when the nth probe slot now holds a different element.
 
-    Kind change always counts. Label/text change counts only when both
-    sides have something to compare (empty labels carry no signal).
+    Incompatible kind change counts (see _kinds_compatible). Label/text
+    change counts only when both sides have something to compare (empty
+    labels carry no signal).
     """
-    if old.kind != new.kind:
+    if not _kinds_compatible(old.kind, new.kind):
         return True
     o = (old.label or old.placeholder or old.text or "").strip().lower()
     n = (new.label or new.placeholder or new.text or "").strip().lower()
     return bool(o and n and o != n)
+
+
+ARIA_IDENTITY_JS = """(el) => {
+  const tag = (el.tagName || '').toLowerCase();
+  const get = (a) => (el.getAttribute ? String(el.getAttribute(a) || '') : '');
+  const text = (el.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 40);
+  return {
+    kind: tag === 'a' ? 'link' : tag,
+    role: get('role'),
+    label: (get('aria-label') || text || get('placeholder') || get('value') || '').slice(0, 80),
+  };
+}"""
+
+SELF_HIT_JS = """(el, pt) => {
+  let t = null;
+  try { t = document.elementFromPoint(pt.x, pt.y); } catch (e) { return false; }
+  if (!t) return false;
+  try { return el === t || el.contains(t); } catch (e) { return false; }
+}"""
+
+
+def _labels_compatible(a: str, b: str) -> bool:
+    """Lenient label match for the aria tier: node identity there comes
+    from the native ref, so text drift (hydration, counters) must not veto.
+    Missing labels carry no signal; containment either way counts."""
+    x, y = (a or "").strip().lower(), (b or "").strip().lower()
+    return not x or not y or x == y or x in y or y in x
+
+
+async def _resolve_by_aria_ref(platform, aria: str) -> dict | None:
+    """Native-identity lookup through the accessibility tree.
+
+    Scrolls the node into view and returns {box(px dict), kind, label}.
+    None when unresolvable — the caller falls through to the selector and
+    nth-match tiers. Framed refs (fNeM) resolve at page level; Playwright
+    routes them to their frame natively. Never writes to the DOM.
+    """
+    if not aria:
+        return None
+    locator = platform.page.locator(resolve_ref(aria, {aria}))
+    try:
+        if await locator.count() == 0:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        await asyncio.wait_for(
+            locator.scroll_into_view_if_needed(timeout=5000), timeout=10.0)
+        box = await locator.bounding_box()
+    except Exception:  # noqa: BLE001
+        return None
+    if not box:
+        return None
+    try:
+        ident = await asyncio.wait_for(
+            locator.evaluate(ARIA_IDENTITY_JS), timeout=10.0)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(ident, dict):
+        return None
+    try:
+        vp = platform.page.viewport_size or {"width": 1280, "height": 800}
+        vw = max(1, int(vp.get("width", 1280)))
+        vh = max(1, int(vp.get("height", 800)))
+        if box["width"] > 1.5 * vw or box["height"] > 1.5 * vh:
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    tag_kind = str(ident.get("kind", "") or "")
+    role = str(ident.get("role", "") or "")
+    # Role-first: composite widgets (textarea[role=combobox]) report their
+    # semantic kind, not their DOM tag.
+    kind = ROLE_TO_KIND.get(role, tag_kind)
+    label = str(ident.get("label", "") or "")
+    px_box = {"x": box["x"], "y": box["y"],
+              "width": box["width"], "height": box["height"]}
+    # Self-hit: the resolved node itself under its center means the point
+    # check below cannot false-cover on vocabulary drift.
+    cx = px_box["x"] + px_box["width"] / 2
+    cy = px_box["y"] + px_box["height"] / 2
+    try:
+        self_hit = await asyncio.wait_for(
+            locator.evaluate(SELF_HIT_JS, {"x": cx, "y": cy}),
+            timeout=10.0)
+    except Exception:  # noqa: BLE001
+        self_hit = False
+    return {"box": px_box, "kind": kind, "label": label,
+            "self_hit": self_hit is True}
 
 
 async def _resolve_by_selector(platform, sel: str) -> dict | None:
@@ -229,6 +333,22 @@ async def _resolve_target(platform, elements: list[ElementRef],
     old = next((e for e in elements if e.idx == idx), None)
     if old is None:
         return blank
+    # Tier 0 — native identity: the same a11y node regardless of DOM order.
+    # Kind is strict up to vocabulary (role-mapped vs tag); labels are
+    # lenient (node identity is already strong, hydration text drift must
+    # not veto).
+    if old.aria:
+        hit = await _resolve_by_aria_ref(platform, old.aria)
+        if hit is not None:
+            live = ElementRef(idx=idx, kind=hit["kind"], label=hit["label"])
+            info = {"box": hit["box"], "element": old,
+                    "live_kind": hit["kind"], "live_label": hit["label"],
+                    "self_hit": hit.get("self_hit", False)}
+            if not _kinds_compatible(old.kind, hit["kind"]) or not _labels_compatible(
+                    old.label or old.placeholder or old.text or old.id or "",
+                    hit["label"]):
+                return {"status": "stale", **info}
+            return {"status": "ok", **info}
     if old.sel:
         hit = await _resolve_by_selector(platform, old.sel)
         if hit is not None:
@@ -293,6 +413,10 @@ async def _verified_center(platform, elements: list[ElementRef], idx: int,
     Returns (px, py, verdict, live_kind). Prefers a direct hit, then a
     clickable cover (anchor/button), else the last verdict seen. A shifted
     map reports stale (no dispatch); a missing slot reports gone.
+    Compatible granularity drift (input vs textarea for one widget) is
+    verified against the LIVE identity instead of refused. A resolver
+    self-hit (the node itself under its center) returns hit immediately —
+    vocabulary drift in sampled point checks cannot false-cover it.
     """
     page = platform.page
     vp = page.viewport_size or {"width": 1280, "height": 800}
@@ -302,10 +426,31 @@ async def _verified_center(platform, elements: list[ElementRef], idx: int,
         if res["status"] == "gone" or res["box"] is None:
             last = (None, None, "gone", "")
             continue
+        if res.get("self_hit"):
+            box = res["box"]
+            cx = box["x"] + box["width"] / 2
+            cy = box["y"] + box["height"] / 2
+            vw = max(1, int(vp.get("width", 1280)))
+            vh = max(1, int(vp.get("height", 800)))
+            return (min(max(int(cx), 0), vw - 1),
+                    min(max(int(cy), 0), vh - 1),
+                    "hit", res["live_kind"])
         if res["status"] == "stale":
-            return None, None, f"stale:{res['live_kind']}", res["live_kind"]
-        el = res["element"]
-        exp_name = (el.label or el.placeholder or el.text or el.id or "")
+            old = next((e for e in elements if e.idx == idx), None)
+            drift = (
+                old is not None
+                and _kinds_compatible(old.kind, res["live_kind"])
+                and _labels_compatible(
+                    old.label or old.placeholder or old.text or old.id or "",
+                    res["live_label"]))
+            if not drift:
+                return None, None, f"stale:{res['live_kind']}", res["live_kind"]
+            # Same widget, coarser label: verify points, don't refuse.
+            el_kind, exp_name = res["live_kind"], res["live_label"]
+        else:
+            el = res["element"]
+            el_kind = el.kind
+            exp_name = (el.label or el.placeholder or el.text or el.id or "")
         box = res["box"]
         vh = int(vp.get("height", 800))
         if not (0 <= box["y"] <= vh):
@@ -314,7 +459,7 @@ async def _verified_center(platform, elements: list[ElementRef], idx: int,
         fallback = None
         for px, py in _sample_points(box, vp, samples):
             verdict, live_kind = await _inspect_point(
-                page, px, py, el.kind, exp_name)
+                page, px, py, el_kind, exp_name)
             if verdict == "hit":
                 return px, py, verdict, live_kind
             if verdict.startswith("error:"):
@@ -329,30 +474,41 @@ async def _verified_center(platform, elements: list[ElementRef], idx: int,
 
 async def probe_target(platform, elements: list[ElementRef], idx: int,
                      expected_kind: str | None = None) -> dict:
-    """Pre-flight probe of element idx: scroll, verify, classify — no dispatch.
+    """Pre-flight probe of element idx: resolve, verify, classify — no dispatch.
 
     Returns a dict with status (ok/through/covered/stale/gone/error),
-    verdict, px/py, live_kind, and label. The runner calls this on its heal
-    pass; click_item uses it before every dispatch.
+    verdict, px/py, box (px dict, for annotation banking), live_kind, and
+    label. The runner calls this on its heal pass; click_item uses it
+    before every dispatch.
     """
     el = next((e for e in elements if e.idx == idx), None)
     blank = {"idx": idx, "status": "gone", "verdict": "gone",
-             "px": None, "py": None, "live_kind": "", "label": ""}
+             "px": None, "py": None, "box": None, "live_kind": "", "label": ""}
     if el is None:
         return blank
     label = el.label or el.placeholder or el.text or el.id or f"element #{idx}"
+    res = await _resolve_target(platform, elements, idx)
+    if res["status"] == "gone":
+        return {**blank, "label": label}
+    if res["status"] == "stale":
+        return {"idx": idx, "status": "stale",
+                "verdict": f"stale:{res['live_kind']}", "px": None, "py": None,
+                "box": None, "live_kind": res["live_kind"], "label": label}
     px, py, verdict, live_kind = await _verified_center(platform, elements, idx)
     if verdict.startswith("stale:"):
         return {"idx": idx, "status": "stale", "verdict": verdict,
-                "px": px, "py": py, "live_kind": live_kind, "label": label}
+                "px": px, "py": py, "box": res["box"],
+                "live_kind": live_kind, "label": label}
     if px is None or verdict == "gone":
         return {**blank, "label": label}
     if verdict.startswith("error:"):
         return {"idx": idx, "status": "error", "verdict": verdict,
-                "px": px, "py": py, "live_kind": live_kind, "label": label}
+                "px": px, "py": py, "box": res["box"],
+                "live_kind": live_kind, "label": label}
     if stale_mismatch(expected_kind, live_kind):
         return {"idx": idx, "status": "stale", "verdict": verdict,
-                "px": px, "py": py, "live_kind": live_kind, "label": label}
+                "px": px, "py": py, "box": res["box"],
+                "live_kind": live_kind, "label": label}
     if verdict == "hit":
         status = "ok"
     elif may_click_through(verdict):
@@ -360,7 +516,29 @@ async def probe_target(platform, elements: list[ElementRef], idx: int,
     else:
         status = "covered"
     return {"idx": idx, "status": status, "verdict": verdict,
-            "px": px, "py": py, "live_kind": live_kind, "label": label}
+            "px": px, "py": py, "box": res["box"],
+            "live_kind": live_kind, "label": label}
+
+
+def _bank_box(elements: list[ElementRef], idx: int,
+              box_px: dict | None, vp: dict) -> None:
+    """Bank the resolved px box (normalized) onto the step's element.
+
+    Lets report.py draw the acted element's true rect; elements never
+    resolved keep box=None and are skipped in annotation.
+    """
+    if not box_px:
+        return
+    el = next((e for e in elements if e.idx == idx), None)
+    if el is None:
+        return
+    try:
+        vw = max(1, int(vp.get("width", 1280)))
+        vh = max(1, int(vp.get("height", 800)))
+        el.box = (box_px["x"] / vw, box_px["y"] / vh,
+                  box_px["width"] / vw, box_px["height"] / vh)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        pass
 
 
 async def dispatch_verified_click(platform, px: int, py: int,
@@ -500,6 +678,7 @@ async def click_item(platform, elements: list[ElementRef], idx: int,
                 log(f"click-through {verdict} for element #{idx}")
             # The click's own humanized move is the settle onto the center.
             vpx, vpy = probe["px"], probe["py"]
+            _bank_box(elements, idx, probe.get("box"), vp)
             res = await dispatch_verified_click(platform, vpx, vpy, harvest=False)
             if res["outcome"] == "error":
                 msg = f"error clicking element #{idx}: {res['info']}"
@@ -535,13 +714,18 @@ async def click_item(platform, elements: list[ElementRef], idx: int,
 
 def _remap_idx(fresh: list[ElementRef], old_label: str,
                old_kind: str | None = None,
-               old_sel: str | None = None) -> int | None:
+               old_sel: str | None = None,
+               old_aria: str | None = None) -> int | None:
     """Find the old target in a fresh element map.
 
-    Same node first (durable selector equality — order-independent), then
-    exact label (case-insensitive). Label match stays strict on purpose —
-    a wrong-element click is worse than a no-op.
+    Same a11y node first (aria-ref equality survives re-renders), then the
+    durable selector, then exact label (case-insensitive). Label match
+    stays strict on purpose — a wrong-element click is worse than a no-op.
     """
+    if old_aria:
+        for e in fresh:
+            if e.aria == old_aria:
+                return e.idx
     if old_sel:
         for e in fresh:
             if e.sel == old_sel:
@@ -558,9 +742,10 @@ def _remap_idx(fresh: list[ElementRef], old_label: str,
 
 async def heal_target(platform, old_label: str,
                       old_kind: str | None = None,
-                      old_sel: str | None = None
+                      old_sel: str | None = None,
+                      old_aria: str | None = None
                       ) -> tuple[list[ElementRef], int | None]:
-    """One self-healing retry: re-probe the page, remap by selector/label.
+    """One self-healing retry: re-probe the page, remap by aria/selector/label.
 
     Returns (fresh_elements, new_idx | None). The fresh list MUST be used
     for the re-attempt: positional refs and selectors belong to their own
@@ -571,7 +756,7 @@ async def heal_target(platform, old_label: str,
         fresh = await find_elements(platform)
     except Exception:  # noqa: BLE001
         return [], None
-    return fresh, _remap_idx(fresh, old_label, old_kind, old_sel)
+    return fresh, _remap_idx(fresh, old_label, old_kind, old_sel, old_aria)
 
 
 def _challenge_kind(el: ElementRef) -> str:
@@ -629,6 +814,8 @@ async def challenge_control(platform, elements: list[ElementRef], idx: int,
                     msg = f"error toggling challenge checkbox #{idx}: {res['info']}"
                     log(msg)
                     return msg
+                _bank_box(elements, idx, probe.get("box"),
+                          page.viewport_size or {"width": 1280, "height": 800})
                 msg = f"element #{idx} challenge checkbox toggled humanize=true"
                 if dismissed:
                     msg += " + cover dismissed via Escape"
@@ -666,6 +853,8 @@ async def challenge_control(platform, elements: list[ElementRef], idx: int,
                 await mouse.up()
             outcome, info = await platform.settle_after_action(prev_url, before_ids)
             snap = await _refresh_snapshot(platform)
+            _bank_box(elements, idx, box,
+                      page.viewport_size or {"width": 1280, "height": 800})
             msg = f"element #{idx} slider drag 8 steps humanize=true"
             if outcome in ("newtab", "navigated") and info:
                 msg += f" + {outcome} {info}"
@@ -714,6 +903,7 @@ async def type_at(platform, elements: list[ElementRef], idx: int, text: str,
             await platform._harvest_and_accumulate(quiet=True)
             await _clear_field(platform)
             await page.keyboard.type(secret, delay=15)
+            _bank_box(elements, idx, box, vp)
             msg = (
                 f"element #{idx} scroll+circle+click at "
                 f"({vpx / vp['width']:.3f},{vpy / vp['height']:.3f}) humanize=true"

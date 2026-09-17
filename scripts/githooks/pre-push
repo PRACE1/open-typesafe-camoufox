@@ -1,0 +1,6 @@
+#!/bin/sh
+# Installed to .git/hooks/pre-push by scripts/install-hooks.ps1.
+# Ranks changed files by Jev issue score; blocks on >= 0.75.
+# Bypass: git push --no-verify  |  JEV_HOOKS_OFF=1 git push
+command -v uv >/dev/null 2>&1 || exit 0
+exec uv run python scripts/jev_hooks.py pre-push "$@"

@@ -26,6 +26,25 @@ and observable enough to debug offline when it stalls. The project started
 as `open-jev-solver` (a 2-tool pydantic harness) and was refactored into
 this shape once live runs showed the costs clearly.
 
+## Goal: earn $1 USDC on Solana
+
+The standing end-to-end target: **earn $1 USDC on the Solana chain** to
+wallet `d8XdEYRHvti6WZNEuohJqENHVGVwMxS9F1PXg5kxBMo`.
+
+Stated honestly: `otc` has no wallet, no accounts, and no payment rails —
+it cannot earn or move crypto by itself, and bot-checks/CAPTCHAs are stop
+conditions, not puzzles to defeat. What the loop *can* do, recursively
+until it works, is the research leg: find legitimate beginner routes to
+$1 USDC on Solana (faucets, learn-to-earn, microtasks, freelance gigs paid
+in crypto), open the most promising results, read pay rates/requirements/
+payout methods, and report the top options with a note quoting each page.
+
+Judgment criteria for a run (in order):
+1. `done=True` with a note naming concrete routes + amounts — complete.
+2. Sustained multi-page progress (25 steps, new tabs adopted, notes
+   banked on distinct URLs) without ever re-clicking a dead target.
+3. Anything else is a stall: fix the decision, not the step count.
+
 ## What we did here
 
 1. **Speed + consistency.** Profiled the cursor and found each humanized
@@ -216,3 +235,14 @@ src/
 ```bash
 uv run python -m pytest -q
 ```
+
+Git hooks (Jev-backed, see `scripts/jev_hooks.py` + `docs/LIBRARIES.md`):
+
+```powershell
+scripts/install-hooks.ps1   # pre-commit maps staged files, pre-push ranks by issues
+```
+
+- `pre-commit` classifies/maps staged `.py` files (advisory; `--strict` to block).
+- `pre-push` ranks pushed `.py` files by Jev issue score and blocks on
+  ≥ 0.75. Bypass with `git push --no-verify` or `JEV_HOOKS_OFF=1`.
+- No key / no network → heuristic fallback, never blocks.

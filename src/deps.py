@@ -36,6 +36,7 @@ class ElementRef:
     value: str = ""
     value_len: int = 0
     href: str = ""
+    region: str = ""
     cx: float = 0.5
     cy: float = 0.5
 

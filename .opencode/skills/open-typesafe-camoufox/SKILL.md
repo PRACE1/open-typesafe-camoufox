@@ -61,8 +61,7 @@ Every run writes `runs/<timestamp>/`:
 | `step-NN-answers.json` | every classifier probability (debug stalls here first) |
 | `transcript.jsonl`, `cursor.json` | per-step lines + cursor trail |
 
-Live feed lines: `SEE` (elements/tabs/focused/text) → `DECIDE <kind> conf=<x> [item=#n] | ready=<x> text?=<x> done?=<x> prog=<x>` → `ACT` → `RESULT`. `kind` is one of `wait | click_item | type_at |
-press_enter | refresh | close_others | goto | done | none` (each with a written what/not-for boundary). The Noul flags ride along: `ready` can only add patience, `text?` gates the writer call, `done?` must agree before `done` is accepted. `conf < --min-confidence` idles;
+Live feed lines: `SEE` (elements/links/tabs/focused/text) → `PROPOSE <kind> [#item] : <rationale>` → `DECIDE <kind> conf=<x> [item=#n] | ready=<x> text?=<x> done?=<x> prog=<x> appr=<x>` → `ACT` → `RESULT`. `kind` is one of `wait | click_item | type_at | press_enter | refresh | close_others | goto | done | none` (each with a written what/not-for boundary). At approval ≥ 0.7 the proposal executes over the Choice vote (`[approved-override]`, `+ newtab <url>` when a tab opens). The Noul flags ride along: `ready` can only add patience, `text?` gates the writer call, `done?` must agree before `done` is accepted. `conf < --min-confidence` idles;
 two doubt no-ops stop the run; `wait` is patience (loading page) and never
 stops it; `done` is accepted only on a settled page with real text.
 Clicks auto-adopt new tabs (`+ newtab <url>` in RESULT); `close_others`

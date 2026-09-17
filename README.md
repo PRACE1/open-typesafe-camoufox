@@ -102,6 +102,9 @@ screenshot ─► element map (DOM probe, reading order, data-jev tags)
               page text (visible words — the reading ground truth)
                           │
                           ▼
+             Groq proposes the single best action as a yes/no question
+                          │
+                          ▼
              one Jev request: Choices, Noul flags, and a Score
              ┌───────────────────────────────────────────────┐
              │ kind : wait | click_item | type_at |          │
@@ -112,6 +115,7 @@ screenshot ─► element map (DOM probe, reading order, data-jev tags)
              │        (label/text/href/fill-state/selector)  │
              │ site : which catalog URL (goto targets)       │
              │ Noul : page_ready? needs_text? task_done?     │
+             │ Noul : approval? (LLM-posed question)         │
              │ Score: progress on the task spectrum          │
              └───────────────────────────────────────────────┘
                           │  conf < 0.4 → idle (no-op)
@@ -147,7 +151,8 @@ Decide path (default, `otc --url … --task …`):
 | phase | module | fires |
 |---|---|---|
 | see | `perception` | element map, focused field, page text, tabs; banks notes + visited |
-| decide | `decide` (Jev) | kind/item/site Choices + page_ready/needs_text/task_done Nouls + progress Score |
+| decide | `decide` (Jev) | kind/item/site Choices + page_ready/needs_text/task_done/approval Nouls + progress Score |
+| propose | `writer` (Groq) | reads all elements + URLs, poses the single best action as the approval question |
 | gate | `runner` | confidence gate, loop-guard, Noul gates |
 | act | `actions` → `platform` | click/type/enter/refresh/goto/close; auto-adopts new tabs |
 | act | `writer` | only on `type_at` (non-credential) and off-catalog `goto` |

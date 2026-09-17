@@ -34,6 +34,31 @@ def test_questions_cover_choices_nouls_score():
     assert q["task_done"]["type"] == "noul"
     assert q["progress"]["type"] == "score"
     assert isinstance(q["progress"]["criteria"], list)
+    assert "approval" not in q
+
+
+def test_approval_noul_present_only_when_posed():
+    q = build_questions(_els(1), ["https://a.example"],
+                        approval_question="Should the browser click #0?")
+    assert q["approval"]["type"] == "noul"
+    assert q["approval"]["instructions"] == "Should the browser click #0?"
+
+
+def test_approval_structured_instructions():
+    struct = {"question": "Should the browser click #0?",
+              "candidate": {"kind": "click_item", "item": 0, "url": None},
+              "rationale": "Top result.",
+              "focus": "YES only if best."}
+    q = build_questions(_els(1), ["https://a.example"], approval_question=struct)
+    assert q["approval"]["instructions"] == struct
+
+
+def test_approval_decode_and_default():
+    from src.decide import _decode
+    raw = _raw("click_item", item="1")
+    raw["answers"]["approval"] = {"noul": 0.85}
+    assert _decode(raw, _els(3), ["https://a.example"]).approval == 0.85
+    assert _decode(_raw("wait"), _els(1), ["https://a.example"]).approval == 0.0
 
 
 def test_item_options_are_structured():

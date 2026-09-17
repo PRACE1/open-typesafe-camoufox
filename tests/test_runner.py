@@ -3,8 +3,11 @@
 import pytest
 
 from src.runner import (
-    Phase, credential_placeholder, loop_guard_trip, page_settled, phase_step,
+    APPROVAL_MIN, BARE_CLICK_VETO_KINDS, EFFECT_KINDS, OVERRIDABLE_KINDS,
+    Phase, credential_placeholder, fresh_tabs, loop_guard_trip, page_settled,
+    phase_step, proposal_executable, should_override,
 )
+from src.writer import ProposedAction
 
 
 def test_page_settled_blank_and_loading():
@@ -83,3 +86,70 @@ def test_phase_illegal_moves_raise():
         phase_step(["see"], Phase.ACT)  # SEE -> ACT skips DECIDE+GATE
     with pytest.raises(ValueError):
         phase_step(["see", "decide", "gate", "done"], Phase.SEE)  # DONE terminal
+
+
+def test_approval_threshold_and_overridable_kinds():
+    assert APPROVAL_MIN == 0.5
+    assert set(OVERRIDABLE_KINDS) == {"click_item", "type_at", "goto"}
+    assert set(BARE_CLICK_VETO_KINDS) == {"input", "textarea", "select"}
+    assert "type_at" not in EFFECT_KINDS  # typing never changes body text
+    assert set(EFFECT_KINDS) == {"click_item", "press_enter", "refresh"}
+
+
+def test_proposal_executable():
+    from src.deps import ElementRef
+    els = [ElementRef(idx=0, kind="link"), ElementRef(idx=5, kind="textarea")]
+    good_click = ProposedAction(question="q?", kind="click_item", item=0,
+                                url=None, rationale="r")
+    assert proposal_executable(good_click, els) is True
+    bad_item = ProposedAction(question="q?", kind="click_item", item=9,
+                              url=None, rationale="r")
+    assert proposal_executable(bad_item, els) is False
+    assert proposal_executable(None, els) is False
+    wait_kind = ProposedAction(question="q?", kind="wait", item=None,
+                               url=None, rationale="r")
+    assert proposal_executable(wait_kind, els) is False
+    goto = ProposedAction(question="q?", kind="goto", item=None,
+                          url="https://a.example/", rationale="r")
+    assert proposal_executable(goto, els) is True
+    click_on_input = ProposedAction(question="q?", kind="click_item", item=5,
+                                    url=None, rationale="r")
+    assert proposal_executable(click_on_input, els) is False
+    type_on_link = ProposedAction(question="q?", kind="type_at", item=0,
+                                  url=None, rationale="r")
+    assert proposal_executable(type_on_link, els) is False
+    type_on_input = ProposedAction(question="q?", kind="type_at", item=5,
+                                   url=None, rationale="r")
+    assert proposal_executable(type_on_input, els) is True
+
+
+def _prop(kind, item):
+    return ProposedAction(question="q?", kind=kind, item=item,
+                          url=None, rationale="r")
+
+
+def test_should_override_disagreement_lean_yes():
+    assert should_override(approval=0.61, proposed=_prop("click_item", 24),
+                           choice_kind="click_item", choice_item=0,
+                           executable=True) is True
+    assert should_override(approval=0.49, proposed=_prop("click_item", 24),
+                           choice_kind="click_item", choice_item=0,
+                           executable=True) is False
+
+
+def test_should_override_agreement_or_unexecutable():
+    assert should_override(approval=0.95, proposed=_prop("click_item", 0),
+                           choice_kind="click_item", choice_item=0,
+                           executable=True) is False
+    assert should_override(approval=0.95, proposed=_prop("click_item", 24),
+                           choice_kind="click_item", choice_item=0,
+                           executable=False) is False
+    assert should_override(approval=0.95, proposed=None,
+                           choice_kind="click_item", choice_item=0,
+                           executable=True) is False
+
+
+def test_fresh_tabs_reconciliation():
+    assert fresh_tabs({1, 2}, {1, 2, 3}) == {3}
+    assert fresh_tabs({1, 2}, {1, 2}) == set()
+    assert fresh_tabs(set(), {1}) == {1}  # first sighting lists all

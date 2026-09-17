@@ -2,8 +2,9 @@
 
 from src.deps import ElementRef, FocusedField
 from src.perception import (
-    build_state, element_criteria, format_elements, is_credential,
-    is_credential_element, norm_url, page_fingerprint, trim_notes,
+    _unwrap_redirect, build_state, element_criteria, format_elements,
+    host_of, is_credential, is_credential_element, norm_url,
+    page_fingerprint, trim_notes,
 )
 
 
@@ -150,3 +151,41 @@ def test_find_elements_resolves_href():
 
     els = asyncio.run(find_elements(type("P", (), {"page": _FakePage()})()))
     assert els[0].href == "https://base.example/other?q=1"
+
+
+def test_unwrap_redirect_only_url_path():
+    assert _unwrap_redirect("https://www.google.com/url?q=https://dest.example/a&sa=t") == \
+        "https://dest.example/a"
+    assert _unwrap_redirect("https://www.google.com/search?q=moon") == \
+        "https://www.google.com/search?q=moon"
+    assert _unwrap_redirect("https://www.google.com/goto?url=OPAQUE") == \
+        "https://www.google.com/goto?url=OPAQUE"
+    assert host_of("https://Dest.Example/a") == "dest.example"
+    assert host_of("not a url") == ""
+
+
+def test_criteria_region_and_host_markers():
+    e = ElementRef(idx=3, kind="link", text="Prolific", cx=0.3, cy=0.4,
+                   href="https://www.prolific.com/", region="main")
+    c = element_criteria(e)
+    assert "[main]" in c and "-> www.prolific.com" in c
+    e2 = ElementRef(idx=0, kind="link", text="X", cx=0.1, cy=0.1)
+    c2 = element_criteria(e2)
+    assert "[" not in c2 and "->" not in c2
+
+
+def test_find_elements_parses_region():
+    import asyncio
+
+    from src.perception import MAX_ELEMENTS, find_elements
+
+    assert MAX_ELEMENTS == 60
+
+    class _FakePage:
+        url = "https://base.example/"
+        async def evaluate(self, js):
+            return [{"idx": 0, "kind": "link", "text": "R", "region": "main",
+                     "href": "https://a.example/", "cx": 0.1, "cy": 0.1}]
+
+    els = asyncio.run(find_elements(type("P", (), {"page": _FakePage()})()))
+    assert els[0].region == "main"

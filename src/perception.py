@@ -21,7 +21,7 @@ from urllib.parse import urljoin, urlparse
 from .capability.element_probe import ELEMENT_PROBE_JS
 from .deps import ElementRef, FocusedField
 
-MAX_ELEMENTS = 40  # probe cap; well under Jev's 255-option Choice cap
+MAX_ELEMENTS = 60  # probe cap; well under Jev's 255-option Choice cap
 PAGE_TEXT_LIMIT = 1500
 NOTES_LIMIT = 2000  # chars of extractive notes kept across the run
 
@@ -50,6 +50,35 @@ def norm_url(url: str) -> str:
         p.scheme.lower(), p.netloc.lower(), p.path or "/",
         "", urllib.parse.urlencode(q), "",
     ))
+
+
+def host_of(href: str) -> str:
+    """Destination host for criteria/state ('' when unknown or opaque)."""
+    try:
+        return urlparse(href or "").netloc.lower()
+    except ValueError:
+        return ""
+
+
+def _unwrap_redirect(href: str) -> str:
+    """Unwrap redirect wrappers (/url?q=<real>) to the destination URL.
+
+    Narrow on purpose: only the well-known redirect path with an explicit
+    http(s) q value. Opaque tokens (google.com/goto?url=...) stay as-is.
+    """
+    try:
+        pr = urlparse(href)
+    except ValueError:
+        return href
+    if pr.path != "/url":
+        return href
+    try:
+        q = urllib.parse.parse_qs(pr.query).get("q", [""])[0]
+    except ValueError:
+        return href
+    if q.startswith(("http://", "https://")):
+        return q[:160]
+    return href
 
 
 def page_fingerprint(url: str, page_text: str) -> tuple[str, str]:
@@ -144,9 +173,10 @@ async def find_elements(platform) -> list[ElementRef]:
                     joined = urljoin(base_url, href_raw)
                     pr = urlparse(joined)
                     if pr.scheme in ("http", "https") and pr.netloc:
-                        href = joined[:160]
+                        href = _unwrap_redirect(joined[:160])
                 except ValueError:
                     href = ""
+            region = str(raw.get("region", "") or "")[:24]
             out.append(ElementRef(
                 idx=int(raw.get("idx", len(out))),
                 kind=str(raw.get("kind", "?")),
@@ -158,6 +188,7 @@ async def find_elements(platform) -> list[ElementRef]:
                 value=value[:80],
                 value_len=value_len,
                 href=href,
+                region=region,
                 cx=float(raw.get("cx", 0.5)),
                 cy=float(raw.get("cy", 0.5)),
             ))
@@ -235,6 +266,11 @@ def element_criteria(e: ElementRef, visited: set[str] | None = None) -> str:
     base = f"{e.kind}{extra} \"{label}\" at {e.cx:.3f},{e.cy:.3f}"
     if e.kind in ("input", "textarea", "select") or e.type:
         base += f" filled({e.value_len}ch)" if e.value_len else " empty"
+    if e.region:
+        base += f" [{e.region}]"
+    host = host_of(e.href) if e.kind == "link" else ""
+    if host:
+        base += f" -> {host}"
     if visited and e.href and norm_url(e.href) in visited:
         base += " (visited)"
     return base
@@ -258,6 +294,7 @@ def build_state(*, task: str, url: str, elements: list[ElementRef],
             {"idx": e.idx, "kind": e.kind, "type": e.type, "label": e.label,
              "placeholder": e.placeholder, "text": e.text, "cx": e.cx, "cy": e.cy,
              "value_len": e.value_len, "href": e.href,
+             "region": e.region, "host": host_of(e.href),
              "sel": f'[data-jev="{e.idx}"]'}
             for e in elements
         ],

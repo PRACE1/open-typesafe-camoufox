@@ -24,9 +24,13 @@ from dataclasses import dataclass
 import httpx
 
 from .capability.jev_actions import _mask, _resolve_placeholders
+from .decide import Kind
+from .deps import ElementRef
+from .perception import host_of
 
 __all__ = [
-    "WriterText", "WriterUrl", "compose_text", "propose_url",
+    "WriterText", "WriterUrl", "ProposedAction",
+    "compose_text", "propose_url", "propose_action",
     "validate_url", "_mask", "_resolve_placeholders",
 ]
 
@@ -154,3 +158,123 @@ async def propose_url(*, task: str, history: list[str]) -> WriterUrl:
     if not bool(data.get("ok", False)) or not cleaned:
         return WriterUrl(ok=False, url="")
     return WriterUrl(ok=True, url=cleaned)
+
+
+PROPOSE_SYSTEM = (
+    "You propose the single best next browser action. Reply with JSON only: "
+    '{"question": "Should the browser ...?", "kind": "<verb>", '
+    '"item": <element idx or null>, "url": "<absolute https URL or null>", '
+    '"rationale": "<one sentence>"}. '
+    "Verbs: wait, click_item, type_at, press_enter, refresh, close_others, "
+    "goto, done, none. click_item/type_at need a valid item idx from the map; "
+    "goto needs an absolute https url or null; other verbs take item null "
+    "and url null. click_item targets links/buttons only — never propose "
+    "clicking an input/textarea/select (those are typed via type_at). "
+    "Never propose done; completion is decided separately. "
+    "Research tasks complete in the main content region — "
+    "header/nav chrome rarely advances the task once results show. "
+    "Never propose typing credentials; credential fields are handled separately."
+)
+
+
+@dataclass
+class ProposedAction:
+    """One LLM-proposed candidate + the yes/no question the Noul answers."""
+
+    question: str
+    kind: str
+    item: int | None
+    url: str | None
+    rationale: str
+
+
+def _element_line(e: ElementRef) -> str:
+    label = e.label or e.placeholder or e.text or e.id or "?"
+    bits = f"[{e.idx}] {e.kind} \"{label}\""
+    if e.kind == "link" and e.href:
+        host = host_of(e.href)
+        if host:
+            bits += f" -> {host}"
+    if e.region:
+        bits += f" [{e.region}]"
+    if e.kind in ("input", "textarea", "select") or e.type:
+        bits += " filled" if e.value_len else " empty"
+    if e.href and not (e.kind == "link" and host_of(e.href)):
+        bits += f" <{e.href[:60]}>"
+    return bits
+
+
+def summarize_elements(elements: list[ElementRef]) -> str:
+    """Compact map grouped by kind so the proposer grounds idx to kind.
+
+    Links, inputs, and buttons read as separate sections — a flat list lets
+    the model attach a button's description to an input's idx (seen live).
+    """
+    groups: dict[str, list[str]] = {"link": [], "input": [], "button": []}
+    other: list[str] = []
+    for e in elements[:60]:
+        line = _element_line(e)
+        if e.kind in groups:
+            groups[e.kind].append(line)
+        elif e.kind in ("textarea", "select"):
+            groups["input"].append(line)
+        else:
+            other.append(line)
+    sections = []
+    for name in ("link", "input", "button"):
+        if groups[name]:
+            sections.append(f"{name.upper()}S:\n" + "\n".join(groups[name]))
+    if other:
+        sections.append("OTHER:\n" + "\n".join(other))
+    return "\n".join(sections)
+
+
+async def propose_action(*, task: str, url: str, elements: list[ElementRef],
+                         page_text: str, history: list[str],
+                         notes: list[str]) -> ProposedAction | None:
+    """Ask the small model for the single best next action as a yes/no question.
+
+    Returns None when there is nothing to propose from (no key, no elements,
+    model failure, or an invalid reply) — the caller then falls back to the
+    Choice classification alone.
+    """
+    if not elements:
+        return None
+    user = (
+        f"TASK: {task}\nURL: {url}\n"
+        f"ELEMENTS (idx kind label -> host [region] state):\n{summarize_elements(elements)}\n"
+        f"PAGE TEXT:\n{(page_text or '').strip()[:600]}\n"
+        f"NOTES:\n" + "\n".join(notes[-4:]) + "\n"
+        f"HISTORY:\n" + "\n".join(history[-6:])
+    )
+    try:
+        data = await _chat_json(PROPOSE_SYSTEM, user)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    kind = data.get("kind", "")
+    if kind not in {k.value for k in Kind}:
+        return None
+    question = data.get("question", "")
+    if not isinstance(question, str) or not question.strip() or len(question) > 300:
+        return None
+    item = data.get("item", None)
+    if item is not None:
+        try:
+            item = int(item)
+        except (ValueError, TypeError):
+            return None
+        if item < 0:
+            return None
+    raw_url = data.get("url", None)
+    cleaned_url = validate_url(raw_url) if raw_url is not None else None
+    if raw_url is not None and cleaned_url is None and kind == "goto":
+        return None
+    return ProposedAction(
+        question=question.strip(),
+        kind=kind,
+        item=item,
+        url=cleaned_url,
+        rationale=str(data.get("rationale", ""))[:200],
+    )

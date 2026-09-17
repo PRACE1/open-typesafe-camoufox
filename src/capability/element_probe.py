@@ -57,6 +57,18 @@ ELEMENT_PROBE_JS = """
     if (tag === 'a' && el.getAttribute) {
       elHref = String(el.getAttribute('href') || '').slice(0, 160);
     }
+    // Region: nearest landmark (header/nav/main/footer + ARIA roles) so the
+    // decider can tell page chrome from main content. Research results live
+    // in main; the search box and nav links live in header/nav.
+    let elRegion = '';
+    try {
+      const landmark = el.closest('header,footer,main,nav,[role="banner"],[role="navigation"],[role="main"],[role="contentinfo"]');
+      if (landmark) {
+        const lt = (landmark.tagName || '').toLowerCase();
+        const lr = landmark.getAttribute ? String(landmark.getAttribute('role') || '') : '';
+        elRegion = (lr || lt).slice(0, 24);
+      }
+    } catch (e) { elRegion = ''; }
     // Links with no own text (icon/title wrapped in headings): fall back to
     // the nearest heading text so results stay choosable instead of "?".
     if (tag === 'a' && !elText) {
@@ -75,6 +87,7 @@ ELEMENT_PROBE_JS = """
       value: elVal,
       value_len: elVal.length,
       href: elHref,
+      region: elRegion,
       cx: Math.round((r.left + r.width / 2) / vw * 1000) / 1000,
       cy: Math.round((r.top + r.height / 2) / vh * 1000) / 1000,
     });
@@ -94,6 +107,7 @@ ELEMENT_PROBE_JS = """
       value: o.value,
       value_len: o.value_len,
       href: o.href,
+      region: o.region,
       doc_top: o.doc_top,
       cx: o.cx,
       cy: o.cy,

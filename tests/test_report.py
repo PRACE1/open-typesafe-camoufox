@@ -77,3 +77,30 @@ def test_load_lessons_bounded_and_missing(tmp_path):
     short = load_lessons(str(tmp_path), limit=8)
     assert len(short) <= 8 and short.startswith("line1")
     assert load_lessons(str(tmp_path / "nope")) == ""
+
+
+def test_write_wire_jsonl_roundtrip(tmp_path):
+    from src.report import write_wire as _ww
+    import json as _json
+    p = _ww(str(tmp_path), {"n": 1, "url": "https://a.example/",
+                            "elements": [{"idx": 0, "kind": "link"}],
+                            "decide": "click_item conf=0.90"})
+    lines = open(p, encoding="utf-8").read().strip().split("\n")
+    assert len(lines) == 1
+    row = _json.loads(lines[0])
+    assert row["n"] == 1 and row["elements"][0]["kind"] == "link"
+    _ww(str(tmp_path), {"n": 2})
+    assert len(open(p, encoding="utf-8").read().strip().split("\n")) == 2
+
+
+def test_payload_writes_parseable_sections(tmp_path):
+    import json as _json
+    state = {"task": "t", "elements": [{"idx": i} for i in range(60)]}
+    questions = {"kind": {"type": "choice", "criteria": {str(i): {"label": f"l{i}"} for i in range(60)}}}
+    p = write_payload_txt(str(tmp_path), 1, state, questions, "done")
+    body = open(p, encoding="utf-8").read()
+    st = _json.loads(body.split("=== step 1 state ===")[1].split("=== questions (criteria) ===")[0])
+    assert len(st["elements"]) == 60
+    q = _json.loads(body.split("=== questions (criteria) ===")[1].split("=== decision ===")[0])
+    assert len(q["kind"]["criteria"]) == 60
+    assert q["kind"]["type"] == "choice"

@@ -88,10 +88,10 @@ def write_payload_txt(run_dir: str, n: int, state: dict[str, Any],
     path = os.path.join(run_dir, f"step-{n:02d}-payload.txt")
     lines = [
         f"=== step {n} state ===",
-        json.dumps(state, ensure_ascii=False, indent=1)[:12000],
+        json.dumps(state, ensure_ascii=False, indent=1),
         "",
         "=== questions (criteria) ===",
-        json.dumps(questions, ensure_ascii=False, indent=1)[:12000],
+        json.dumps(questions, ensure_ascii=False, indent=1),
         "",
         "=== decision ===",
         decision,
@@ -111,6 +111,21 @@ def write_answers_json(run_dir: str, n: int, raw: dict[str, Any]) -> str:
 def append_transcript(run_dir: str, entry: dict) -> None:
     with open(os.path.join(run_dir, "transcript.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def write_wire(run_dir: str, wire: dict[str, Any]) -> str:
+    """Append one normalized wire record per step (wire.jsonl).
+
+    The machine-readable twin of the human feed: normalized URL, tabs,
+    full element map (idx/kind/label/text/value/href/region/host/sel/coords),
+    focused field, page text, decision + Nouls + progress, action, result,
+    phases, notes, visited. Grep-able and replayable offline without parsing
+    the annotated payload dumps.
+    """
+    path = os.path.join(run_dir, "wire.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(wire, ensure_ascii=False) + "\n")
+    return path
 
 
 def write_cursor(run_dir: str, cursor: dict) -> str:

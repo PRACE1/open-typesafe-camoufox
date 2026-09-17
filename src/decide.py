@@ -29,7 +29,7 @@ from typing import Any
 import httpx
 
 from .deps import ElementRef, FocusedField
-from .perception import build_state, norm_url
+from .perception import build_state, host_of, norm_url
 
 
 class Kind(str, Enum):
@@ -87,7 +87,9 @@ KIND_INSTRUCTIONS = {
     "question": "Which single action advances the TASK?",
     "focus": "The options are mutually exclusive: pick exactly one. "
              "If the page is still loading, picking anything other than "
-             "wait/none is wrong.",
+             "wait/none is wrong. Research tasks are completed in the main "
+             "content region: header/nav chrome (search box, nav links) "
+             "rarely advances the task once results are showing.",
 }
 
 MIN_CONFIDENCE = 0.4
@@ -106,6 +108,8 @@ class JevDecision:
     page_ready: float = 0.0
     needs_text: float = 0.0
     task_done: float = 0.0
+    # Approval Noul on the LLM-posed question (0.0 when none was posed).
+    approval: float = 0.0
     # Score: position on the task-completion spectrum (0..1).
     progress: float = 0.0
     raw: dict = field(default_factory=dict)
@@ -154,6 +158,8 @@ def _item_option(e: ElementRef, visited: set[str]) -> dict[str, Any]:
         "type": e.type,
         "text": e.text,
         "href": e.href,
+        "host": host_of(e.href),
+        "region": e.region,
         "state": state,
         "at": f"{e.cx:.3f},{e.cy:.3f}",
         "sel": f'[data-jev="{e.idx}"]',
@@ -162,7 +168,8 @@ def _item_option(e: ElementRef, visited: set[str]) -> dict[str, Any]:
 
 
 def build_questions(elements: list[ElementRef], sites: list[str],
-                    visited: list[str] | None = None) -> dict[str, Any]:
+                    visited: list[str] | None = None,
+                    approval_question: str | dict | None = None) -> dict[str, Any]:
     """Three Choices plus three Noul flags plus one progress Score.
 
     Nouls flag situations needing a decision alongside the verb choice:
@@ -179,7 +186,7 @@ def build_questions(elements: list[ElementRef], sites: list[str],
         "what": "A different URL the writer proposes from the task",
         "not_for": "Any listed URL",
     }
-    return {
+    questions: dict[str, Any] = {
         "kind": {
             "type": "choice",
             "instructions": KIND_INSTRUCTIONS,
@@ -243,6 +250,16 @@ def build_questions(elements: list[ElementRef], sites: list[str],
             ],
         },
     }
+    if approval_question:
+        questions["approval"] = {
+            "type": "noul",
+            "instructions": approval_question,
+            "criteria": {
+                "true": "Yes — take the proposed action now",
+                "false": "No — the proposal is wrong or premature",
+            },
+        }
+    return questions
 
 
 def _decode(decision_raw: dict, elements: list[ElementRef], sites: list[str]) -> JevDecision:
@@ -297,7 +314,8 @@ def _decode(decision_raw: dict, elements: list[ElementRef], sites: list[str]) ->
         propose_url=propose_url,
         confidence=min(max(confidence, 0.0), 1.0),
         page_ready=_noul("page_ready"), needs_text=_noul("needs_text"),
-        task_done=_noul("task_done"), progress=progress, raw=decision_raw,
+        task_done=_noul("task_done"), approval=_noul("approval"),
+        progress=progress, raw=decision_raw,
     )
 
 
@@ -316,6 +334,7 @@ async def decide_action(
     notes: list[str] | None = None,
     visited: list[str] | None = None,
     lessons: str = "",
+    approval_question: str | dict | None = None,
     timeout_s: float = 30.0,
 ) -> JevDecision:
     """One Jev request -> the single next action (+ confidence)."""
@@ -334,7 +353,7 @@ async def decide_action(
     payload: dict[str, Any] = {
         "model": model,
         "state": state,
-        "questions": build_questions(elements, sites, visited),
+        "questions": build_questions(elements, sites, visited, approval_question),
     }
     data = await _post(payload, timeout_s, base, key)
     return _decode(data, elements, sites)

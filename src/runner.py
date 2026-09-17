@@ -21,6 +21,8 @@ import asyncio
 import os
 import re
 import time
+import urllib.parse
+from dataclasses import replace
 from datetime import datetime
 from enum import Enum
 
@@ -30,7 +32,7 @@ from .capability.human_move import HUMANIZE_LEVEL
 from .decide import Kind, decide_action
 from .deps import RunState
 from .perception import is_credential_element
-from .writer import compose_text, propose_url
+from .writer import ProposedAction, compose_text, propose_action, propose_url
 
 _LOADING_RE = re.compile(r"looking for results|loading|^\\s*$", re.IGNORECASE)
 
@@ -61,6 +63,68 @@ def loop_guard_trip(last_sig: tuple | None, run: int, sig: tuple) -> tuple[bool,
     """
     run = run + 1 if sig == last_sig else 1
     return run >= 3, run
+
+
+APPROVAL_MIN = 0.5
+OVERRIDABLE_KINDS = ("click_item", "type_at", "goto")
+# Bare-clicking a text field never advances anything (no navigation, no state
+# change — focusing happens inside type_at). Five straight runs fixated on the
+# search box this way, so the runner vetoes it outright.
+BARE_CLICK_VETO_KINDS = ("input", "textarea", "select")
+# Kinds whose lack of observable effect means failure. type_at is excluded
+# on purpose: typing never changes body text, so every type would read as
+# "no effect" (repeat-typing is the loop-guard's job, and clear-before-type
+# keeps retypes idempotent).
+EFFECT_KINDS = ("click_item", "press_enter", "refresh")
+
+
+def proposal_executable(proposed: ProposedAction | None, elements: list) -> bool:
+    """True when an LLM-proposed candidate is safe to execute on approval.
+
+    click_item needs a live, non-input idx (bare input clicks are vetoed
+    downstream anyway — rejecting here keeps a misgrounded proposal from
+    overriding a sound Choice); type_at needs an input-ish idx; goto needs
+    nothing more (a missing URL falls through to the writer-proposal branch).
+    All other kinds stay on the Choice path.
+    """
+    if proposed is None or proposed.kind not in OVERRIDABLE_KINDS:
+        return False
+    by_idx = {e.idx: e for e in elements}
+    if proposed.kind == "click_item":
+        return (proposed.item is not None and proposed.item in by_idx
+                and by_idx[proposed.item].kind not in BARE_CLICK_VETO_KINDS)
+    if proposed.kind == "type_at":
+        return (proposed.item is not None and proposed.item in by_idx
+                and by_idx[proposed.item].kind in ("input", "textarea", "select"))
+    return True  # goto
+
+
+def should_override(*, approval: float, proposed: ProposedAction | None,
+                    choice_kind: str, choice_item: int | None,
+                    executable: bool) -> bool:
+    """True when an LLM proposal should execute over a differing Choice vote.
+
+    Agreement needs no override (the normal path runs). On disagreement a
+    lean-yes (0.5) for the reasoning mind wins: it read every element, host,
+    region, and note, while the classifier has a demonstrated fixation mode
+    (five runs of search-box clicks at 0.7+). Guard, gate-on-agreement, and
+    no-effect rails bound a wrong override to ~one wasted step.
+    """
+    if proposed is None or not executable:
+        return False
+    if (proposed.kind, proposed.item) == (choice_kind, choice_item):
+        return False
+    return approval >= APPROVAL_MIN
+
+
+def fresh_tabs(known: set[int], current: set[int]) -> set[int]:
+    """Tabs the loop hasn't adopted yet (SEE-time reconciliation).
+
+    click_item adopts 0.7s after its click, but slow popups register later.
+    Any tab unknown at SEE time gets adopted so perception never strands on
+    a stale tab while a fresh result sits unopened beside it.
+    """
+    return current - known
 
 
 class Phase(str, Enum):
@@ -183,6 +247,7 @@ async def run_decide_session(
     prev_fp: tuple | None = None
     dead_run = 0
     last_effect_kind: str | None = None
+    known_tab_ids: set[int] = set()
     phase_trail: list[str] = []
     steer_consumed = 0
     started = datetime.now().isoformat(timespec="seconds")
@@ -200,6 +265,7 @@ async def run_decide_session(
             await platform.reinject_tracker()
         await platform.start_cursor_tracking()
         log(f"tracker selftest: {'PASS' if await platform.cursor_selftest() else 'WARN — cursor.json may be incomplete'}")
+        known_tab_ids = platform.tab_ids()
 
         while time.time() < t_end and steps < max_steps and not done and not stopped:
             if paused:
@@ -216,6 +282,20 @@ async def run_decide_session(
             )
 
             # SEE
+            n_tabs = await platform.tab_count()
+            # SEE-time reconciliation: click_item adopts 0.7s after its
+            # click, but slow popups register later. Adopt anything unknown
+            # now so perception reads the fresh result, not a stale tab.
+            current_ids = platform.tab_ids()
+            if known_tab_ids and fresh_tabs(known_tab_ids, current_ids):
+                fresh_url = await platform.adopt_new_tab(known_tab_ids)
+                if fresh_url:
+                    msg = f"step {steps}: adopted slow popup — {fresh_url}"
+                    log(f"TABS   {msg}")
+                    history.append(msg)
+                    entry.setdefault("tabs", []).append(f"adopted {fresh_url}")
+            known_tab_ids = platform.tab_ids()
+            page = platform.page
             try:
                 raw_png = await page.screenshot(type="png")
             except Exception as exc:
@@ -229,6 +309,13 @@ async def run_decide_session(
             focused = await perception.get_focused_field(platform)
             page_text = await perception.get_page_text(platform)
             n_tabs = await platform.tab_count()
+            try:
+                page_host = urllib.parse.urlparse(page.url).netloc.lower()
+            except ValueError:
+                page_host = ""
+            n_links = sum(1 for e in elements if e.kind == "link")
+            n_ext = sum(1 for e in elements
+                        if e.kind == "link" and (h := perception.host_of(e.href)) and h != page_host)
             # READ + remember: first settled sighting of a page banks an
             # extractive note (survives the history window across 40-50 steps).
             norm = perception.norm_url(page.url)
@@ -246,7 +333,7 @@ async def run_decide_session(
             state.history = list(history)
             report_mod.write_raw_png(run_dir, steps, raw_png)
             see_line = (
-                f"{len(elements)} elements · tabs={n_tabs} · focused={focused.role or '-'}"
+                f"{len(elements)} elements ({n_links} links, {n_ext} external) · tabs={n_tabs} · focused={focused.role or '-'}"
                 f"{' (credential)' if focused.is_credential else ''} · "
                 f"text={len(page_text.strip())}ch"
             )
@@ -287,6 +374,41 @@ async def run_decide_session(
                 await asyncio.sleep(interval)
                 continue
 
+            # PROPOSE: the small model reads every element + URL and poses
+            # the single best next action as a yes/no question. Jev answers
+            # it as the approval Noul below — LLM reasons, Noul confirms.
+            # The question is wrapped with the candidate + rationale as
+            # structured supporting data (docs: structure sharpens Nouls).
+            proposed = None
+            approval_struct: dict | str | None = None
+            try:
+                proposed = await propose_action(
+                    task=effective_task, url=page.url, elements=elements,
+                    page_text=page_text, history=history, notes=notes,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log(f"PROPOSE failed ({exc.__class__.__name__})")
+            if proposed is not None:
+                log(f"PROPOSE {proposed.kind}"
+                    + (f" #{proposed.item}" if proposed.item is not None else "")
+                    + (f" {proposed.url}" if proposed.url else "")
+                    + f" : {proposed.rationale[:100]}")
+                entry["propose"] = (
+                    f"{proposed.kind} #{proposed.item} : {proposed.rationale[:100]}"
+                )
+                approval_struct = {
+                    "question": proposed.question,
+                    "candidate": {
+                        "kind": proposed.kind,
+                        "item": proposed.item,
+                        "url": proposed.url,
+                    },
+                    "rationale": proposed.rationale,
+                    "focus": "Answer YES only if this exact action is the best "
+                             "next step toward the TASK; answer NO if any other "
+                             "action (including waiting) serves the task better.",
+                }
+
             # DECIDE
             try:
                 decision = await decide_action(
@@ -294,6 +416,7 @@ async def run_decide_session(
                     elements=elements, focused=focused, page_text=page_text,
                     history=history, tabs=n_tabs, notes=notes, visited=visited,
                     lessons=lessons,
+                    approval_question=approval_struct,
                 )
             except Exception as exc:
                 log(f"DECIDE failed ({exc.__class__.__name__}); idling this step")
@@ -317,7 +440,8 @@ async def run_decide_session(
                 + (f" item=#{decision.element_idx}" if decision.element_idx is not None else "")
                 + (f" site={decision.target_url or 'other...'}" if decision.kind == Kind.GOTO else "")
                 + f" | ready={decision.page_ready:.2f} text?={decision.needs_text:.2f}"
-                + f" done?={decision.task_done:.2f} prog={decision.progress:.2f}")
+                + f" done?={decision.task_done:.2f} prog={decision.progress:.2f}"
+                + f" appr={decision.approval:.2f}")
             entry["decide"] = (
                 f"{decision.kind.value} conf={conf:.2f} "
                 f"item={decision.element_idx} site={decision.target_url or ('other' if decision.propose_url else None)}"
@@ -326,9 +450,32 @@ async def run_decide_session(
                 "ready": round(decision.page_ready, 2),
                 "text?": round(decision.needs_text, 2),
                 "done?": round(decision.task_done, 2),
+                "approve": round(decision.approval, 2),
             }
             entry["progress"] = round(decision.progress, 2)
             entry["think"] = entry["decide"]
+            # Approval override: the LLM reasoned over all elements + URLs
+            # and the Noul leans yes on a DIFFERENT target than the Choice
+            # vote — execute the proposal. Agreement runs the normal path.
+            if should_override(approval=decision.approval, proposed=proposed,
+                               choice_kind=decision.kind.value,
+                               choice_item=decision.element_idx,
+                               executable=proposal_executable(proposed, elements)):
+                log(f"APPROVED {proposed.kind}"
+                    + (f" #{proposed.item}" if proposed.item is not None else "")
+                    + f" (approval={decision.approval:.2f}) — executing proposal over Choice")
+                history.append(f"step {steps}: approved proposal — {proposed.rationale[:100]}")
+                entry["decide"] += " [approved-override]"
+                decision = replace(
+                    decision,
+                    kind=Kind(proposed.kind),
+                    element_idx=proposed.item
+                    if proposed.kind in ("click_item", "type_at") else None,
+                    target_url=proposed.url if proposed.kind == "goto" else None,
+                    propose_url=proposed.kind == "goto" and proposed.url is None,
+                    confidence=max(decision.confidence, decision.approval),
+                )
+                conf = decision.confidence
             report_mod.write_answers_json(run_dir, steps, decision.raw)
 
             # Loop-guard: the tab, clear, and click systems all report into
@@ -452,16 +599,25 @@ async def run_decide_session(
                     entry["act"] = f"{decision.kind.value} (no item)"
                     noops += 1
                 elif decision.kind == Kind.CLICK_ITEM:
-                    log(f"ACT    element #{idx} (scroll+circle+click)")
-                    res = await click_item(platform, elements, idx)
-                    log(f"RESULT {res}")
-                    entry["act"] = f"element #{idx} click"
-                    entry["result"] = res
-                    history.append(f"step {steps}: clicked element #{idx} — {res}")
-                    moves += 1
-                    noops = 0
-                    acted = True
-                    last_effect_kind = "click_item"
+                    target = by_idx[idx]
+                    if target.kind in BARE_CLICK_VETO_KINDS:
+                        msg = (f"step {steps}: vetoed bare click on {target.kind} #{idx} — "
+                               "text fields are typed (type_at), never bare-clicked")
+                        log(f"VETO   {msg}")
+                        history.append(msg)
+                        entry["act"] = f"click vetoed ({target.kind} #{idx})"
+                        noops += 1
+                    else:
+                        log(f"ACT    element #{idx} (scroll+circle+click)")
+                        res = await click_item(platform, elements, idx)
+                        log(f"RESULT {res}")
+                        entry["act"] = f"element #{idx} click"
+                        entry["result"] = res
+                        history.append(f"step {steps}: clicked element #{idx} — {res}")
+                        moves += 1
+                        noops = 0
+                        acted = True
+                        last_effect_kind = "click_item"
                 else:  # TYPE_AT
                     elem = by_idx[idx]
                     label = elem.label or elem.placeholder or elem.text or elem.id or f"element #{idx}"
@@ -533,13 +689,39 @@ async def run_decide_session(
                 chosen_idx=decision.element_idx, focused_frame=focused.frame or None,
             )
             report_mod.write_payload_txt(
-                run_dir, steps, state_packet, build_questions(elements, sites),
+                run_dir, steps, state_packet, build_questions(elements, sites, visited),
                 f"{decision.kind.value} conf={decision.confidence:.2f} "
                 f"item={decision.element_idx} "
                 f"ready={decision.page_ready:.2f} text?={decision.needs_text:.2f} "
-                f"done?={decision.task_done:.2f} prog={decision.progress:.2f}",
+                f"done?={decision.task_done:.2f} prog={decision.progress:.2f} "
+                f"appr={decision.approval:.2f}",
             )
             entry["phases"] = list(phase_trail)
+            report_mod.write_wire(run_dir, {
+                "n": steps, "t": entry.get("t"), "url": page.url, "tabs": n_tabs,
+                "see": entry.get("see"), "decide": entry.get("decide"),
+                "nouls": entry.get("nouls"), "progress": entry.get("progress"),
+                "act": entry.get("act"), "result": entry.get("result"),
+                "phases": entry.get("phases"),
+                "focused": {
+                    "role": focused.role, "label": focused.label,
+                    "placeholder": focused.placeholder,
+                    "value_len": len(focused.value),
+                    "is_credential": focused.is_credential,
+                },
+                "page_text": page_text,
+                "elements": [
+                    {"idx": e.idx, "kind": e.kind, "type": e.type,
+                     "label": e.label, "placeholder": e.placeholder,
+                     "text": e.text, "value_len": e.value_len,
+                     "href": e.href, "region": e.region,
+                     "host": perception.host_of(e.href),
+                     "sel": f'[data-jev="{e.idx}"]',
+                     "cx": e.cx, "cy": e.cy}
+                    for e in elements
+                ],
+                "notes": notes, "visited": visited,
+            })
             report_mod.append_transcript(run_dir, entry)
 
             # VERIFY: fingerprint the step's outcome and evaluate the stop
@@ -552,7 +734,7 @@ async def run_decide_session(
                 phase_step(phase_trail, Phase.VERIFY)
             fp = perception.page_fingerprint(page.url, page_text)
             if (prev_fp is not None and fp == prev_fp and page_settled(page_text)
-                    and last_effect_kind in ("click_item", "type_at", "press_enter", "refresh")):
+                    and last_effect_kind in EFFECT_KINDS):
                 dead_run += 1
                 history.append(f"step {steps}: no observable effect from {last_effect_kind} x{dead_run}")
                 log(f"NOEFFECT {last_effect_kind} changed nothing x{dead_run}")
@@ -564,7 +746,7 @@ async def run_decide_session(
                 dead_run = 0
             prev_fp = fp
 
-            if noops >= 2 and not done:
+            if noops >= 2 and not done and not stopped:
                 stopped = True
                 stop_reason = "two consecutive no-ops"
                 phase_step(phase_trail, Phase.STOPPED)

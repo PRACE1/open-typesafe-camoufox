@@ -973,13 +973,15 @@ async def run_decide_session(
                         res = await click_item(platform, elements, idx,
                                                      expected_kind=by_idx[idx].kind)
                         log(f"RESULT {res}")
-                        # Self-healing retry: a stale map or covered target
-                        # detours ACT -> HEAL -> ACT for exactly one re-attempt
-                        # (remapped by label), else ACT -> HEAL -> VERIFY.
-                        # Jev triages the failure first; the runner executes
-                        # the strategy (remap / dismiss / challenge / abort).
+                        # Self-healing retry: a stale map, covered target, or
+                        # vanished box detours ACT -> HEAL -> ACT for exactly
+                        # one re-attempt (remapped by aria/selector/label),
+                        # else ACT -> HEAL -> VERIFY. Jev triages the failure
+                        # first; the runner executes the strategy (remap /
+                        # dismiss / challenge / abort).
                         if action_failed(res) and ("stale map" in res
-                                                   or "target covered" in res):
+                                                   or "target covered" in res
+                                                   or "has no bounding box" in res):
                             old_label = (target.label or target.placeholder
                                          or target.text or target.id or "")
                             log(f"HEAL   {res[:90]} — triaging")

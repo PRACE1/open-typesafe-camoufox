@@ -422,6 +422,37 @@ def test_remap_prefers_aria_ref():
     assert _remap_idx(fresh, "Old label", "link", None, "e99") is None
 
 
+def test_confirm_aria_ref_ok_stale_unknown(monkeypatch):
+    from src.actions import _confirm_aria_ref
+    import src.actions as _actions_mod
+
+    live = [_el(0, kind="div", label="Other")]
+    live[0].aria = "e25"
+    same = [_el(0, kind="link", label="More")]
+    same[0].aria = "e25"
+    old = _aria_el()
+    old.aria = "e25"
+
+    async def _find(platform):
+        return _FIND
+
+    _FIND = same
+    monkeypatch.setattr(_actions_mod, "find_elements", _find)
+    assert _run(_confirm_aria_ref(_FakePlatform2(_FakePage2()), old)) == "ok"
+
+    _FIND = live
+    assert _run(_confirm_aria_ref(_FakePlatform2(_FakePage2()), old)) == "stale"
+
+    _FIND = [_el(0)]
+    assert _run(_confirm_aria_ref(_FakePlatform2(_FakePage2()), old)) == "unknown"
+
+    async def _boom(platform):
+        raise RuntimeError("no page")
+
+    monkeypatch.setattr(_actions_mod, "find_elements", _boom)
+    assert _run(_confirm_aria_ref(_FakePlatform2(_FakePage2()), old)) == "unknown"
+
+
 class _FakeAriaLocator:
     def __init__(self, count=1, box=None, ident=None, fail=None,
                  self_hit=False):
@@ -516,6 +547,21 @@ def test_verified_center_self_hit_short_circuits(monkeypatch):
     px, py, verdict, live = _run(_verified_center(
         _FakePlatform(pg), [old], 1))
     assert verdict == "hit" and (px, py) == (60, 60)
+
+
+def test_verified_center_self_hit_never_overrides_stale(monkeypatch):
+    import src.actions as _actions_mod
+
+    async def _stale_hit(platform, elements, idx):
+        return {"status": "stale",
+                "box": {"x": 10, "y": 40, "width": 100, "height": 40},
+                "element": None, "live_kind": "link",
+                "live_label": "Other", "self_hit": True}
+
+    monkeypatch.setattr(_actions_mod, "_resolve_target", _stale_hit)
+    pg = _FakePage(point="hit")
+    old = _el(1, kind="input", label="Search")
+    assert _run(_verified_center(_FakePlatform(pg), [old], 1))[2] == "stale:link"
 
 
 def test_resolve_by_aria_ref_prefers_role_over_tag(monkeypatch):

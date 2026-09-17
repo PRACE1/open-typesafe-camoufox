@@ -313,6 +313,33 @@ async def _resolve_by_selector(platform, sel: str) -> dict | None:
             "kind": kind, "label": label}
 
 
+async def _confirm_aria_ref(platform, old: ElementRef) -> str:
+    """Confirm a disputed aria ref against a fresh snapshot.
+
+    Locator identity can phantom during hydration (a ref briefly resolving
+    to a sibling while the anchor re-renders). The snapshot is the cheaper
+    authority: same ref present with compatible kind/label means the node
+    is alive and well — "ok". Present but incompatible — "stale". Absent —
+    "unknown" (fall through to the selector/nth tiers).
+
+    Returns "ok", "stale", or "unknown". Pure lookup.
+    """
+    try:
+        fresh = await find_elements(platform)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    node = next((e for e in fresh if e.aria == old.aria), None)
+    if node is None:
+        return "unknown"
+    same_kind = _kinds_compatible(old.kind, node.kind)
+    same_label = _labels_compatible(
+        old.label or old.placeholder or old.text or old.id or "",
+        node.label or node.placeholder or node.text or node.id or "")
+    if same_kind and same_label:
+        return "ok"
+    return "stale"
+
+
 async def _resolve_target(platform, elements: list[ElementRef],
                           idx: int) -> dict:
     """Resolve positional idx to its live element across tiers.
@@ -345,7 +372,8 @@ async def _resolve_target(platform, elements: list[ElementRef],
     # Tier 0 — native identity: the same a11y node regardless of DOM order.
     # Kind is strict up to vocabulary (role-mapped vs tag); labels are
     # lenient (node identity is already strong, hydration text drift must
-    # not veto).
+    # not veto). A disagreeing locator is confirmed against a fresh
+    # snapshot before it may refuse (hydration phantoms).
     if old.aria:
         hit = await _resolve_by_aria_ref(platform, old.aria)
         if hit is not None:
@@ -356,6 +384,11 @@ async def _resolve_target(platform, elements: list[ElementRef],
                     old.label or old.placeholder or old.text or old.id or "",
                     hit["label"]):
                 return {"status": "ok", **info}
+            confirmed = await _confirm_aria_ref(platform, old)
+            if confirmed == "ok":
+                return {"status": "ok", **info}
+            if confirmed == "stale":
+                return {"status": "stale", **info}
             _stale(info)
     if old.sel:
         hit = await _resolve_by_selector(platform, old.sel)
@@ -422,9 +455,10 @@ async def _verified_center(platform, elements: list[ElementRef], idx: int,
     clickable cover (anchor/button), else the last verdict seen. A shifted
     map reports stale (no dispatch); a missing slot reports gone.
     Compatible granularity drift (input vs textarea for one widget) is
-    verified against the LIVE identity instead of refused. A resolver
+    verified against the LIVE identity instead of refused. An ok resolver
     self-hit (the node itself under its center) returns hit immediately —
     vocabulary drift in sampled point checks cannot false-cover it.
+    (Self-hit never overrides a stale verdict.)
     """
     page = platform.page
     vp = page.viewport_size or {"width": 1280, "height": 800}
@@ -434,7 +468,7 @@ async def _verified_center(platform, elements: list[ElementRef], idx: int,
         if res["status"] == "gone" or res["box"] is None:
             last = (None, None, "gone", "")
             continue
-        if res.get("self_hit"):
+        if res["status"] == "ok" and res.get("self_hit"):
             box = res["box"]
             cx = box["x"] + box["width"] / 2
             cy = box["y"] + box["height"] / 2

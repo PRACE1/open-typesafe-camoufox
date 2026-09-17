@@ -1,0 +1,28 @@
+{
+  "name": "open-typesafe-camoufox",
+  "version": "1.0.0",
+  "description": "A CLI tool that drives a headed Camoufox browser toward a goal you type in plain English — for about $0.0002 a step. It never sends a screenshot to a big model. Instead it reads the page deterministically, asks a small classifier which action comes next, and only calls a writing model when a text field genuinely needs free text.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matthewdonsemail-lab/open-typesafe-camoufox.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/matthewdonsemail-lab/open-typesafe-camoufox/issues"
+  },
+  "homepage": "https://github.com/matthewdonsemail-lab/open-typesafe-camoufox#readme",
+  "devDependencies": {
+    "lefthook": "^2.1.14"
+  }
+}

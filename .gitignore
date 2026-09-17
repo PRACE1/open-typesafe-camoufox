@@ -8,3 +8,4 @@ output/
 runs/
 *.cap
 cursor.json
+node_modules/

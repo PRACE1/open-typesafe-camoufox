@@ -1,0 +1,14 @@
+# lefthook — Jev-backed git hooks. Install once per clone: npx lefthook install
+# Bypass: JEV_HOOKS_OFF=1 (any hook) or git push --no-verify (pre-push).
+
+pre-commit:
+  commands:
+    jev-map:
+      # Classify/map staged Python files. Advisory (always passes).
+      run: uv run python scripts/jev_hooks.py pre-commit
+
+pre-push:
+  commands:
+    jev-rank:
+      # Rank pushed Python files by Jev issue score. Blocks on >= 0.75.
+      run: uv run python scripts/jev_hooks.py pre-push

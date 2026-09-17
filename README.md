@@ -236,10 +236,12 @@ src/
 uv run python -m pytest -q
 ```
 
-Git hooks (Jev-backed, see `scripts/jev_hooks.py` + `docs/LIBRARIES.md`):
+Git hooks via [lefthook](https://github.com/evilmartians/lefthook)
+(`lefthook.yml`, Jev-backed — see `scripts/jev_hooks.py` + `docs/LIBRARIES.md`):
 
-```powershell
-scripts/install-hooks.ps1   # pre-commit maps staged files, pre-push ranks by issues
+```bash
+npm install          # one-time: provides the lefthook binary
+npx lefthook install # one-time per clone: wires .git/hooks
 ```
 
 - `pre-commit` classifies/maps staged `.py` files (advisory; `--strict` to block).

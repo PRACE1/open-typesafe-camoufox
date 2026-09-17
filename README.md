@@ -132,7 +132,9 @@ auto-adopted (harvest old buffer, bind the new page, restart the tracker)
 so the next step reads the new content instead of re-clicking; `refresh`
 reloads a stale tab and `close_others` trims tabs while always keeping the
 current tab and its opener (a click-opened popup dies with its opener in
-this build — verified live). A tab switch starts a 4-step reading cooldown:
+this build — verified live). Nav listeners are generation-guarded: after an
+adoption, events from stale tabs are ignored so a dead tab can't clobber
+the URL bookkeeping or fire tracker recovery on the wrong tab. A tab switch starts a 4-step reading cooldown:
 the fresh tab's DOM is recaptured with a digest immediately, `goto` is
 refused until the cooldown ends, and the proposer is told to read the
 adopted page instead of navigating away.

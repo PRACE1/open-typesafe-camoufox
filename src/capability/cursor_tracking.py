@@ -246,6 +246,12 @@ class CursorTrackingMixin:
         """
 
         def _on_frame_navigated(frame) -> None:
+            # Generation guard: listeners stay attached to old tabs after
+            # adoption, so ignore events from any page that is no longer the
+            # bound one. Without this, a stale tab's late navigation clobbers
+            # _last_url and fires tracker recovery on the WRONG (new) tab.
+            if page is not self._page:
+                return
             # Only the top-level document matters; iframes have their own.
             if frame != page.main_frame:
                 return
@@ -273,6 +279,8 @@ class CursorTrackingMixin:
                 asyncio.ensure_future(self._recover_after_external_nav(new_url))
 
         def _on_response(response) -> None:
+            if page is not self._page:
+                return
             try:
                 request = response.request
                 if request.resource_type != "document" or request.frame != page.main_frame:
@@ -282,6 +290,8 @@ class CursorTrackingMixin:
                 pass
 
         async def _on_dialog(dialog):
+            if page is not self._page:
+                return
             # A JS alert()/confirm() left open blocks ALL CDP input dispatch:
             # page.mouse.move() hangs until the timeout (an empty 'asyncio.
             # TimeoutError' -> 'error moving cursor: ' with no message). Handle

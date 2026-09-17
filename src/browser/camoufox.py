@@ -159,3 +159,140 @@ class CamoufoxPlatform(CursorTrackingMixin, BrowserActionsMixin):
         import urllib.parse
         parsed = urllib.parse.urlparse(self._last_url or "")
         return self._generated_whitelist.get(parsed.path, set()) if self._generated_whitelist else set()
+
+    # -- tabs: new-tab adoption, refresh, close-others (multi-tab caveats) --
+
+    def tab_ids(self) -> set[int]:
+        """Identity set of the context's current tabs (diff before/after click)."""
+        try:
+            return {id(p) for p in self.page.context.pages}
+        except Exception:
+            return set()
+
+    async def tab_count(self) -> int:
+        """Number of open tabs in this browser context."""
+        try:
+            return len(self.page.context.pages)
+        except Exception:
+            return 1
+
+    async def adopt_new_tab(self, before_ids: set[int]) -> str | None:
+        """Adopt the newest tab if the click just opened one. Returns its URL.
+
+        Clicks on links/buttons often land in a fresh tab (target=_blank,
+        popup). Without adoption the loop keeps perceiving the OLD tab and
+        re-clicks the same element forever. Harvests the old document's
+        buffer first, binds the new page, re-registers nav listeners, and
+        restarts the tracker with the original start time so cursor.json
+        stays continuous. None when no new tab appeared.
+        """
+        try:
+            pages = list(self.page.context.pages)
+        except Exception:
+            return None
+        fresh = [p for p in pages if id(p) not in before_ids]
+        if not fresh:
+            return None
+        new_page = fresh[-1]
+        try:
+            await self._harvest_and_accumulate(quiet=True)
+        except Exception as exc:  # noqa: BLE001
+            log(f"[tabs] pre-adopt harvest: {exc}")
+        old_url = self._last_url
+        self._page = new_page
+        try:
+            await new_page.bring_to_front()
+        except Exception:  # noqa: BLE001
+            pass
+        self._last_url = new_page.url
+        try:
+            self._register_nav_listeners(new_page)
+        except Exception as exc:  # noqa: BLE001
+            log(f"[tabs] listener re-register: {exc}")
+        try:
+            await self._restart_tracker_on_new_page()
+        except Exception as exc:  # noqa: BLE001
+            log(f"[tabs] tracker restart: {exc}")
+        log(f"[tabs] adopted new tab ({len(pages)} open): {old_url} -> {new_page.url}")
+        return new_page.url
+
+    async def close_other_tabs(self) -> int:
+        """Close other tabs, keeping the current tab and its opener.
+
+        The opener is kept deliberately: in this build a click-opened popup
+        dies with its opener (verified live — closing example.com killed an
+        adopted example.org tab), so closing it would strand the loop with
+        no live tab. Returns closed count.
+        """
+        try:
+            pages = list(self.page.context.pages)
+        except Exception:
+            return 0
+        me = self._page
+        try:
+            opener = await me.opener()
+        except Exception:  # noqa: BLE001
+            opener = None
+        keep = {id(me)}
+        if opener is not None:
+            keep.add(id(opener))
+        closed = 0
+        for p in pages:
+            if id(p) in keep:
+                continue
+            try:
+                await p.close()
+                closed += 1
+            except Exception as exc:  # noqa: BLE001
+                log(f"[tabs] close failed: {exc}")
+        try:
+            self._last_url = self.page.url
+        except Exception:  # noqa: BLE001
+            pass
+        if closed:
+            kept = " (+opener kept)" if opener is not None else ""
+            log(f"[tabs] closed {closed} other tab(s){kept}; current: {self._last_url}")
+        # An uncommitted popup can die with its opener: if our tab didn't
+        # survive, fall back to the last remaining tab (or report stranded).
+        try:
+            survivors = list(self.page.context.pages)
+        except Exception:  # noqa: BLE001
+            survivors = []
+        if me not in survivors:
+            if survivors:
+                self._page = survivors[-1]
+                self._last_url = self._page.url
+                try:
+                    self._register_nav_listeners(self._page)
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[tabs] listener re-register: {exc}")
+                try:
+                    await self._restart_tracker_on_new_page()
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[tabs] tracker restart: {exc}")
+                log(f"[tabs] current tab died with its opener; fell back to {self._last_url}")
+            else:
+                log("[tabs] WARNING: no surviving tabs after close")
+        return closed
+
+    async def refresh_page(self) -> str:
+        """Reload the current tab (stale/failed content). Harvests first."""
+        async with self._lock:
+            try:
+                await self._harvest_and_accumulate(quiet=True)
+            except Exception as exc:  # noqa: BLE001
+                log(f"[tabs] pre-refresh harvest: {exc}")
+            try:
+                await self.page.reload(wait_until="load", timeout=20000)
+            except Exception as exc:  # noqa: BLE001
+                msg = f"refresh failed: {exc}"
+                log(msg)
+                return msg
+            self._last_url = self.page.url
+            try:
+                await self._restart_tracker_on_new_page()
+            except Exception as exc:  # noqa: BLE001
+                log(f"[tabs] tracker restart after refresh: {exc}")
+            msg = f"refreshed {self._last_url}"
+            log(msg)
+            return msg

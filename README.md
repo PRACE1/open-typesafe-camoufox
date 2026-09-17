@@ -105,7 +105,8 @@ screenshot ─► element map (DOM probe, reading order, data-jev tags)
              one Jev request, three Choices
              ┌───────────────────────────────────────────────┐
              │ kind : wait | click_item | type_at |          │
-             │        press_enter | goto | done | none       │
+             │        press_enter | refresh | close_others | │
+             │        goto | done | none                     │
              │ item : which element idx (click/type targets) │
              │ site : which catalog URL (goto targets)       │
              └───────────────────────────────────────────────┘
@@ -118,7 +119,12 @@ screenshot ─► element map (DOM probe, reading order, data-jev tags)
 `wait` is patience, not doubt: a loading page idles without counting
 toward the stop rule, so the loop can never retype into a transition (the
 old query-accumulation bug is structurally impossible). `done` is accepted
-only on a settled page with real text.
+only on a settled page with real text. Clicks that open a new tab are
+auto-adopted (harvest old buffer, bind the new page, restart the tracker)
+so the next step reads the new content instead of re-clicking; `refresh`
+reloads a stale tab and `close_others` trims tabs while always keeping the
+current tab and its opener (a click-opened popup dies with its opener in
+this build — verified live).
 
 ## Run folder
 

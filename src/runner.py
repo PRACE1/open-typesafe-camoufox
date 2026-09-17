@@ -158,6 +158,7 @@ async def run_decide_session(
             elements = await perception.find_elements(platform)
             focused = await perception.get_focused_field(platform)
             page_text = await perception.get_page_text(platform)
+            n_tabs = await platform.tab_count()
             state.url = page.url
             state.elements = elements
             state.focused = focused
@@ -165,7 +166,7 @@ async def run_decide_session(
             state.history = list(history)
             report_mod.write_raw_png(run_dir, steps, raw_png)
             see_line = (
-                f"{len(elements)} elements · focused={focused.role or '-'}"
+                f"{len(elements)} elements · tabs={n_tabs} · focused={focused.role or '-'}"
                 f"{' (credential)' if focused.is_credential else ''} · "
                 f"text={len(page_text.strip())}ch"
             )
@@ -208,7 +209,7 @@ async def run_decide_session(
                 decision = await decide_action(
                     task=effective_task, url=page.url, start_url=start_url,
                     elements=elements, focused=focused, page_text=page_text,
-                    history=history,
+                    history=history, tabs=n_tabs,
                 )
             except Exception as exc:
                 log(f"DECIDE failed ({exc.__class__.__name__}); idling this step")
@@ -292,6 +293,25 @@ async def run_decide_session(
                 history.append(f"step {steps}: pressed Enter — {res}")
                 moves += 1
                 noops = 0
+            elif decision.kind == Kind.REFRESH:
+                log("ACT    refresh")
+                res = await platform.refresh_page()
+                log(f"RESULT {res}")
+                entry["act"] = "refresh"
+                entry["result"] = res
+                history.append(f"step {steps}: refreshed — {res}")
+                moves += 1
+                noops = 0
+            elif decision.kind == Kind.CLOSE_OTHERS:
+                log("ACT    close other tabs")
+                n_closed = await platform.close_other_tabs()
+                res = f"closed {n_closed} other tab(s)"
+                log(f"RESULT {res}")
+                entry["act"] = "close_others"
+                entry["result"] = res
+                history.append(f"step {steps}: {res}")
+                moves += 1
+                noops = 0
             else:  # CLICK_ITEM / TYPE_AT
                 idx = decision.element_idx
                 by_idx = {e.idx: e for e in elements}
@@ -346,6 +366,11 @@ async def run_decide_session(
                         moves += 1
                         noops = 0
 
+            # The action may have rebound the platform to a new tab
+            # (click auto-adopt) — re-sync the local handle so the screenshot,
+            # url, and artifacts below all read the CURRENT tab.
+            page = platform.page
+
             # REPORT artifacts for this step
             from .decide import build_questions
             from .perception import build_state as _build_state
@@ -353,6 +378,7 @@ async def run_decide_session(
             state_packet = _build_state(
                 task=effective_task, url=page.url, elements=elements,
                 focused=focused, page_text=page_text, history=history,
+                tabs=n_tabs,
             )
             sites = [u for u in (start_url, page.url) if u]
             sites = list(dict.fromkeys(sites))

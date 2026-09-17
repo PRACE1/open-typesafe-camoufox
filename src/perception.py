@@ -164,14 +164,17 @@ def element_criteria(e: ElementRef) -> str:
 
 def build_state(*, task: str, url: str, elements: list[ElementRef],
                 focused: FocusedField, page_text: str,
-                history: list[str], frame: str = "", grid: str = "") -> dict[str, Any]:
+                history: list[str], frame: str = "", grid: str = "",
+                tabs: int = 1) -> dict[str, Any]:
     """Assemble the deterministic state packet sent to Jev."""
     return {
         "task": task,
         "url": url,
+        "tabs": tabs,
         "elements": [
             {"idx": e.idx, "kind": e.kind, "type": e.type, "label": e.label,
-             "placeholder": e.placeholder, "text": e.text, "cx": e.cx, "cy": e.cy}
+             "placeholder": e.placeholder, "text": e.text, "cx": e.cx, "cy": e.cy,
+             "sel": f'[data-jev="{e.idx}"]'}
             for e in elements
         ],
         "focused_field": {

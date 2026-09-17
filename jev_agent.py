@@ -31,7 +31,8 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from pydantic import BaseModel, Field
 
-from src.capability import CamoufoxCapability, CamoufoxDeps
+from src.capability import CamoufoxDeps
+from src.capability.camoufox_capability import CamoufoxCapability
 
 DEFAULT_BASE_URL = "https://api.groq.com/openai/v1"
 DEFAULT_MODEL = "openai/gpt-oss-20b"

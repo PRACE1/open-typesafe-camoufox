@@ -16,14 +16,16 @@ capability package — browser verbs, split by concern:
   jev_actions.py            JevCapability (2-tool mixin; action bodies move to
                             actions.py, perception.py, writer.py over time)
 
-Re-exports the symbols external code imports.
+Re-exports the symbols external code imports. Note: CamoufoxCapability is
+intentionally NOT re-exported here — importing it would pull
+browser.camoufox back in and create a package cycle (browser imports
+capability mixins). Import it from src.capability.camoufox_capability
+directly.
 """
 
 from __future__ import annotations
 
-from .camoufox_capability import CamoufoxCapability
 from .deps import CamoufoxDeps
-from ..browser.camoufox import CamoufoxPlatform
 from ..deps import ElementRef, FocusedField, RunState
 
-__all__ = ["CamoufoxCapability", "CamoufoxDeps", "CamoufoxPlatform", "ElementRef", "FocusedField", "RunState"]
+__all__ = ["CamoufoxDeps", "ElementRef", "FocusedField", "RunState"]

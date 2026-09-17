@@ -61,11 +61,13 @@ Every run writes `runs/<timestamp>/`:
 | `step-NN-answers.json` | every classifier probability (debug stalls here first) |
 | `transcript.jsonl`, `cursor.json` | per-step lines + cursor trail |
 
-Live feed lines: `SEE` (elements/focused/text) → `DECIDE <kind> conf=<x> [item=#n]`
+Live feed lines: `SEE` (elements/tabs/focused/text) → `DECIDE <kind> conf=<x> [item=#n]`
 → `ACT` → `RESULT`. `kind` is one of `wait | click_item | type_at |
-press_enter | goto | done | none`. `conf < --min-confidence` idles;
+press_enter | refresh | close_others | goto | done | none`. `conf < --min-confidence` idles;
 two doubt no-ops stop the run; `wait` is patience (loading page) and never
 stops it; `done` is accepted only on a settled page with real text.
+Clicks auto-adopt new tabs (`+ newtab <url>` in RESULT); `close_others`
+always keeps the current tab and its opener.
 
 ## Caveats (do not work around these)
 

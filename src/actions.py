@@ -64,11 +64,19 @@ async def click_item(platform, elements: list[ElementRef], idx: int) -> str:
             await platform._harvest_and_accumulate(quiet=True)
             await platform._hover_and_highlight(box)
             # The click's own humanized move is the settle onto the center.
+            before_ids = platform.tab_ids()
             await asyncio.wait_for(page.mouse.click(px, py), timeout=10.0)
             msg = (
                 f"element #{idx} scroll+circle+click at "
                 f"({px / vp['width']:.3f},{py / vp['height']:.3f}) humanize=true"
             )
+            # Clicks often land in a fresh tab (target=_blank, popup): give
+            # it a beat, then adopt it so the next perception reads the NEW
+            # content instead of re-clicking this element forever.
+            await asyncio.sleep(0.7)
+            adopted = await platform.adopt_new_tab(before_ids)
+            if adopted:
+                msg += f" + newtab {adopted}"
             log(msg)
             return msg
         except Exception as exc:  # noqa: BLE001

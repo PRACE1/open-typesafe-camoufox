@@ -54,3 +54,11 @@ def test_build_state_shape():
     assert len(s["elements"]) == 1 and s["elements"][0]["label"] == "Search"
     assert s["focused_field"]["role"] == "input"
     assert s["page_text"] == "hello" and s["history"] == ["a", "b"]
+    assert s["tabs"] == 1
+    assert s["elements"][0]["sel"] == '[data-jev="0"]'
+
+
+def test_build_state_tabs_param():
+    s = build_state(task="t", url="u", elements=[], focused=FocusedField(),
+                    page_text="", history=[], tabs=3)
+    assert s["tabs"] == 3

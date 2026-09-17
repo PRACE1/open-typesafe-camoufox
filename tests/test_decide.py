@@ -14,7 +14,7 @@ def _els(n):
 
 
 def test_kinds_mutually_exclusive():
-    assert len(KIND_CRITERIA) == len({k.value for k in Kind}) == 7
+    assert len(KIND_CRITERIA) == len({k.value for k in Kind}) == 9
     assert set(KIND_CRITERIA) == {k.value for k in Kind}
 
 

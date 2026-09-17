@@ -37,6 +37,8 @@ class Kind(str, Enum):
     CLICK_ITEM = "click_item"
     TYPE_AT = "type_at"
     PRESS_ENTER = "press_enter"
+    REFRESH = "refresh"
+    CLOSE_OTHERS = "close_others"
     GOTO = "goto"
     DONE = "done"
     NONE = "none"
@@ -47,6 +49,8 @@ KIND_CRITERIA: dict[str, str] = {
     Kind.CLICK_ITEM.value: "Click the chosen element (button/link); no text needed",
     Kind.TYPE_AT.value: "Focus the chosen input and type fresh text into it (writer composes it)",
     Kind.PRESS_ENTER.value: "Press Enter to submit the focused field (e.g. after typing)",
+    Kind.REFRESH.value: "Reload the current tab; its content failed to load or is stale",
+    Kind.CLOSE_OTHERS.value: "Close all tabs except the current one; too many tabs are open",
     Kind.GOTO.value: "This page is finished; navigate to the chosen site URL",
     Kind.DONE.value: "TASK is observably complete in PAGE TEXT; stop with the outcome",
     Kind.NONE.value: "No confident action; idle this step",
@@ -187,6 +191,7 @@ async def decide_action(
     history: list[str],
     frame: str = "",
     grid: str = "",
+    tabs: int = 1,
     timeout_s: float = 30.0,
 ) -> JevDecision:
     """One Jev request -> the single next action (+ confidence)."""
@@ -200,7 +205,8 @@ async def decide_action(
             sites.append(cand)
 
     state = build_state(task=task, url=url, elements=elements, focused=focused,
-                        page_text=page_text, history=history, frame=frame, grid=grid)
+                        page_text=page_text, history=history, frame=frame, grid=grid,
+                        tabs=tabs)
     payload: dict[str, Any] = {
         "model": model,
         "state": state,

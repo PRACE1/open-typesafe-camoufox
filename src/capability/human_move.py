@@ -175,6 +175,6 @@ async def human_loop(
     try:
         await _replay(page, [tuple(map(float, p)) for p in pts], vp_w, vp_h)
     except Exception as exc:  # noqa: BLE001
-        log(f"[human-loop] replay failed: {exc}")
+        log(f"[human-loop] replay failed: {exc.__class__.__name__}: {exc}")
         return None
     return (float(pts[0, 0]), float(pts[0, 1]))

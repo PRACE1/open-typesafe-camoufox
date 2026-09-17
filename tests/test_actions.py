@@ -66,14 +66,18 @@ def test_point_status_passthrough():
     assert _run(_point_status(pg2, 10, 10)) == "hit"
 
 
-def _stub_find(monkeypatch, elements):
-    """Stub the fresh-probe seam: _resolve_target re-probes per act."""
-    import src.actions as _actions_mod
+def _patch_find(monkeypatch, fn):
+    """Point the single fresh-probe seam (perception.find_elements) at fn."""
+    import src.perception as _perception_mod
+    monkeypatch.setattr(_perception_mod, "find_elements", fn)
 
+
+def _stub_find(monkeypatch, elements):
+    """Stub the fresh-probe seam with a fixed element list."""
     async def _fake_find(platform):
         return list(elements)
 
-    monkeypatch.setattr(_actions_mod, "find_elements", _fake_find)
+    _patch_find(monkeypatch, _fake_find)
 
 
 def test_verified_center_hit_first_try(monkeypatch):
@@ -372,7 +376,7 @@ def test_resolve_target_prefers_selector_over_nth(monkeypatch):
         return [_el(0, kind="div", label="Other")]
 
     import src.actions as _actions_mod
-    monkeypatch.setattr(_actions_mod, "find_elements", _counting_find)
+    _patch_find(monkeypatch, _counting_find)
     old = _el(5, kind="textarea", label="Search", sel='textarea[name="q"]')
     plat = _FakePlatform2(_FakeSelPage(hit=_sel_hit()))
     res = _run(_resolve_target(plat, [old], 5))
@@ -394,7 +398,7 @@ def test_probe_via_selector_skips_nth(monkeypatch):
     async def _boom(platform):
         raise AssertionError("must not re-probe")
 
-    monkeypatch.setattr(_actions_mod, "find_elements", _boom)
+    _patch_find(monkeypatch, _boom)
     old = _el(3, kind="link", label="More", sel="a#go",
               box=(0.01, 0.05, 0.1, 0.05))
     page = _FakeSelPage(
@@ -437,7 +441,7 @@ def test_confirm_aria_ref_ok_stale_unknown(monkeypatch):
         return _FIND
 
     _FIND = same
-    monkeypatch.setattr(_actions_mod, "find_elements", _find)
+    _patch_find(monkeypatch, _find)
     assert _run(_confirm_aria_ref(_FakePlatform2(_FakePage2()), old)) == "ok"
 
     _FIND = live
@@ -449,7 +453,7 @@ def test_confirm_aria_ref_ok_stale_unknown(monkeypatch):
     async def _boom(platform):
         raise RuntimeError("no page")
 
-    monkeypatch.setattr(_actions_mod, "find_elements", _boom)
+    _patch_find(monkeypatch, _boom)
     assert _run(_confirm_aria_ref(_FakePlatform2(_FakePage2()), old)) == "unknown"
 
 
@@ -609,7 +613,7 @@ def test_resolve_target_aria_tier_skips_probe(monkeypatch):
     async def _boom(platform):
         raise AssertionError("aria tier must not re-probe")
 
-    monkeypatch.setattr(_actions_mod, "find_elements", _boom)
+    _patch_find(monkeypatch, _boom)
     plat = _FakePlatform2(_FakeAriaPage(_FakeAriaLocator()))
     res = _run(_resolve_target(plat, [_aria_el()], 2))
     assert res["status"] == "ok" and res["live_kind"] == "link"
@@ -702,7 +706,7 @@ def test_heal_target_failsoft_without_browser(monkeypatch):
     async def _boom(platform):
         raise RuntimeError("no browser")
 
-    monkeypatch.setattr(_actions_mod, "find_elements", _boom)
+    _patch_find(monkeypatch, _boom)
     fresh, idx = _run(heal_target(_FakePlatform2(_FakePage2(None)), "More"))
     assert (fresh, idx) == ([], None)
 

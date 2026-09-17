@@ -1,0 +1,78 @@
+---
+name: open-typesafe-camoufox
+description: Drive a headed Camoufox browser from plain English with the otc CLI (uv run otc.py). Use when asked to run a browser task, check or replay a run, preflight keys and browser, or work inside the open-typesafe-camoufox repo.
+---
+
+# open-typesafe-camoufox (`otc`)
+
+CLI tool that drives a headed Camoufox browser toward a goal typed in plain
+English (~$0.0002/step). It never sends screenshots to a big model: Jev (TypeSafe
+System One) classifies one action per step, a small writer model composes free
+text only when a field genuinely needs it.
+
+Repo: `open-typesafe-camoufox/`. Call shape from the repo root:
+
+```bash
+uv run otc.py --url <start-url> --task "<plain-English goal>" --budget 240 --max-steps 20
+```
+
+## Setup (once)
+
+```bash
+uv sync
+cp .env.example .env.local   # fill GROQ_API_KEY + TYPESAFE_API_KEY
+uv run otc.py --url https://example.com --preflight   # proves keys + headed browser
+```
+
+Writer needs no new key (small Groq model; `WRITER_MODEL` overrides,
+`ANTHROPIC_API_KEY` optionally selects haiku).
+
+## Commands
+
+```bash
+# solve a task (Jev-primary decide loop)
+uv run otc.py --url https://www.google.com --task "Type ONE surprising moon fact in the search box, press Enter, read the top result, and mark done." --budget 240 --max-steps 20
+# sign-in style task: credentials ONLY via {ENV} placeholders (values never log)
+uv run otc.py --url https://x.com/login --task "Sign in with {TWITTER_USERNAME} / {TWITTER_PASSWORD}" --budget 120
+# flags: --headless --fps 2-5 --min-confidence 0.4 --steer steer.txt --verbose
+# fallback: --legacy-planner (old GPT planner loop)
+# offline replay, no browser:
+uv run otc.py --replay runs/<timestamp> --replay-step 3
+uv run otc.py --replay runs/<timestamp>   # list saved steps
+# quick demo (same shape as the CLI call above):
+uv run python run_fact.py
+# tests:
+uv run python -m pytest -q
+```
+
+Steer a live run from another terminal via `steer.txt`:
+`stop` | `goto <url>` | `pause` | `resume` | any instruction line.
+
+## Reading a run
+
+Every run writes `runs/<timestamp>/`:
+
+| file | use |
+|---|---|
+| `run.log`, `run.json` | full feed; goal, outcome, seconds, config |
+| `step-NN-raw.png` | screenshot capture |
+| `step-NN.png` | elements blue, chosen red, focused field green |
+| `step-NN-payload.txt` | exact state + criteria sent to Jev, then the decision |
+| `step-NN-answers.json` | every classifier probability (debug stalls here first) |
+| `transcript.jsonl`, `cursor.json` | per-step lines + cursor trail |
+
+Live feed lines: `SEE` (elements/focused/text) → `DECIDE <kind> conf=<x> [item=#n]`
+→ `ACT` → `RESULT`. `kind` is one of `wait | click_item | type_at |
+press_enter | goto | done | none`. `conf < --min-confidence` idles;
+two doubt no-ops stop the run; `wait` is patience (loading page) and never
+stops it; `done` is accepted only on a settled page with real text.
+
+## Caveats (do not work around these)
+
+- Headed by default: hands off mouse/keyboard/focus while it runs.
+- Without `TYPESAFE_API_KEY`, grounding goes blind (`conf=0.00` heuristic).
+- DOM element-map targeting only; canvas/icon-only controls are invisible.
+- Slow pages burn steps on `wait`; raise `--budget`/`--max-steps`.
+- The writer never invents credentials; `{ENV}` placeholders must exist in
+  `.env.local` or credential steps are skipped.
+- Never commit `.env.local` or `runs/` (both git-ignored).

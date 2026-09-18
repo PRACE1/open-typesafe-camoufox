@@ -78,8 +78,11 @@ IMAGE_FOLLOWUP_TEXT_MARKERS = (
 HCAPTCHA_IFRAME_SEL = "iframe[src*='hcaptcha'], iframe[src*='hcaptcha.com']"
 HCAPTCHA_TOKEN_SEL = "textarea[name='h-captcha-response']"
 
-# Fixed widget click point inside a Turnstile iframe host, ported from
-# upstream WIDGET_CLICK_X/Y (checkbox sits top-left of the widget).
+# Upstream widget geometry gate: loader/hidden iframes share the same
+# selectors as the widget — only a real widget box gets the click.
+IFRAME_MIN_W = 180.0
+IFRAME_MIN_H = 45.0
+HEADER_Y = 80.0
 WIDGET_CLICK = {"x": 26.0, "y": 32.0}
 TOKEN_MIN_LEN = 20
 POLL_INTERVAL_S = 0.5
@@ -259,33 +262,56 @@ async def _click_turnstile_checkbox(page, logs: list[str] | None = None) -> bool
     except Exception as exc:  # noqa: BLE001
         trail.append(f"turnstile: role-click failed ({exc.__class__.__name__}) — trying offset click")
         log(f"turnstile role-click failed: {exc}")
-    # Path 2: iframe host element-handle click at the fixed widget
-    # offset with a human-like delay (upstream WIDGET_CLICK + delay=60).
-    # Fresh widgets need a settle beat: the iframe exists in the DOM
-    # before its host box is measurable, so wait visible first — a bare
-    # 500ms handle grab times out on live widgets (observed headed).
+    # Path 2: per-iframe widget loop (upstream click_turnstile_checkbox).
+    # `.first` is usually a hidden loader iframe, not the widget — walk
+    # every match, keep the one with a real widget box that is not already
+    # verifying, and offset-click exactly that host.
     try:
-        host = page.locator(TURNSTILE_IFRAME_SEL).first
+        total = await asyncio.wait_for(
+            page.locator(TURNSTILE_IFRAME_SEL).count(), timeout=5.0)
+    except Exception:  # noqa: BLE001
+        total = 0
+    for i in range(total):
+        host_i = page.locator(TURNSTILE_IFRAME_SEL).nth(i)
         try:
-            await asyncio.wait_for(host.wait_for(state="visible", timeout=10000),
-                                   timeout=12.0)
+            handle_i = await asyncio.wait_for(
+                host_i.element_handle(timeout=2000), timeout=5.0)
         except Exception:  # noqa: BLE001
-            pass
-        handle = await asyncio.wait_for(host.element_handle(timeout=5000),
-                                        timeout=8.0)
-        if handle is None:
-            trail.append("turnstile: offset click skipped (no element handle)")
-            return False
-        await asyncio.wait_for(
-            handle.click(position=dict(WIDGET_CLICK), timeout=3000,
-                         delay=60, force=True),
-            timeout=8.0)
-        trail.append("turnstile: iframe-host offset click dispatched")
-        return True
-    except Exception as exc:  # noqa: BLE001
-        trail.append(f"turnstile: offset-click failed ({exc.__class__.__name__})")
-        log(f"turnstile offset-click failed: {exc}")
-        return False
+            handle_i = None
+        if handle_i is None:
+            trail.append(f"turnstile: iframe[{i}] no handle — skipping")
+            continue
+        try:
+            box = await handle_i.bounding_box()
+        except Exception:  # noqa: BLE001
+            box = None
+        if (not box or float(box.get("width") or 0) < IFRAME_MIN_W
+                or float(box.get("height") or 0) < IFRAME_MIN_H
+                or float(box.get("y") or 0) < HEADER_Y):
+            trail.append(f"turnstile: iframe[{i}] box not widget — skipping")
+            continue
+        try:
+            fl_i = page.frame_locator(TURNSTILE_IFRAME_SEL).nth(i)
+            verifying = await asyncio.wait_for(
+                fl_i.get_by_text("Verifying...", exact=True).first.is_visible(timeout=300),
+                timeout=5.0)
+        except Exception:  # noqa: BLE001
+            verifying = False
+        if verifying:
+            trail.append(f"turnstile: iframe[{i}] verifying — skipping")
+            continue
+        try:
+            await asyncio.wait_for(
+                handle_i.click(position=dict(WIDGET_CLICK), timeout=3000,
+                               delay=60, force=True),
+                timeout=8.0)
+            trail.append(f"turnstile: iframe[{i}] offset click dispatched")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            trail.append(f"turnstile: iframe[{i}] offset-click failed ({exc.__class__.__name__})")
+            continue
+    trail.append("turnstile: offset-click failed (no widget iframe)")
+    return False
 
 
 async def _click_recaptcha_checkbox(page, logs: list[str] | None = None) -> bool:

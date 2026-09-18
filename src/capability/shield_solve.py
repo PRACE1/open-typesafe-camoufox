@@ -261,10 +261,18 @@ async def _click_turnstile_checkbox(page, logs: list[str] | None = None) -> bool
         log(f"turnstile role-click failed: {exc}")
     # Path 2: iframe host element-handle click at the fixed widget
     # offset with a human-like delay (upstream WIDGET_CLICK + delay=60).
+    # Fresh widgets need a settle beat: the iframe exists in the DOM
+    # before its host box is measurable, so wait visible first — a bare
+    # 500ms handle grab times out on live widgets (observed headed).
     try:
         host = page.locator(TURNSTILE_IFRAME_SEL).first
-        handle = await asyncio.wait_for(host.element_handle(timeout=500),
-                                        timeout=5.0)
+        try:
+            await asyncio.wait_for(host.wait_for(state="visible", timeout=10000),
+                                   timeout=12.0)
+        except Exception:  # noqa: BLE001
+            pass
+        handle = await asyncio.wait_for(host.element_handle(timeout=5000),
+                                        timeout=8.0)
         if handle is None:
             trail.append("turnstile: offset click skipped (no element handle)")
             return False

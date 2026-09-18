@@ -237,6 +237,14 @@ async def _click_turnstile_checkbox(page, logs: list[str] | None = None) -> bool
     inside the ``ShieldSolveResult`` response, not just run.log.
     """
     trail = logs if logs is not None else []
+    # screenX repair first: without plausible display coordinates the
+    # click below is discarded no matter how faithful the target is.
+    # Fail-soft — 0 patched frames means proceed exactly as before.
+    try:
+        from .screenx_patch import install_screenx_patch
+        await install_screenx_patch(page, trail)
+    except Exception:  # noqa: BLE001
+        pass
     # Path 1: frame-locator role checkbox (most faithful click target).
     try:
         fl = page.frame_locator(TURNSTILE_IFRAME_SEL).first

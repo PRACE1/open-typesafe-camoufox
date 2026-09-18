@@ -383,3 +383,197 @@ def test_step_verdict_taxonomy():
                         recovered=False, unresolved=True) == "unresolved"
     assert step_verdict(done=False, stopped=False, acted=False,
                         recovered=False, unresolved=False) == "noop"
+
+
+class _ShotFailPage:
+    url = "https://a.example/"
+
+    async def screenshot(self, type="png"):
+        raise TimeoutError("taking page screenshot")
+
+
+class _ShotFailPlatform:
+    def __init__(self):
+        self.page = _ShotFailPage()
+
+    def tab_ids(self):
+        return {1}
+
+    async def tab_count(self):
+        return 1
+
+    async def go_back(self):
+        return "went back to https://a.example/"
+
+
+def _see_kwargs(tmp_path, **over):
+    import src.report as _report
+
+    kw = dict(platform=_ShotFailPlatform(), entry={"n": 1, "t": 1.0},
+              steps=1, shot_streak=0, known_tab_ids={1},
+              last_page_id=None, reading_until_step=0,
+              visited=[], visited_set=set(), notes=[], history=[],
+              task_text="t", run_dir=str(tmp_path), report_mod=_report,
+              interval=0)
+    kw.update(over)
+    return kw
+
+
+def test_step_see_screenshot_failure_skips_step(tmp_path):
+    """Regression: plain screenshot failure (no restart/stop) must tell
+    the caller to skip the step — the return carries no raw_png."""
+    import asyncio as _asyncio
+
+    from src.runner.loop import _step_see
+
+    see = _asyncio.run(_step_see(**_see_kwargs(tmp_path)))
+    assert see["skip_step"] is True
+    assert see["restarted"] is False and see["stopped"] is False
+    assert see["shot_streak"] == 1
+    assert "raw_png" not in see  # caller must not touch observation keys
+
+
+def test_step_see_restart_path_skips_step(tmp_path, monkeypatch):
+    """Third consecutive failure triggers the Jev-scored restart branch
+    (no-key fallback: history-back) and still skips the step."""
+    import asyncio as _asyncio
+
+    from src.runner.loop import _step_see
+
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    kw = _see_kwargs(tmp_path, shot_streak=2)
+    see = _asyncio.run(_step_see(**kw))
+    assert see["skip_step"] is True
+    assert see["restarted"] is True and see["shot_streak"] == 3
+    assert kw["entry"]["restart"]["action"] == "back"
+
+
+class _VrPage:
+    url = "https://a.example/"
+
+
+def _vr_kwargs(tmp_path, **over):
+    import src.report as _report
+
+    kw = dict(machine=None, phase_trail=[], entry={"n": 1, "t": 1.0},
+              steps=1, page=_VrPage(), page_text="Results. " * 60,
+              elements=[], blocked=None, acted=False,
+              done=False, stopped=False, stop_reason="",
+              noops=0, noop_limit=3, dead_run=0, dead_limit=2,
+              prev_fp=None, prev_acted=False, last_effect_kind=None,
+              recoveries=[], recover_cap=3, same_fp=False,
+              synth_attempted=True, captcha_streak=0, step_captcha=False,
+              heal_edge=None, heal_abort=None, notes=[],
+              effective_task="t", run_dir=str(tmp_path),
+              report_mod=_report, history=[], platform=object())
+    kw.update(over)
+    return kw
+
+
+def _drive(machine, trail, *events):
+    from src.machine.run_engine import advance
+
+    for ev in events:
+        advance(machine, trail, ev)
+    return trail
+
+
+def test_propose_decide_returns_real_phase_timings(monkeypatch, tmp_path):
+    """Regression: TIME decide=-3.1s. t_proposed/t_decided must be
+    captured at phase boundaries (not once by the caller), so each
+    phase duration is real and non-negative."""
+    import asyncio as _asyncio
+    import time as _time
+
+    import src.runner.loop as _loop
+    from src.decide import JevDecision, Kind
+    from src.writer import ProposedAction
+
+    async def _fake_propose(**kwargs):
+        await _asyncio.sleep(0.02)
+        return ProposedAction(question="Should the browser wait?",
+                              kind="wait", item=None, url=None,
+                              rationale="r")
+
+    async def _fake_decide(**kwargs):
+        await _asyncio.sleep(0.02)
+        return JevDecision(kind=Kind.WAIT, confidence=0.9, raw={})
+
+    async def _noop_advance(machine, trail, event):
+        trail.append(event)
+        return trail
+
+    class _Page:
+        url = "https://a.example/"
+
+    class _Report:
+        @staticmethod
+        def write_answers_json(*a, **k):
+            return "answers.json"
+
+        @staticmethod
+        def append_transcript(*a, **k):
+            return None
+
+    monkeypatch.setattr(_loop, "propose_action", _fake_propose)
+    monkeypatch.setattr(_loop, "decide_action", _fake_decide)
+    monkeypatch.setattr(_loop, "advance", _noop_advance)
+
+    t0 = _time.time()
+    pd = _asyncio.run(_loop._step_propose_decide(
+        machine=object(), phase_trail=[], entry={"n": 1, "t": 1.0},
+        steps=1, effective_task="t", start_url="https://a.example/",
+        platform=object(), page=_Page(), elements=[], focused=None,
+        page_text="settled body text here", history=[], n_tabs=1,
+        notes=[], visited=[], lessons="", blocked=None,
+        reading_until_step=0, mismatch_sig=None, mismatch_run=0,
+        escalated_sigs=set(), escalated_urls=set(), last_typed=None,
+        blank_streak=0, run_dir=str(tmp_path), report_mod=_Report(),
+        frontier=None))
+    t1 = _time.time()
+    assert pd["idle"] is False and pd["decision"].kind == Kind.WAIT
+    assert t0 <= pd["t_proposed"] <= pd["t_decided"] <= t1
+    assert pd["t_decided"] - pd["t_proposed"] >= 0.015  # decide phase measured
+    assert pd["t_proposed"] - t0 >= 0.015  # propose phase measured
+
+
+def test_verify_recover_gate_stop_does_not_advance(tmp_path):
+    """Regression: a GATE stop (loopguard fixation) leaves the machine
+    in stopped, which has no outgoing edges — VERIFY must not advance
+    (live crash: TransitionNotAllowed Can't Idle now when in Stopped)."""
+    import asyncio as _asyncio
+
+    from src.machine.run_engine import RunMachine
+    from src.runner.loop import _step_verify_recover
+
+    machine, trail = RunMachine(), []
+    _drive(machine, trail, "perceived", "decided", "abort")
+    assert trail[-1] == "stopped"
+    vr = _asyncio.run(_step_verify_recover(**_vr_kwargs(
+        tmp_path, machine=machine, phase_trail=trail, stopped=True,
+        stop_reason="loopguard fixation on challenge #0 x6")))
+    assert vr["stopped"] is True
+    assert vr["stop_reason"] == "loopguard fixation on challenge #0 x6"
+    assert len(trail) == 3  # no verify/recover transitions attempted
+
+
+def test_verify_recover_done_skips_dead_rail_abort(tmp_path):
+    """Regression: DONE accepted in GATE plus a tripped no-effect rail
+    must not advance either (done has no outgoing edges)."""
+    import asyncio as _asyncio
+
+    from src import perception as _perception
+    from src.machine.run_engine import RunMachine
+    from src.runner.loop import _step_verify_recover
+
+    machine, trail = RunMachine(), []
+    _drive(machine, trail, "perceived", "decided", "finish")
+    assert trail[-1] == "done"
+    text = "Results. " * 60
+    fp = _perception.page_fingerprint("https://a.example/", text)
+    vr = _asyncio.run(_step_verify_recover(**_vr_kwargs(
+        tmp_path, machine=machine, phase_trail=trail, done=True,
+        page_text=text, dead_run=5, prev_fp=fp, prev_acted=True,
+        last_effect_kind="click_item")))
+    assert vr["done"] is True and vr["stopped"] is False
+    assert len(trail) == 3  # no abort attempted from done

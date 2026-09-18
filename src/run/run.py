@@ -126,6 +126,7 @@ async def _mission(start_url: str, task: str, steer_file: str, fps: float,
     total_moves = 0
     covered: list[str] = []
     seeded: list[str] = []
+    frontier_state: dict | None = None
     done = False
     session = 0
     last_run_dir = ""
@@ -167,11 +168,16 @@ async def _mission(start_url: str, task: str, steer_file: str, fps: float,
             humanize=humanize,
             steer_file=steer_file,
             seed_visited=covered,
+            seed_frontier=frontier_state,
         )
         total_steps += result["steps"]
         total_moves += result["moves"]
         last_run_dir = result["run_dir"]
         covered = _covered_urls(result["run_dir"], covered)
+        # Carry the crawl-frontier ledger across sessions so relaunches
+        # never re-queue (or re-click) already-read targets.
+        if result.get("frontier_state"):
+            frontier_state = result["frontier_state"]
         log(f"MISSION session {session} end: steps={result['steps']} "
             f"moves={result['moves']} done={result['done']} "
             f"covered_urls={len(covered)}")

@@ -166,17 +166,41 @@ async def _post(payload: dict, timeout_s: float, base: str, key: str) -> dict:
     raise RuntimeError("unreachable")
 
 
-def _item_option(e: ElementRef, visited: set[str]) -> dict[str, Any]:
+def _item_option(e: ElementRef, visited: set[str],
+                 frontier=None) -> dict[str, Any]:
     """Structured Choice option: the model sees what the element is, what it
     holds, where it points, and whether it was already visited — the full
     capability context for this ref, not just a label. Keyed by ephemeral
-    ref (eN); the harness maps the chosen ref back to its idx."""
+    ref (eN); the harness maps the chosen ref back to its idx.
+
+    ``frontier`` (optional Frontier ledger) additionally matches by
+    visible label, which is what kills re-picks through opaque SERP
+    redirect hrefs that URL matching can never see. Visited options are
+    labeled loudly so the classifier routes around them.
+    """
     label = e.label or e.placeholder or e.text or e.id or "?"
     state = "-"
     if e.kind in ("input", "textarea", "select") or e.type:
-        state = f"filled({e.value_len}ch)" if e.value_len else "empty"
+        state = f"filled({e.value_len}ch)" if e.value_len else " empty"
+    seen = bool(e.href and norm_url(e.href) in visited)
+    if not seen and frontier is not None:
+        try:
+            seen = bool(frontier.is_visited_element(e))
+        except Exception:
+            seen = False
+    shown = f"{e.ref}: {e.kind} \"{label}\""
+    if frontier is not None:
+        try:
+            mark = frontier.element_mark(e)
+        except Exception:
+            mark = ""
+        if mark:
+            shown += f" ({mark})"
+            seen = seen or "DEAD" in mark
+    elif seen:
+        shown += " (ALREADY VISITED — do not pick; it was read before)"
     return {
-        "label": f"{e.ref}: {e.kind} \"{label}\"",
+        "label": shown,
         "kind": e.kind,
         "type": e.type,
         "text": e.text,
@@ -185,22 +209,26 @@ def _item_option(e: ElementRef, visited: set[str]) -> dict[str, Any]:
         "region": e.region,
         "state": state,
         "ref": e.ref,
-        "visited": bool(e.href and norm_url(e.href) in visited),
+        "visited": seen,
     }
 
 
 def build_questions(elements: list[ElementRef], sites: list[str],
                     visited: list[str] | None = None,
-                    approval_question: str | dict | None = None) -> dict[str, Any]:
+                    approval_question: str | dict | None = None,
+                    frontier=None) -> dict[str, Any]:
     """Three Choices plus three Noul flags plus one progress Score.
 
     Nouls flag situations needing a decision alongside the verb choice:
     page_ready (model-side settle check), needs_text (gate the writer),
     task_done (completion flag independent of kind=done). The Score places
     the run on the task-completion spectrum for long-horizon tracking.
+    ``frontier`` threads the crawl ledger into item options so visited
+    targets are marked even when their hrefs are opaque redirects.
     """
     vset = set(visited or [])
-    item_criteria = {e.ref: _item_option(e, vset) for e in elements[:MAX_ITEMS]}
+    item_criteria = {e.ref: _item_option(e, vset, frontier)
+                     for e in elements[:MAX_ITEMS]}
     if not item_criteria:
         item_criteria = {"-1": "No actionable elements on this page"}
     site_criteria: dict[str, Any] = {str(i): url[:160] for i, url in enumerate(sites)}
@@ -426,6 +454,77 @@ async def decide_recovery_action(*, reason: str, act: str, result: str,
     return choice, min(max(conf, 0.0), 1.0)
 
 
+async def decide_captcha_action(*, instruction: str,
+                                candidates: list[dict],
+                                page_excerpt: str,
+                                timeout_s: float = 15.0) -> tuple[str, float]:
+    """JEV review of OCR readings: which candidate text to trust.
+
+    The ddddocr pipeline ranks near-miss readings (``0`` vs ``O``,
+    ``1`` vs ``I``); this call lets JEV score them against the CAPTCHA
+    instruction and page context before anything is typed. ``candidates``
+    are ``{"text": ..., "confidence": ...}`` dicts, best-first.
+    Returns (picked_text, conf); ``""`` means abstain. No-key or failure
+    fallback picks the top-ranked candidate at its own confidence —
+    deterministic offline, never a guess beyond the OCR ranking.
+    """
+    cands = [c for c in (candidates or [])
+             if isinstance(c, dict) and str(c.get("text", "")).strip()]
+    if not cands:
+        return "", 0.0
+    top = cands[0]
+    try:
+        top_conf = min(max(float(top.get("confidence", 0.0) or 0.0), 0.0), 1.0)
+    except (ValueError, TypeError):
+        top_conf = 0.0
+    base, key, model = _env()
+    if not key:
+        return str(top.get("text", "")), top_conf
+    criteria: dict[str, Any] = {
+        str(i): {"text": str(c.get("text", ""))[:40],
+                 "ocr_confidence": round(float(c.get("confidence", 0.0) or 0.0), 3)}
+        for i, c in enumerate(cands[:5])
+    }
+    criteria["none"] = ("Abstain: no reading is trustworthy enough to type; "
+                        "route around the challenge instead")
+    payload: dict[str, Any] = {
+        "model": model,
+        "state": {"instruction": (instruction or "")[:200],
+                  "page_excerpt": (page_excerpt or "")[:400]},
+        "questions": {
+            "captcha_pick": {
+                "type": "choice",
+                "instructions": {
+                    "question": "Which OCR reading of the CAPTCHA image should be typed?",
+                    "focus": ("Weigh each reading's OCR confidence against the "
+                              "CAPTCHA instruction (e.g. 'digits only' rules out "
+                              "letter readings). Pick none when no reading is "
+                              "trustworthy."),
+                },
+                "criteria": criteria,
+            },
+        },
+    }
+    try:
+        data = await _post(payload, timeout_s, base, key)
+    except Exception:
+        return str(top.get("text", "")), top_conf
+    answers = data.get("answers", {}) if isinstance(data, dict) else {}
+    raw = answers.get("captcha_pick", {})
+    choice = str(raw.get("choice", "none") or "none")
+    if choice == "none":
+        return "", 0.0
+    try:
+        picked = cands[int(choice)]
+    except (ValueError, IndexError, TypeError):
+        return str(top.get("text", "")), top_conf
+    try:
+        conf = float(raw.get("confidence", 0.0) or 0.0)
+    except (ValueError, TypeError):
+        conf = 0.0
+    return str(picked.get("text", "")), min(max(conf, 0.0), 1.0)
+
+
 def ref_to_idx(choice: str, elements: list[ElementRef]) -> int:
     """Map a chosen item back to its positional idx.
 
@@ -520,8 +619,14 @@ async def decide_action(
     blocked: str | None = None,
     approval_question: str | dict | None = None,
     timeout_s: float = 30.0,
+    frontier=None,
 ) -> JevDecision:
-    """One Jev request -> the single next action (+ confidence)."""
+    """One Jev request -> the single next action (+ confidence).
+
+    ``frontier`` (optional Frontier ledger) contributes its summary to
+    the state packet and its visited set to the item options — both
+    models then reason over the full to-do list, not just recent steps.
+    """
     base, key, model = _env()
     if not key:
         return JevDecision(kind=Kind.NONE, confidence=0.0, raw={"fallback": "no-key"})
@@ -531,14 +636,21 @@ async def decide_action(
         if cand and cand not in sites:
             sites.append(cand)
 
+    frontier_summary: dict[str, Any] | None = None
+    if frontier is not None:
+        try:
+            frontier_summary = frontier.to_record()
+        except Exception:
+            frontier_summary = None
     state = build_state(task=task, url=url, elements=elements, focused=focused,
                         page_text=page_text, history=history, frame=frame, grid=grid,
                         tabs=tabs, notes=notes, visited=visited, lessons=lessons,
-                        blocked=blocked)
+                        blocked=blocked, frontier=frontier_summary)
     payload: dict[str, Any] = {
         "model": model,
         "state": state,
-        "questions": build_questions(elements, sites, visited, approval_question),
+        "questions": build_questions(elements, sites, visited,
+                                     approval_question, frontier),
     }
     data = await _post(payload, timeout_s, base, key)
     return _decode(data, elements, sites)

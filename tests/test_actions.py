@@ -471,6 +471,7 @@ class _FakeAriaLocator:
         self._value = value
         self.scrolled = []
         self.clicked = []
+        self.clicked_force = []
 
     async def count(self):
         if "count" in self._fail:
@@ -501,10 +502,11 @@ class _FakeAriaLocator:
             raise RuntimeError("value boom")
         return self._value
 
-    async def click(self, timeout=None):
+    async def click(self, timeout=None, force=False):
         if "click" in self._fail:
             raise RuntimeError("click boom")
         self.clicked.append(timeout)
+        self.clicked_force.append(bool(force))
         return None
 
 
@@ -843,6 +845,78 @@ def test_verify_for_dispatch_still_covered_stays_refusal(monkeypatch):
     assert plat.page.keyboard.presses == ["Escape"]  # exactly once
 
 
+def test_verify_for_dispatch_dismisses_stale_cover(monkeypatch):
+    """A stale probe whose point verdict still reports a cover (kind
+    drift over a covered point, e.g. checkbox-vs-div on a bot-check
+    page) gets the same one-shot Escape dismiss as a covered probe."""
+    _stub_find(monkeypatch, [_el(0), _el(1), _el(2)])
+    first = {"v": "covered:div.menu", "k": "span"}
+    plat = _FakePlatform2(_FakePageSeq(_box(), first, "hit"))
+    probe, dismissed = _run(verify_for_dispatch(
+        plat, [_el(0), _el(1), _el(2)], 2, "link"))
+    assert probe["status"] == "ok" and dismissed is True
+    assert plat.page.keyboard.presses == ["Escape"]  # exactly once
+
+
+def test_challenge_checkbox_native_toggle_uses_force(monkeypatch):
+    """Shield-checkbox native clicks skip actionability waits (upstream
+    shield-bypass clicks force=True): animated widgets must not hang
+    the dispatch past timeout without ever clicking."""
+    from src.actions import challenge_control
+    box_el = _aria_el(idx=6, aria="f4e7", kind="checkbox", label="I agree")
+    els = [_el(i) for i in range(6)] + [box_el]
+    _stub_find(monkeypatch, els)
+    loc = _FakeAriaLocator(
+        ident={"kind": "checkbox", "role": "checkbox", "label": "I agree"})
+    plat = _FakePlatform2(_FakeAriaPage(loc, point="covered:iframe"))
+    res = _run(challenge_control(plat, els, 6, expected_kind="checkbox"))
+    assert "challenge checkbox toggled" in res and "native locator" in res
+    assert loc.clicked == [10000]
+    assert loc.clicked_force == [True]
+
+
+def test_dispatch_error_names_exception_class():
+    """Dispatch failures must name the exception class: bare TimeoutError
+    stringifies empty, which used to emit undebuggable 'dispatch failed: '
+    lines (seen live on /sorry/)."""
+    import asyncio as _asyncio
+
+    from src.actions import dispatch_verified_click
+
+    async def _boom(*a, **k):
+        await _asyncio.sleep(0)
+        raise _asyncio.TimeoutError()
+
+    class _BoomPage:
+        viewport_size = {"width": 1000, "height": 800}
+        url = "https://a.example/"
+
+        class _Mouse:
+            async def click(self, px, py):
+                raise _asyncio.TimeoutError()
+
+        mouse = _Mouse()
+
+        def locator(self, sel):
+            raise AssertionError("no locator dispatch on coordinate path")
+
+    class _BoomPlatform:
+        page = _BoomPage()
+
+        def tab_ids(self):
+            return ["t1"]
+
+        async def _harvest_and_accumulate(self, quiet=True):
+            pass
+
+        async def settle_after_action(self, prev_url, before_ids):
+            raise AssertionError("unreachable on dispatch error")
+
+    res = _run(dispatch_verified_click(_BoomPlatform(), 5, 5, harvest=False))
+    assert res["outcome"] == "error"
+    assert res["info"].startswith("dispatch failed: TimeoutError")
+
+
 def test_verify_for_dispatch_escape_failure_keeps_probe(monkeypatch):
     _stub_find(monkeypatch, [_el(0), _el(1), _el(2)])
     page = _FakePageSeq(_box(), "covered:div.menu", "hit")
@@ -879,14 +953,112 @@ def test_click_item_framed_target_native_dispatch(monkeypatch):
     assert plat.page.keyboard.presses == ["Escape"]  # dismiss tried first
 
 
+async def _shield_fast_fail(platform, challenge_type, timeout_s=30.0):
+    """Fast-failing shield solve: exercises the fallback wiring without
+    burning the 30s production token-poll deadline."""
+    from src.capability.shield_solve import ShieldSolveResult
+
+    return ShieldSolveResult(challenge_type=challenge_type, success=False,
+                             elapsed_ms=1, error="no token in time")
+
+
 def test_challenge_checkbox_framed_native_toggle(monkeypatch):
     from src.actions import challenge_control
     box_el = _aria_el(idx=6, aria="f4e7", kind="checkbox", label="I agree")
     els = [_el(i) for i in range(6)] + [box_el]
     _stub_find(monkeypatch, els)
+    monkeypatch.setattr("src.capability.shield_solve.solve_shield",
+                        _shield_fast_fail)
     loc = _FakeAriaLocator(
         ident={"kind": "checkbox", "role": "checkbox", "label": "I agree"})
     plat = _FakePlatform2(_FakeAriaPage(loc, point="covered:iframe"))
     res = _run(challenge_control(plat, els, 6, expected_kind="checkbox"))
     assert "challenge checkbox toggled" in res and "native locator" in res
     assert loc.clicked == [10000]
+
+
+def test_challenge_checkbox_fallback_carries_attempt_tail(monkeypatch):
+    """A failed shield solve must not vanish into prose: the fallback
+    toggle result carries a machine tail the loop audits into
+    entry["shield"] — this is what makes 30s token polls analyzable
+    instead of invisible (seen live on /sorry/)."""
+    from src.actions import challenge_control
+    from src.capability.shield_solve import unpack_attempt_tail
+    box_el = _aria_el(idx=6, aria="f4e7", kind="checkbox", label="I agree")
+    els = [_el(i) for i in range(6)] + [box_el]
+    _stub_find(monkeypatch, els)
+    monkeypatch.setattr("src.capability.shield_solve.solve_shield",
+                        _shield_fast_fail)
+    loc = _FakeAriaLocator(
+        ident={"kind": "checkbox", "role": "checkbox", "label": "I agree"})
+    plat = _FakePlatform2(_FakeAriaPage(loc, point="covered:iframe"))
+    res = _run(challenge_control(plat, els, 6, expected_kind="checkbox"))
+    assert "challenge checkbox toggled" in res
+    tail = unpack_attempt_tail(res)
+    assert tail is not None and tail["success"] is False
+    assert tail["challenge_type"] == "cf_turnstile"
+
+
+def test_challenge_checkbox_toggle_error_keeps_attempt_tail(monkeypatch):
+    """Same audit contract on the error path: the error prefix drives
+    the failure rails, the tail drives the forensics."""
+    from src.actions import challenge_control
+    from src.capability.shield_solve import unpack_attempt_tail
+    box_el = _aria_el(idx=6, aria="f4e7", kind="checkbox", label="I agree")
+    els = [_el(i) for i in range(6)] + [box_el]
+    _stub_find(monkeypatch, els)
+    monkeypatch.setattr("src.capability.shield_solve.solve_shield",
+                        _shield_fast_fail)
+
+    async def _boom_toggle(platform, px, py, timeout=10.0, harvest=True,
+                           native_aria=None, force=False):
+        return {"outcome": "error",
+                "info": "dispatch failed: TimeoutError: ",
+                "snapshot": ""}
+
+    monkeypatch.setattr("src.actions.dispatch_verified_click", _boom_toggle)
+    loc = _FakeAriaLocator(
+        ident={"kind": "checkbox", "role": "checkbox", "label": "I agree"})
+    plat = _FakePlatform2(_FakeAriaPage(loc, point="covered:iframe"))
+    res = _run(challenge_control(plat, els, 6, expected_kind="checkbox"))
+    assert res.startswith("error")
+    assert "TimeoutError" in res
+    tail = unpack_attempt_tail(res)
+    assert tail is not None and tail["success"] is False
+
+
+def test_probe_stale_mismatch_keeps_iframe_evidence(monkeypatch):
+    els = [_el(2, kind="checkbox"), _el(0), _el(1)]
+    _stub_find(monkeypatch, [_el(0), _el(1), els[0]])
+    p = _run(probe_target(
+        _FakePlatform2(_FakePage2(point={"v": "covered:iframe", "k": "iframe"})),
+        els, 2, "checkbox"))
+    assert p["status"] == "stale" and p["verdict"] == "covered:iframe"
+    assert p["frame_embedded"] is True
+
+
+def test_challenge_checkbox_stale_iframe_still_toggles_natively(monkeypatch):
+    """Google /sorry/ regression: a stale point verdict over an iframe
+    cover must still dispatch natively via the aria ref — never refused.
+
+    Native dispatch is identity-based (aria ref + Playwright actionability
+    checks), independent of the coordinate probe that went stale.
+    """
+    from src.actions import challenge_control
+    box_el = _aria_el(idx=6, aria="f4e7", kind="checkbox",
+                      label="I'm not a robot")
+    els = [_el(i) for i in range(6)] + [box_el]
+    _stub_find(monkeypatch, els)
+    loc = _FakeAriaLocator(
+        ident={"kind": "checkbox", "role": "checkbox",
+               "label": "I'm not a robot"})
+    point = {"v": "covered:iframe", "k": "iframe"}
+    monkeypatch.setattr("src.capability.shield_solve.solve_shield",
+                        _shield_fast_fail)
+    plat = _FakePlatform2(_FakeAriaPage(loc, point=point))
+    res = _run(challenge_control(plat, els, 6, expected_kind="checkbox"))
+    assert "challenge checkbox toggled" in res and "native locator" in res
+    assert loc.clicked == [10000]
+    # Stale-with-cover gets the one-shot Escape dismiss, then the native
+    # toggle still dispatches through the aria identity.
+    assert plat.page.keyboard.presses == ["Escape"]

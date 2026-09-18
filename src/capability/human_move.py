@@ -73,6 +73,14 @@ def _move_with_timeout(page, x: float, y: float):
     return asyncio.wait_for(page.mouse.move(x, y), timeout=5.0)
 
 
+async def _move_with_timeout_strict(page, x: float, y: float) -> None:
+    """Like _move_with_timeout but surfaces a descriptive TimeoutError."""
+    try:
+        await asyncio.wait_for(page.mouse.move(x, y), timeout=5.0)
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"mouse.move({x},{y}) timed out after 5s")
+
+
 def _offset_sign(seed: int | None) -> float:
     """Deterministic per-seed side so the lateral offset is stable per seed."""
     if seed is None:
@@ -103,7 +111,7 @@ async def human_move(
     dist = math.hypot(ex - sx, ey - sy)
     if dist < 150 or (k is not None and k == 0):
         try:
-            await _move_with_timeout(page, ex, ey)
+            await _move_with_timeout_strict(page, ex, ey)
         except Exception as exc:  # noqa: BLE001 - same False contract as below
             log(f"[human-move] move failed: {exc}")
             return False
@@ -125,8 +133,8 @@ async def human_move(
         mid = (sx + ux * dist * 0.55 - uy * off, sy + uy * dist * 0.55 + ux * off)
 
     try:
-        await _move_with_timeout(page, mid[0], mid[1])
-        await _move_with_timeout(page, ex, ey)
+        await _move_with_timeout_strict(page, mid[0], mid[1])
+        await _move_with_timeout_strict(page, ex, ey)
     except Exception as exc:  # noqa: BLE001
         log(f"[human-move] move failed: {exc}")
         return False
@@ -144,7 +152,7 @@ async def _replay(
     for x, y in points:
         x = max(1.0, min(float(x), vp_w - 1.0))
         y = max(1.0, min(float(y), vp_h - 1.0))
-        await asyncio.wait_for(page.mouse.move(x, y), timeout=5.0)
+        await _move_with_timeout_strict(page, x, y)
 
 
 async def human_loop(

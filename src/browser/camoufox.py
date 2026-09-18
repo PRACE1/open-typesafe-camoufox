@@ -312,24 +312,58 @@ class CamoufoxPlatform(CursorTrackingMixin, BrowserActionsMixin):
         return closed
 
     async def refresh_page(self) -> str:
-        """Reload the current tab (stale/failed content). Harvests first."""
+        """Reload the current tab (stale/failed content). Harvests first.
+
+        A reload timeout does NOT mean failure — if the URL changed or the
+        DOM already looks usable, the reload succeeded from the loop's
+        perspective. Only a genuinely blank/stuck page counts as a failure.
+        """
         async with self._lock:
             try:
                 await self._harvest_and_accumulate(quiet=True)
             except Exception as exc:  # noqa: BLE001
                 log(f"[tabs] pre-refresh harvest: {exc}")
+            prev_url = ""
+            try:
+                prev_url = self.page.url
+            except Exception:  # noqa: BLE001
+                pass
+            reload_ok = False
+            reload_err = ""
             try:
                 await self.page.reload(wait_until="load", timeout=20000)
+                reload_ok = True
             except Exception as exc:  # noqa: BLE001
-                msg = f"error: refresh failed: {exc}"
+                reload_err = str(exc)
+                log(f"[tabs] reload timeout: {exc}")
+                # Check whether the page is actually in a usable state
+                # despite the timeout — navigation may have completed.
+                try:
+                    cur_url = self.page.url
+                    if cur_url != prev_url:
+                        reload_ok = True
+                        log(f"[tabs] reload timed out but URL changed to {cur_url}")
+                except Exception:  # noqa: BLE001
+                    pass
+                if not reload_ok:
+                    # DOM might still be usable even if URL didn't change.
+                    try:
+                        text = await self.page.locator("body").inner_text(timeout=2000)
+                        if len(text.strip()) > 50:
+                            reload_ok = True
+                            log("[tabs] reload timed out but body has usable text")
+                    except Exception:  # noqa: BLE001
+                        pass
+            if reload_ok:
+                self._last_url = self.page.url
+                try:
+                    await self._restart_tracker_on_new_page()
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[tabs] tracker restart after refresh: {exc}")
+                msg = f"refreshed {self._last_url}"
                 log(msg)
                 return msg
-            self._last_url = self.page.url
-            try:
-                await self._restart_tracker_on_new_page()
-            except Exception as exc:  # noqa: BLE001
-                log(f"[tabs] tracker restart after refresh: {exc}")
-            msg = f"refreshed {self._last_url}"
+            msg = f"error: refresh failed: {reload_err}"
             log(msg)
             return msg
 
@@ -338,23 +372,53 @@ class CamoufoxPlatform(CursorTrackingMixin, BrowserActionsMixin):
 
         Harvests first (back destroys the document), then restarts the
         tracker on the restored page. Empty history reports an error.
+        A timeout is not an automatic failure: if the URL changed or the
+        DOM is usable despite the timeout, the back-navigation succeeded.
         """
         async with self._lock:
             try:
                 await self._harvest_and_accumulate(quiet=True)
             except Exception as exc:  # noqa: BLE001
                 log(f"[tabs] pre-back harvest: {exc}")
+            prev_url = ""
+            try:
+                prev_url = self.page.url
+            except Exception:  # noqa: BLE001
+                pass
+            back_ok = False
+            back_err = ""
             try:
                 await self.page.go_back(wait_until="load", timeout=20000)
+                back_ok = True
             except Exception as exc:  # noqa: BLE001
-                msg = f"error: back failed (empty history?): {exc}"
+                back_err = str(exc)
+                log(f"[tabs] go_back timeout: {exc}")
+                # Same escape as refresh_page: a slow back that completed
+                # just past the timeout is still a success.
+                try:
+                    cur_url = self.page.url
+                    if cur_url != prev_url:
+                        back_ok = True
+                        log(f"[tabs] go_back timed out but URL changed to {cur_url}")
+                except Exception:  # noqa: BLE001
+                    pass
+                if not back_ok:
+                    try:
+                        text = await self.page.locator("body").inner_text(timeout=2000)
+                        if len(text.strip()) > 50:
+                            back_ok = True
+                            log("[tabs] go_back timed out but body has usable text")
+                    except Exception:  # noqa: BLE001
+                        pass
+            if back_ok:
+                self._last_url = self.page.url
+                try:
+                    await self._restart_tracker_on_new_page()
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[tabs] tracker restart after back: {exc}")
+                msg = f"went back to {self._last_url}"
                 log(msg)
                 return msg
-            self._last_url = self.page.url
-            try:
-                await self._restart_tracker_on_new_page()
-            except Exception as exc:  # noqa: BLE001
-                log(f"[tabs] tracker restart after back: {exc}")
-            msg = f"went back to {self._last_url}"
+            msg = f"error: back failed (empty history?): {back_err}"
             log(msg)
             return msg

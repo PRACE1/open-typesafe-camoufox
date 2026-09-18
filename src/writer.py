@@ -332,6 +332,8 @@ PROPOSE_SYSTEM = (
     "Never propose typing credentials; credential fields are handled separately. "
     "Prefer pages not yet visited (their URLs appear in NOTES); revisit a page "
     "only to read what was missed. "
+    "Never propose an element marked VISITED — that target was already read; "
+    "proposing it again is always wrong, no matter how relevant it looks. "
     "If recent clicks were blocked by overlays, propose press_escape to dismiss "
     "them. If this page is read and offers nothing more, propose back to return "
     "to results (prefer back over goto-search)."
@@ -348,7 +350,8 @@ class ProposedAction:
     rationale: str
 
 
-def _element_line(e: ElementRef) -> str:
+def _element_line(e: ElementRef, visited: bool = False,
+                  mark: str = "") -> str:
     label = e.label or e.placeholder or e.text or e.id or "?"
     bits = f"[{e.ref}] {e.kind} \"{label}\""
     if e.kind == "link" and e.href:
@@ -361,20 +364,34 @@ def _element_line(e: ElementRef) -> str:
         bits += " filled" if e.value_len else " empty"
     if e.href and not (e.kind == "link" and host_of(e.href)):
         bits += f" <{e.href[:60]}>"
+    if mark:
+        bits += f" {mark}"
+    elif visited:
+        bits += " VISITED — do not propose"
     return bits
 
 
-def summarize_elements(elements: list[ElementRef]) -> str:
+def summarize_elements(elements: list[ElementRef], frontier=None) -> str:
     """Compact map grouped by kind so the proposer grounds ref to kind.
 
     Links, inputs, and buttons read as separate sections — a flat list lets
     the model attach a button's description to an input's ref (seen live).
-    Capped to the probe map (already ≤128 by perception).
+    Capped to the probe map (already ≤128 by perception). When a frontier
+    ledger is given, already-read targets are stamped VISITED so the
+    proposer routes around them instead of re-picking the same result.
     """
     groups: dict[str, list[str]] = {"link": [], "input": [], "button": []}
     other: list[str] = []
     for e in elements[:128]:
-        line = _element_line(e)
+        seen = False
+        mark = ""
+        if frontier is not None:
+            try:
+                mark = frontier.element_mark(e) or ""
+                seen = bool(mark)
+            except Exception:
+                seen, mark = False, ""
+        line = _element_line(e, visited=seen, mark=mark)
         if e.kind in groups:
             groups[e.kind].append(line)
         elif e.kind in ("textarea", "select"):
@@ -392,21 +409,36 @@ def summarize_elements(elements: list[ElementRef]) -> str:
 
 async def propose_action(*, task: str, url: str, elements: list[ElementRef],
                          page_text: str, history: list[str],
-                         notes: list[str], reading_note: str = "") -> ProposedAction | None:
+                         notes: list[str], reading_note: str = "",
+                         frontier=None) -> ProposedAction | None:
     """Ask the small model for the single best next action as a yes/no question.
 
     Returns None when there is nothing to propose from (no key, no elements,
     model failure, or an invalid reply) — the caller then falls back to the
-    Choice classification alone.
+    Choice classification alone. ``frontier`` appends the to-do queue
+    (pending labels) so proposals chase uncovered targets first.
     """
     if not elements:
         return None
     context = ""
     if reading_note:
         context = f"CONTEXT: {reading_note}\n"
+    frontier_block = ""
+    if frontier is not None:
+        try:
+            rec = frontier.to_record()
+            pend = rec.get("pending_labels") or []
+            frontier_block = (
+                f"FRONTIER: {rec.get('visited', 0)} targets read, "
+                f"{rec.get('pending', 0)} still to do. "
+                f"Unvisited targets: {'; '.join(pend) if pend else '(none listed)'}.\n"
+                "Propose an UNVISITED target whenever one serves the task.\n"
+            )
+        except Exception:
+            frontier_block = ""
     user = (
-        f"TASK: {task}\nURL: {url}\n{context}"
-        f"ELEMENTS (idx kind label -> host [region] state):\n{summarize_elements(elements)}\n"
+        f"TASK: {task}\nURL: {url}\n{context}{frontier_block}"
+        f"ELEMENTS (idx kind label -> host [region] state):\n{summarize_elements(elements, frontier)}\n"
         f"PAGE TEXT:\n{(page_text or '').strip()[:600]}\n"
         f"NOTES:\n" + "\n".join(notes[-4:]) + "\n"
         f"HISTORY:\n" + "\n".join(history[-6:])

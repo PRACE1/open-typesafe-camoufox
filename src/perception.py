@@ -463,13 +463,20 @@ def build_state(*, task: str, url: str, elements: list[ElementRef],
                 history: list[str], frame: str = "", grid: str = "",
                 tabs: int = 1, notes: list[str] | None = None,
                 visited: list[str] | None = None,
-                lessons: str = "", blocked: str | None = None) -> dict[str, Any]:
-    """Assemble the deterministic state packet sent to Jev."""
+                lessons: str = "", blocked: str | None = None,
+                frontier: dict | None = None) -> dict[str, Any]:
+    """Assemble the deterministic state packet sent to Jev.
+
+    ``frontier`` is the crawl-frontier summary (pending/visited counts
+    plus pending labels) so the classifier reasons over the whole
+    to-do list, not just the last 8 history lines.
+    """
     return {
         "task": task,
         "url": url,
         "tabs": tabs,
         "lessons": lessons,
+        "frontier": frontier or {},
         "page_state": (
             f"blocked:{blocked} — interact with this page's verification "
             "controls (checkbox/button/input) like any page; classify "

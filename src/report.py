@@ -10,6 +10,9 @@ Every run writes runs/<timestamp>/:
                        questions + full Jev answers (rankings) + decision
   step-NN-answers.json every probability the classifier returned
   transcript.jsonl     one JSON line per step (kept from the legacy loop)
+  steps.jsonl          canonical machine transcript: one validated StepRecord
+                       per step (intent, proposed/executed calls, result,
+                       observable change, error, recovery, replayable flag)
   cursor.json          video-agent-compatible cursor trail
 
 A stall replays offline from step-NN-payload.jsonl + step-NN-answers.json
@@ -48,6 +51,96 @@ class StepPayload(BaseModel):
     answers: dict[str, Any] = Field(default_factory=dict)
     decision: str = ""
     phases: list[str] = Field(default_factory=list)
+
+
+class ProposedCall(BaseModel):
+    """What the proposer/writer suggested before Jev voted."""
+
+    model_config = {"extra": "ignore"}
+
+    kind: str = ""
+    item: int | None = None
+    url: str | None = None
+    rationale: str = ""
+
+
+class ExecutedCall(BaseModel):
+    """The tool call that actually ran (post-gate, post-override)."""
+
+    model_config = {"extra": "ignore"}
+
+    kind: str = ""
+    item: int | None = None
+    ref: str | None = None
+    selector: str | None = None
+    url: str | None = None
+
+
+class RecoveryAttempt(BaseModel):
+    """One audited compensation (heal, challenge-work, recover, synthesis)."""
+
+    model_config = {"extra": "ignore"}
+
+    strategy: str = ""
+    result: str = ""
+    reason: str = ""
+
+
+class StepRecord(BaseModel):
+    """Canonical machine-readable transcript: exactly one JSON object per
+    step per line (steps.jsonl). No human log prose, no raw DOM dumps —
+    compact excerpts and references only, sufficient to reconstruct the
+    run offline: what was tried, what ran, what changed, what failed,
+    what compensated, and whether the step can be re-driven.
+
+    Replayable means a fresh session can re-drive from this step: the
+    resulting URL is known and the action is deterministic (goto URL, or
+    click/type/challenge grounded by a durable selector — never a bare
+    positional idx, which dies with its probe).
+    """
+
+    model_config = {"extra": "ignore"}
+
+    n: int = Field(ge=1)
+    t: float = 0.0
+    url: str = ""
+    url_after: str = ""
+    intent: str = ""
+    page_state: dict[str, Any] = Field(default_factory=dict)
+    proposed: ProposedCall = Field(default_factory=ProposedCall)
+    decided: dict[str, Any] = Field(default_factory=dict)
+    executed: ExecutedCall = Field(default_factory=ExecutedCall)
+    action_type: str = ""
+    result: str = ""
+    observable_change: bool = False
+    error: str | None = None
+    recovery: RecoveryAttempt | None = None
+    captcha_ocr: dict[str, Any] = Field(default_factory=dict)
+    shield: dict[str, Any] = Field(default_factory=dict)
+    frontier: dict[str, Any] = Field(default_factory=dict)
+    confidence: float = 0.0
+    replayable: bool = False
+    verdict: str = ""
+    phases: list[str] = Field(default_factory=list)
+
+
+REPLAYABLE_KINDS = frozenset({"goto", "click_item", "type_at", "challenge"})
+
+
+def write_step_jsonl(run_dir: str, record: dict[str, Any]) -> str:
+    """Validate one canonical step record and append it to steps.jsonl.
+
+    Pydantic-validated on write like StepPayload: schema breaks fail
+    loudly in tests; at runtime the raw dict still lands for forensics.
+    """
+    path = os.path.join(run_dir, "steps.jsonl")
+    try:
+        line = StepRecord.model_validate(record).model_dump_json()
+    except ValidationError:
+        line = json.dumps(record, ensure_ascii=False)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    return path
 
 
 def write_payload_jsonl(run_dir: str, n: int, *, t: float = 0.0,
@@ -152,9 +245,76 @@ def write_answers_json(run_dir: str, n: int, raw: dict[str, Any]) -> str:
     return path
 
 
+def write_captcha_json(run_dir: str, n: int, payload: dict[str, Any]) -> str:
+    """Write the structured CAPTCHA analysis for one step (captcha-NN.json).
+
+    Payload carries the step number, URL, element idx, and the OCR record
+    (kind, text, boxes, confidence, backend, suggestion). No image bytes —
+    only the analysis, so the file stays small and greppable. Fail-soft
+    is the caller's job; this writer assumes a valid payload dict.
+    """
+    path = os.path.join(run_dir, f"captcha-{n:02d}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=1)
+    return path
+
+
+def write_shield_json(run_dir: str, n: int, payload: dict[str, Any]) -> str:
+    """Write the structured shield-solve analysis for one step (shield-NN.json).
+
+    Payload carries the step number, URL, element idx, and the solve
+    record (challenge_type, success, token_len, backend notes). Token
+    values are never recorded — lengths only. Same audit contract as
+    write_captcha_json.
+    """
+    path = os.path.join(run_dir, f"shield-{n:02d}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=1)
+    return path
+
+
+def write_frontier_event(run_dir: str, event: dict[str, Any]) -> str:
+    """Append one crawl-frontier ledger event (frontier.jsonl).
+
+    The canonical to-do record: ``discovered`` (new link target queued),
+    ``visited`` (navigation landed), ``aliased`` (label→URL learned).
+    One JSON object per line, crash-safe append, replayable offline.
+    """
+    path = os.path.join(run_dir, "frontier.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    return path
+
+
+def write_frontier_snapshot(run_dir: str, snapshot: dict[str, Any]) -> str:
+    """Rewrite the full frontier state (frontier.json).
+
+    Snapshot for cheap resume and human inspection; the JSONL event
+    ledger above is the audit trail. Atomic-ish: write tmp + rename so
+    a mid-write crash never leaves a corrupt ledger.
+    """
+    path = os.path.join(run_dir, "frontier.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(snapshot, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+    return path
+
+
+def _public_entry(entry: dict) -> dict:
+    """Drop private ``_``-prefixed keys before serializing.
+
+    The runner split passes live objects (machine, phase trail) through
+    the step entry dict; those must never reach JSON artifacts — the
+    original flat runner kept them as closure locals, so stripping
+    restores exactly the old on-disk shape.
+    """
+    return {k: v for k, v in entry.items() if not str(k).startswith("_")}
+
+
 def append_transcript(run_dir: str, entry: dict) -> None:
     with open(os.path.join(run_dir, "transcript.jsonl"), "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.write(json.dumps(_public_entry(entry), ensure_ascii=False) + "\n")
 
 
 def write_wire(run_dir: str, wire: dict[str, Any]) -> str:
@@ -168,7 +328,7 @@ def write_wire(run_dir: str, wire: dict[str, Any]) -> str:
     """
     path = os.path.join(run_dir, "wire.jsonl")
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(wire, ensure_ascii=False) + "\n")
+        f.write(json.dumps(_public_entry(wire), ensure_ascii=False) + "\n")
     return path
 
 

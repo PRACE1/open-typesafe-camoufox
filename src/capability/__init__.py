@@ -13,8 +13,11 @@ capability package — browser verbs, split by concern:
                             browser.CamoufoxPlatform, the single adapter)
   human_move.py             human trajectory primitives (HUMANIZE_LEVEL, ...)
   element_probe.py          ELEMENT_PROBE_JS (used by perception.find_elements)
-  jev_actions.py            JevCapability (2-tool mixin; action bodies move to
-                            actions.py, perception.py, writer.py over time)
+   jev_actions.py            JevCapability (2-tool mixin; action bodies move to
+                             actions.py, perception.py, writer.py over time)
+   captcha_ocr.py            ddddocr-backed CAPTCHA pipeline (optional
+                             backend; structured analysis for JEV review,
+                             never dispatches input itself)
 
 Re-exports the symbols external code imports. Note: CamoufoxCapability is
 intentionally NOT re-exported here — importing it would pull

@@ -14,6 +14,8 @@ dependencies = [
     "humanmovemouse>=1.2.0",
     "python-statemachine>=3.2.1",
     "pydot>=4.0.1",
+    "ddddocr>=1.5.1",
+    "crawl4ai>=0.7",
 ]
 
 [project.scripts]

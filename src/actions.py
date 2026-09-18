@@ -295,6 +295,7 @@ async def probe_target(platform, elements: list[ElementRef], idx: int,
     if stale_mismatch(expected_kind, live_kind):
         return {"idx": idx, "status": "stale", "verdict": verdict,
                 "px": px, "py": py, "box": res["box"],
+                "frame_embedded": _covering_tag(verdict) == "iframe",
                 "live_kind": live_kind, "label": label}
     if verdict == "hit":
         status = "ok"
@@ -332,7 +333,8 @@ def _bank_box(elements: list[ElementRef], idx: int,
 async def dispatch_verified_click(platform, px: int, py: int,
                                   timeout: float = 10.0,
                                   harvest: bool = True,
-                                  native_aria: str | None = None) -> dict:
+                                  native_aria: str | None = None,
+                                  force: bool = False) -> dict:
     """Click an already-verified point, settle, and rebuild context.
 
     Lock-free: the caller must hold platform._lock and have harvested the
@@ -344,6 +346,12 @@ async def dispatch_verified_click(platform, px: int, py: int,
     there — Playwright resolves the frame natively instead. Humanized
     motion is skipped for these; the verified identity + settle + snapshot
     rails still apply.
+
+    force skips Playwright actionability (visibility/stability/enabled)
+    waits on the native path — shield checkboxes animate continuously,
+    so a stability wait can hang past the timeout without the click ever
+    dispatching (seen live: empty dispatch failure on /sorry/). Only the
+    challenge-checkbox path opts in; coordinate clicks keep full checks.
     """
     page = platform.page
     if harvest:
@@ -357,11 +365,15 @@ async def dispatch_verified_click(platform, px: int, py: int,
         if native_aria is not None:
             locator = page.locator(resolve_ref(native_aria, {native_aria}))
             await asyncio.wait_for(
-                locator.click(timeout=int(timeout * 1000)), timeout=timeout)
+                locator.click(timeout=int(timeout * 1000), force=force),
+                timeout=timeout)
         else:
             await asyncio.wait_for(page.mouse.click(px, py), timeout=timeout)
     except Exception as exc:  # noqa: BLE001
-        return {"outcome": "error", "info": f"dispatch failed: {exc}",
+        # Class name included: bare TimeoutError stringifies empty, which
+        # used to produce undebuggable "dispatch failed: " lines.
+        return {"outcome": "error",
+                "info": f"dispatch failed: {exc.__class__.__name__}: {exc}",
                 "snapshot": ""}
     outcome, info = await platform.settle_after_action(prev_url, before_ids)
     snap = await _refresh_snapshot(platform)
@@ -388,14 +400,18 @@ async def verify_for_dispatch(platform, elements: list[ElementRef], idx: int,
                               expected_kind: str | None = None) -> tuple[dict, bool]:
     """Probe a target, recovering from a covering overlay once.
 
-    Returns (probe, dismissed). When the first probe reports covered, the
-    overlay is dismissed (Escape) and the point re-verified a single time —
-    the standard playbook for intercepted clicks: dismiss explicitly,
-    never force-click through. One recovery only; a still-covered point
-    stays a refusal (the runner's heal layer owns the retry).
+    Returns (probe, dismissed). When the first probe reports covered —
+    by status, or by verdict when the status is stale (kind drift over
+    a covered point, e.g. checkbox-vs-div on a bot-check page) — the
+    overlay is dismissed (Escape) and the point re-verified a single
+    time: the standard playbook for intercepted clicks, dismiss
+    explicitly, never force-click through. One recovery only; a
+    still-covered point stays a refusal (the runner's heal layer owns
+    the retry).
     """
     probe = await probe_target(platform, elements, idx, expected_kind)
-    if probe["status"] != "covered":
+    if probe["status"] != "covered" \
+            and not str(probe.get("verdict") or "").startswith("covered:"):
         return probe, False
     log(f"cover on element #{idx} ({probe['verdict']}) — dismissing once (Escape)")
     if not await _dismiss_cover(platform):
@@ -567,8 +583,28 @@ async def challenge_control(platform, elements: list[ElementRef], idx: int,
                 return msg
             kind = _challenge_kind(el)
             if kind == "captcha":
-                msg = (f"error: element #{idx} captcha/image challenge — "
-                       f"escalating to done (no solve attempted)")
+                # Image/text CAPTCHA: run the local ddddocr pipeline and
+                # return the structured result for JEV review. No typing,
+                # clicking, or dragging happens here — the next step's
+                # normal propose/decide path acts on the suggestion.
+                from .capability.captcha_ocr import (
+                    pack_result_line,
+                    solve_challenge,
+                )
+
+                try:
+                    page_text = await get_page_text(platform, limit=800)
+                except Exception:  # noqa: BLE001
+                    page_text = ""
+                ocr_res = await solve_challenge(
+                    platform, elements, idx, page_text)
+                if not ocr_res.available or ocr_res.error:
+                    reason = ocr_res.error or "backend missing"
+                    msg = (f"error: element #{idx} captcha/image challenge — "
+                           f"escalating to done (ocr {reason})")
+                    log(msg)
+                    return msg
+                msg = pack_result_line(idx, ocr_res)
                 log(msg)
                 return msg
             if kind == "none":
@@ -577,21 +613,80 @@ async def challenge_control(platform, elements: list[ElementRef], idx: int,
                 log(msg)
                 return msg
             probe, dismissed = await verify_for_dispatch(platform, elements, idx, expected_kind)
-            framed = (probe["status"] == "covered" and probe.get("frame_embedded")
-                      and bool(el.aria))
+            # Framed targets (recaptcha checkboxes) sit behind an iframe
+            # boundary elementFromPoint cannot pierce: dispatch natively via
+            # the aria-ref locator instead of refusing. A stale point
+            # verdict with an iframe cover verdict must not veto this
+            # either — native dispatch is identity-based (aria ref) with
+            # Playwright's own actionability checks, independent of the
+            # coordinate probe that went stale (seen live: Google /sorry/
+            # checkbox refused as "stale" with a covered:iframe point
+            # verdict, never attempted). Resolver-level stale (no
+            # frame_embedded key) stays a refusal.
+            framed = (probe.get("frame_embedded") and bool(el.aria)
+                      and probe["status"] in ("covered", "stale"))
             if probe["status"] not in ("ok", "through") and not framed:
-                msg = (f"error: element #{idx} target {probe['verdict']} — "
+                msg = (f"error: element #{idx} target {probe['verdict']} "
+                       f"({probe['status']}) — "
                        f"skipping challenge (no dispatch)")
                 log(msg)
                 return msg
             if kind == "checkbox":
                 native = el.aria if framed else None
+                # Machine tail for a shield attempt ("" when no family
+                # solve ran): appended to toggle results so failed
+                # token polls stay auditable without changing verdicts.
+                shield_attempt_tail = ""
+                if framed:
+                    # Shield family first: an iframe-embedded checkbox is
+                    # the Cloudflare Turnstile / reCAPTCHA shape (see
+                    # capability/shield_solve.py, ported from
+                    # genguzzz/shield-bypass). A family click + token poll
+                    # that succeeds returns a packed result for JEV
+                    # review; anything else falls through to the plain
+                    # native toggle below — behavior never regresses.
+                    from .capability.shield_solve import (
+                        detect_shield,
+                        pack_attempt_tail,
+                        pack_result_line,
+                        solve_shield,
+                    )
+
+                    shield_attempt_tail = ""
+                    try:
+                        shield_text = await get_page_text(platform, limit=800)
+                    except Exception:  # noqa: BLE001
+                        shield_text = ""
+                    det = await detect_shield(platform, shield_text)
+                    if det.detected and det.challenge_type in (
+                            "cf_turnstile", "recaptcha"):
+                        log(f"shield {det.challenge_type} conf={det.confidence:.2f} "
+                            f"on #{idx} — attempting native family solve")
+                        sol = await solve_shield(
+                            platform, det.challenge_type, timeout_s=15.0)
+                        if sol.success:
+                            msg = pack_result_line(idx, sol)
+                            log(msg)
+                            return msg
+                        # Failure keeps its error prefix for the failure
+                        # rails, but the attempt tail preserves the
+                        # structured record (family, token_len, elapsed,
+                        # error) for the audit trail — a 15s+ token poll
+                        # must never vanish into prose.
+                        shield_attempt_tail = " " + pack_attempt_tail(sol)
+                        log(f"shield {det.challenge_type} unsolved "
+                            f"({sol.error}) — falling back to native toggle")
                 if native:
                     log(f"iframe-embedded challenge #{idx} ({native}) — native locator dispatch")
                 res = await dispatch_verified_click(
-                    platform, probe["px"], probe["py"], native_aria=native)
+                    platform, probe["px"], probe["py"], native_aria=native,
+                    # Shield checkboxes animate: skip actionability waits
+                    # (upstream shield-bypass clicks force=True), or the
+                    # dispatch can hang past timeout without ever clicking.
+                    force=native is not None)
                 if res["outcome"] == "error":
-                    msg = f"error toggling challenge checkbox #{idx}: {res['info']}"
+                    msg = (f"error toggling challenge checkbox #{idx}: "
+                           f"{res['info']}{shield_attempt_tail}")
                     log(msg)
                     return msg
                 _bank_box(elements, idx, probe.get("box"),
@@ -605,6 +700,8 @@ async def challenge_control(platform, elements: list[ElementRef], idx: int,
                     msg += f" + {res['outcome']} {res['info']}"
                 if res["snapshot"]:
                     msg += f" + {res['snapshot']}"
+                if shield_attempt_tail:
+                    msg += shield_attempt_tail
                 log(msg)
                 return msg
             # Slider: drag the handle across the track in small human steps.

@@ -84,7 +84,9 @@ class CamoufoxPlatform(CursorTrackingMixin, BrowserActionsMixin):
         from where the cursor actually is.
         """
         self._last_cursor_pos = (float(x), float(y))
-        await asyncio.wait_for(self.page.mouse.move(float(x), float(y)), timeout=5.0)
+        from ..capability.human_move import mouse_move
+
+        await mouse_move(self.page, float(x), float(y), timeout=5.0)
 
     async def _ensure_tracker_machine(self):
         """Lazily initialize the TrackerMachine + Interpreter.

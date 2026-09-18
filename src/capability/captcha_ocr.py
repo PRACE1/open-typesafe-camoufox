@@ -1,5 +1,6 @@
 """captcha_ocr.py — ddddocr-backed CAPTCHA image pipeline (optional backend).
 
+Library: https://github.com/sml2h3/ddddocr
 Upstream: https://github.com/sml2h3/ddddocr (MIT, ~14.8k stars).
 API verified against master (compat/v1.py): ``DdddOcr(ocr, det, ...)`` with
 ``classification(img, png_fix, probability, ...)``,
@@ -33,7 +34,16 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from .aria_refs import resolve_ref
-from .logging_utils import log
+from .logging_utils import log as _base_log
+
+
+def log(msg: str, tag: str = "ddddocr") -> None:
+    """Hierarchical domain logger (default ``ddddocr[:sub]``).
+
+    Named after the actual OCR library:
+    https://github.com/sml2h3/ddddocr
+    """
+    _base_log(msg, tag=tag)
 
 BACKEND_NAME = "ddddocr"
 MIN_CONFIDENCE_TO_SUGGEST = 0.35
@@ -89,6 +99,7 @@ class CaptchaOcrResult(BaseModel):
     suggest_item: int | None = None
     elapsed_ms: int = 0
     error: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
 
     def to_record(self) -> dict[str, Any]:
         """Compact dict for JSONL audit (no raw image bytes, ever)."""
@@ -105,6 +116,7 @@ class CaptchaOcrResult(BaseModel):
             "suggest_item": self.suggest_item,
             "elapsed_ms": self.elapsed_ms,
             "error": self.error,
+            "data": self.data,
         }
 
     def to_history_line(self, step: int, idx: int) -> str:
@@ -120,11 +132,11 @@ class CaptchaOcrResult(BaseModel):
         sugg = ""
         if self.suggest_kind and self.suggest_item is not None:
             sugg = f" — suggest {self.suggest_kind} #{self.suggest_item} for JEV review"
-        return (f"step {step}: captcha-ocr #{idx} kind={self.kind} "
+        return (f"step {step}: ddddocr #{idx} kind={self.kind} "
                 f"text={detail!r:.60} conf={self.confidence:.2f}{sugg}")
 
 
-RESULT_MARKER = "captcha-ocr:"
+RESULT_MARKER = "ddddocr:"
 
 
 def pack_result_line(idx: int, result: "CaptchaOcrResult") -> str:
@@ -318,7 +330,137 @@ async def _capture_element_png(platform, aria: str,
             timeout=timeout_s + 2.0,
         )
     except Exception as exc:  # noqa: BLE001
-        log(f"[captcha-ocr] element capture failed: {exc}")
+        log(f"element capture failed: {exc}")
+        return None
+
+
+async def discover_grid_tiles(platform,
+                              timeout_s: float = 10.0) -> list[dict[str, Any]]:
+    """Find image-grid tile elements in the open bframe popup.
+
+    Queries the bframe frame-locator with the tile selector table
+    (ported from BetterWright's IMAGE_TILE_SELECTORS), reads each
+    element's box, and runs the pure geometry pipeline
+    (cluster → collapse → reading order → plausibility gate).
+    Returns ordered ``[{index, box, locator}]`` (viewport px) or [].
+    Fail-soft: any failure means "no tiles", never an exception.
+    """
+    from .shield_solve import RECAPTCHA_BFRAME_SEL
+    from .tiles import (
+        IMAGE_TILE_SELECTORS,
+        cluster_similar_boxes,
+        is_plausible_grid,
+        sort_reading_order,
+    )
+
+    try:
+        frame = platform.page.frame_locator(RECAPTCHA_BFRAME_SEL).first
+    except Exception:  # noqa: BLE001
+        return []
+    found: list[dict[str, Any]] = []
+    try:
+        for sel in IMAGE_TILE_SELECTORS:
+            try:
+                loc = frame.locator(sel)
+                try:
+                    count = await asyncio.wait_for(loc.count(), timeout=5.0)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not count:
+                    continue
+                try:
+                    handles = await asyncio.wait_for(
+                        loc.all(), timeout=timeout_s)
+                except Exception:  # noqa: BLE001
+                    continue
+                for handle in handles[:25]:
+                    try:
+                        box = await asyncio.wait_for(
+                            handle.bounding_box(), timeout=5.0)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not box:
+                        continue
+                    try:
+                        found.append({
+                            "x": float(box["x"]), "y": float(box["y"]),
+                            "width": float(box["width"]),
+                            "height": float(box["height"]),
+                            "locator": handle,
+                        })
+                    except (ValueError, TypeError, KeyError):
+                        continue
+                if found:
+                    break  # most-specific selector that hit wins
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        return []
+    boxes = [{"x": f["x"], "y": f["y"], "width": f["width"],
+              "height": f["height"]} for f in found]
+    ordered = sort_reading_order(cluster_similar_boxes(boxes))
+    if not is_plausible_grid(ordered):
+        return []
+    # Reattach locators by position (cluster/sort are pure on copies).
+    tiles: list[dict[str, Any]] = []
+    for i, box in enumerate(ordered):
+        match = next(
+            (f for f in found
+             if abs(f["x"] - box["x"]) < 3 and abs(f["y"] - box["y"]) < 3),
+            None)
+        if match is None:
+            continue
+        tiles.append({"index": i, "box": box, "locator": match["locator"]})
+    return tiles
+
+
+async def read_grid_tiles(platform, tiles: list[dict[str, Any]],
+                          timeout_s: float = 10.0) -> list[dict[str, Any]]:
+    """Screenshot + OCR each discovered tile (their capture_tiles stage).
+
+    Returns per-tile ``[{index, text, confidence}]`` readings — empty
+    text with 0.0 confidence when a tile won't read (photo tiles have
+    no text; the reading still proves the tile was captured). One log
+    line per tile is emitted by the caller ("show each"). Never raises.
+    """
+    readings: list[dict[str, Any]] = []
+    for tile in tiles or []:
+        text, conf = "", 0.0
+        try:
+            shot = await asyncio.wait_for(
+                tile["locator"].screenshot(timeout=int(timeout_s * 1000)),
+                timeout=timeout_s + 2.0)
+        except Exception:  # noqa: BLE001
+            shot = None
+        if shot:
+            try:
+                text, conf, _, _ = await solve_text_captcha(shot)
+            except Exception:  # noqa: BLE001
+                text, conf = "", 0.0
+        readings.append({"index": int(tile.get("index", 0)),
+                         "text": text, "confidence": round(conf, 3)})
+    return readings
+
+
+async def _capture_bframe_png(platform, timeout_s: float = 10.0) -> bytes | None:
+    """Screenshot the open recaptcha image-grid popup (bframe iframe).
+
+    Fallback when the element-map capture misses: the popup document
+    lives in a bframe iframe whose aria ref may be stale or absent
+    from the map. None when no bframe is present or the shot fails.
+    """
+    try:
+        from .shield_solve import RECAPTCHA_BFRAME_SEL
+
+        loc = platform.page.locator(RECAPTCHA_BFRAME_SEL).first
+        if await asyncio.wait_for(loc.count(), timeout=5.0) == 0:
+            return None
+        return await asyncio.wait_for(
+            loc.screenshot(timeout=int(timeout_s * 1000)),
+            timeout=timeout_s + 2.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"bframe capture failed: {exc}")
         return None
 
 
@@ -369,12 +511,16 @@ async def solve_text_captcha(
     backend reply yields a single neutral-confidence candidate.
     """
     def _run() -> tuple[str, float, list[CaptchaCandidate], str | None]:
+        # Lazy import: backends/ocr.py imports nothing from here at
+        # module level (LocalOcrBackend delegates back at call time),
+        # so this stays cycle-free in both directions.
+        from .backends import get_ocr_backend
+
+        backend = get_ocr_backend()
+        if not backend.available():
+            return "", 0.0, [], _unavailable_reason or "ocr backend unavailable"
         try:
-            ocr = _get_instance("ocr")
-        except ImportError as exc:
-            return "", 0.0, [], str(exc)
-        try:
-            res = ocr.classification(png, probability=True)
+            res = backend.classify(png, probability=True)
         except Exception as exc:  # noqa: BLE001
             return "", 0.0, [], f"classification failed: {exc}"
         if isinstance(res, dict):
@@ -395,12 +541,13 @@ async def solve_text_captcha(
 async def solve_detection(png: bytes) -> tuple[list[list[int]], str | None]:
     """Detection boxes for grid-style CAPTCHAs → (bboxes, error)."""
     def _run() -> tuple[list[list[int]], str | None]:
+        from .backends import get_ocr_backend
+
+        backend = get_ocr_backend()
+        if not backend.available():
+            return [], _unavailable_reason or "ocr backend unavailable"
         try:
-            det = _get_instance("det")
-        except ImportError as exc:
-            return [], str(exc)
-        try:
-            boxes = det.detection(png)
+            boxes = backend.detection(png)
             return [[int(v) for v in b] for b in (boxes or [])], None
         except Exception as exc:  # noqa: BLE001
             return [], f"detection failed: {exc}"
@@ -440,6 +587,10 @@ async def solve_challenge(platform, elements: list, idx: int,
     instruction = _instruction_from_dom(el, page_text)
     png = await _capture_element_png(platform, getattr(el, "aria", "") or "")
     if not png:
+        # The grid popup (bframe iframe) often has no stable map ref —
+        # shoot it directly so an open follow-up is captured, not lost.
+        png = await _capture_bframe_png(platform)
+    if not png:
         return CaptchaOcrResult(
             available=True, kind="captcha", instruction=instruction,
             error="element capture produced no image (ref gone or hidden)",
@@ -447,9 +598,21 @@ async def solve_challenge(platform, elements: list, idx: int,
         )
     text, conf, candidates, err = await solve_text_captcha(png)
     boxes: list[CaptchaBox] = []
+    tile_readings: list[dict[str, Any]] = []
     if not text or conf < MIN_CONFIDENCE_TO_SUGGEST:
-        # Low-confidence text reads on grid CAPTCHAs: add detection
-        # boxes so JEV still gets structured regions to reason over.
+        # Low-confidence text reads on grid CAPTCHAs: discover the tile
+        # elements, capture + read each (their capture_tiles stage), and
+        # add detection boxes so JEV gets structured regions to reason
+        # over. One log line per tile — show each.
+        tiles = await discover_grid_tiles(platform)
+        if tiles:
+            log(f"grid: {len(tiles)} tiles discovered", tag="ddddocr:grid")
+            tile_readings = await read_grid_tiles(platform, tiles)
+            for reading in tile_readings:
+                log(f"tile={reading['index']} "
+                    f"text={reading['text']!r:.30} "
+                    f"conf={reading['confidence']:.2f}",
+                    tag="ddddocr:tile")
         det_boxes, _ = await solve_detection(png)
         for i, b in enumerate(det_boxes[:16]):
             if len(b) >= 4:
@@ -458,6 +621,17 @@ async def solve_challenge(platform, elements: list, idx: int,
                     x2=b[2], y2=b[3], confidence=0.0,
                 ))
     suggest_item = _adjacent_input(elements, idx) if text and conf >= MIN_CONFIDENCE_TO_SUGGEST else None
+    # Grid follow-ups (3x3 image selects) have no text to OCR: detection
+    # boxes and per-tile captures ARE the result. A text miss with boxes
+    # or tile readings found is a partial success for JEV review, not a
+    # total failure — clearing the error keeps the packed record (and
+    # the open popup) on the audit trail instead of collapsing to
+    # "capture failed".
+    grid_evidence = bool(boxes) or bool(tile_readings)
+    data: dict[str, Any] = {}
+    if tile_readings:
+        data["tiles"] = tile_readings
+        data["grid"] = {"tiles": len(tile_readings)}
     return CaptchaOcrResult(
         available=True, kind="captcha", text=text,
         candidates=candidates,
@@ -466,5 +640,6 @@ async def solve_challenge(platform, elements: list, idx: int,
         suggest_kind="type_at" if suggest_item is not None else "",
         suggest_item=suggest_item,
         elapsed_ms=int((time.monotonic() - t0) * 1000),
-        error=err,
+        error=err if not grid_evidence else None,
+        data=data,
     )

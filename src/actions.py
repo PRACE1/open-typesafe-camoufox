@@ -12,7 +12,12 @@ from __future__ import annotations
 import asyncio
 
 from .capability.aria_refs import resolve_ref
-from .capability.logging_utils import log
+from .capability.logging_utils import log as _base_log
+
+
+def log(msg: str, tag: str = "actions") -> None:
+    """Hierarchical domain logger (default ``actions[:sub]``)."""
+    _base_log(msg, tag=tag)
 from .capability.resolve import (
     TEXT_ENTRY_KINDS,
     _confirm_aria_ref,
@@ -413,11 +418,13 @@ async def verify_for_dispatch(platform, elements: list[ElementRef], idx: int,
     if probe["status"] != "covered" \
             and not str(probe.get("verdict") or "").startswith("covered:"):
         return probe, False
-    log(f"cover on element #{idx} ({probe['verdict']}) — dismissing once (Escape)")
+    log(f"target=#{idx} cover={probe['verdict']} action=escape-once",
+        tag="actions:cover")
     if not await _dismiss_cover(platform):
         return probe, False
     fresh = await probe_target(platform, elements, idx, expected_kind)
-    log(f"cover dismissed, re-verified element #{idx}: {fresh['verdict']}")
+    log(f"target=#{idx} reverdict={fresh['verdict']}",
+        tag="actions:cover")
     return fresh, True
 
 
@@ -483,13 +490,36 @@ async def click_item(platform, elements: list[ElementRef], idx: int,
             through = status == "through"
             # Framed targets (recaptcha checkboxes) sit behind an iframe
             # boundary elementFromPoint cannot pierce: dispatch natively via
-            # the aria-ref locator instead of refusing.
+            # the aria-ref locator instead of refusing. This covers both
+            # covered AND stale verdicts — a decided checkbox probing as a
+            # live iframe is the normal shape of an embedded widget, not a
+            # re-rendered map (seen live: every click refused forever).
             tgt = next((e for e in elements if e.idx == idx), None)
-            native = (tgt.aria if tgt is not None and status == "covered"
+            native = (tgt.aria if tgt is not None
+                      and status in ("covered", "stale")
                       and probe.get("frame_embedded") and tgt.aria else None)
             if native:
-                log(f"iframe-embedded target #{idx} ({native}) — native locator dispatch")
-            if status == "stale":
+                # An open image-grid follow-up must survive: clicking the
+                # anchor now would close its popup, so refuse loudly and
+                # let heal route to challenge_control's OCR capture.
+                from .capability.shield_solve import detect_image_followup
+                try:
+                    _page_text = await get_page_text(platform, limit=800)
+                except Exception:  # noqa: BLE001
+                    _page_text = ""
+                _open, _via = await detect_image_followup(
+                    platform, _page_text)
+                if _open:
+                    msg = (f"error: element #{idx} image follow-up open "
+                           f"({_via}) — anchor click would close it, no "
+                           f"dispatch (route via challenge)")
+                    log(f"target=#{idx} state=open via={_via} "
+                        f"decision=refuse-anchor-click",
+                        tag="actions:click")
+                    return msg
+                log(f"target=#{idx} locator=native ref={native}",
+                    tag="actions:click")
+            if status == "stale" and native is None:
                 msg = (f"error: element #{idx} stale map (decided {expected_kind}, "
                        f"live {live_kind or 'gone'}) — skipping click (no dispatch)")
                 log(msg)
@@ -500,7 +530,8 @@ async def click_item(platform, elements: list[ElementRef], idx: int,
                 log(msg)
                 return msg
             if through:
-                log(f"click-through {verdict} for element #{idx}")
+                log(f"target=#{idx} mode=click-through cover={verdict}",
+                    tag="actions:click")
             # The click's own humanized move is the settle onto the center.
             vpx, vpy = probe["px"], probe["py"]
             _bank_box(elements, idx, probe.get("box"), vp)
@@ -529,7 +560,10 @@ async def click_item(platform, elements: list[ElementRef], idx: int,
                 msg += f" + navigated {info}"
             if snap:
                 msg += f" + {snap}"
-            log(msg)
+            log(f"target=#{idx} outcome={outcome} "
+                f"x={vpx / vp['width']:.3f} y={vpy / vp['height']:.3f} "
+                f"native={native is not None} (record in audit trail)",
+                tag="actions:click")
             return msg
         except Exception as exc:  # noqa: BLE001
             msg = f"error clicking element #{idx}: {exc}"
@@ -563,6 +597,24 @@ def _challenge_kind(el: ElementRef) -> str:
     return "none"
 
 
+def _followup_idx(elements: list[ElementRef], default_idx: int) -> int:
+    """Idx of the open image-grid follow-up element in the map.
+
+    Matches the grid instruction node ("select all images ...",
+    "verify you are human") so the OCR pipeline captures the popup,
+    not the anchor checkbox. Falls back to the checkbox idx (whose
+    capture then falls back to a direct bframe screenshot).
+    """
+    markers = ("select all images", "select each image",
+               "verify you are human")
+    for e in elements:
+        blob = (f"{e.kind} {e.type} {e.label} {e.placeholder} "
+                f"{e.text} {e.id}").lower()
+        if any(k in blob for k in markers):
+            return e.idx
+    return default_idx
+
+
 async def challenge_control(platform, elements: list[ElementRef], idx: int,
                             expected_kind: str | None = None) -> str:
     """Work a checkbox/slider challenge; refuse image CAPTCHAs out loud.
@@ -582,6 +634,29 @@ async def challenge_control(platform, elements: list[ElementRef], idx: int,
                 log(msg)
                 return msg
             kind = _challenge_kind(el)
+            # Show each stage: classify what is on screen right now
+            # (provider + stage + signal) so the feed names the attempt
+            # instead of burying it in probe verdicts.
+            from .capability.stage import classify_stage, collect_metadata
+            from .runner.policy import next_action
+
+            try:
+                _stage_text = await get_page_text(platform, limit=800)
+            except Exception:  # noqa: BLE001
+                _stage_text = ""
+            try:
+                _stage_title = await asyncio.wait_for(
+                    page.title(), timeout=5.0)
+            except Exception:  # noqa: BLE001
+                _stage_title = ""
+            _meta = await collect_metadata(page, _stage_text, _stage_title)
+            _stg = classify_stage(_meta)
+            _strat = next_action(_stg.stage, 0)
+            log(f"provider={_stg.provider} stage={_stg.stage} "
+                f"signal={_stg.get('signal') or 'no-signal'} "
+                f"auto={int(_stg.auto_solvable)} "
+                f"vision={int(_stg.needs_vision)} "
+                f"strategy={_strat['action']}", tag="actions:stage")
             if kind == "captcha":
                 # Image/text CAPTCHA: run the local ddddocr pipeline and
                 # return the structured result for JEV review. No typing,
@@ -612,7 +687,13 @@ async def challenge_control(platform, elements: list[ElementRef], idx: int,
                        f"(live kind {el.kind}) — skipping challenge (no dispatch)")
                 log(msg)
                 return msg
-            probe, dismissed = await verify_for_dispatch(platform, elements, idx, expected_kind)
+            # Probe WITHOUT dismissing first: for iframe-embedded
+            # targets the "cover" is the iframe host itself, and an
+            # Escape dismissal would close an open image follow-up
+            # popup (seen live: popup opens, Escape closes it, checkbox
+            # re-clicked forever, grid never captured). Only real
+            # overlays on non-framed targets get the Escape treatment.
+            probe = await probe_target(platform, elements, idx, expected_kind)
             # Framed targets (recaptcha checkboxes) sit behind an iframe
             # boundary elementFromPoint cannot pierce: dispatch natively via
             # the aria-ref locator instead of refusing. A stale point
@@ -625,83 +706,259 @@ async def challenge_control(platform, elements: list[ElementRef], idx: int,
             # frame_embedded key) stays a refusal.
             framed = (probe.get("frame_embedded") and bool(el.aria)
                       and probe["status"] in ("covered", "stale"))
-            if probe["status"] not in ("ok", "through") and not framed:
-                msg = (f"error: element #{idx} target {probe['verdict']} "
-                       f"({probe['status']}) — "
-                       f"skipping challenge (no dispatch)")
-                log(msg)
-                return msg
+            if framed:
+                dismissed = False
+            else:
+                probe, dismissed = await verify_for_dispatch(
+                    platform, elements, idx, expected_kind)
+                framed = (probe.get("frame_embedded") and bool(el.aria)
+                          and probe["status"] in ("covered", "stale"))
+            # Open-grid short-circuit: when the image follow-up popup
+            # is open, the anchor probe is MEANINGLESS (a div overlay
+            # covers the checkbox — seen live as covered:div/stale) yet
+            # the grid is fully solvable. Detect first, refuse later:
+            # an open grid bypasses the probe refusal AND the Escape
+            # dismiss (both would close what we're trying to capture).
+            _followup_open = False
             if kind == "checkbox":
+                from .capability.shield_solve import (
+                    detect_image_followup as _detect_followup,
+                )
+
+                try:
+                    _followup_text = await get_page_text(platform, limit=800)
+                except Exception:  # noqa: BLE001
+                    _followup_text = ""
+                _followup_open, _followup_via = await _detect_followup(
+                    platform, _followup_text)
+                if _followup_open:
+                    log(f"state=open via={_followup_via} "
+                        f"probe_refusal=bypassed escape=skipped",
+                        tag="actions:grid")
+                    framed = framed or bool(el.aria)
+                    dismissed = False
+            if probe["status"] not in ("ok", "through") and not framed:
+                if not _followup_open:
+                    msg = (f"error: element #{idx} target {probe['verdict']} "
+                           f"({probe['status']}) — "
+                           f"skipping challenge (no dispatch)")
+                    log(msg)
+                    return msg
+                log(f"state=open probe={probe['status']} decision=proceed",
+                    tag="actions:grid")
+            if kind == "checkbox":
+                # Staged plan from runner.policy (pure order, mechanics
+                # below): grid-capture alone when a follow-up is open,
+                # else shield → toggle → paid. Each stage returns on
+                # success; failures fall through to the next stage.
+                from .capability.shield_solve import (
+                    detect_image_followup,
+                    detect_shield,
+                )
+                from .runner.policy import STEP_SOLVERS, plan_challenge
+
+                try:
+                    followup_text = await get_page_text(platform, limit=800)
+                except Exception:  # noqa: BLE001
+                    followup_text = ""
+                followup, via = await detect_image_followup(
+                    platform, followup_text)
+                det = await detect_shield(platform, followup_text)
+                family = (det.challenge_type
+                          if det.detected else None)
+                from .capability.twocaptcha_client import (
+                    is_available as _tc_available,
+                )
+                from .capability.backends.kraken import (
+                    is_available as _kraken_available,
+                    new_session_id as _kraken_session,
+                )
+                _vision_ok = _kraken_available()
+                from .trajectory.solver_ledger import (
+                    score_for as _ledger_score,
+                    stats as _ledger_stats,
+                )
+
+                # Effectiveness evidence derives from runs/*/steps.jsonl
+                # (single source of truth) — no sidecar ledger to diverge.
+                _stats = _ledger_stats()
+                plan = plan_challenge(
+                    kind="checkbox", framed=framed,
+                    followup_open=followup, family=family,
+                    paid_available=_tc_available(),
+                    vision_available=_vision_ok, stats=_stats)
+                from ._log_sink import kv as _kv
+
+                _rates = {s: round(_ledger_score(
+                    STEP_SOLVERS.get(s, s), _stats), 2) for s in plan}
+                _kv("capability:actions:challenge_plan", target=f"#{idx}",
+                    strategy=">".join(
+                        f"{s}({_rates.get(s, '-')})" for s in plan))
+
+                def _rank_tail() -> str:
+                    import json as _json
+
+                    return " solver-rank:" + _json.dumps(
+                        {"order": list(plan), "rates": _rates},
+                        ensure_ascii=False)
+                _billing_session = _kraken_session() if _vision_ok else ""
                 native = el.aria if framed else None
                 # Machine tail for a shield attempt ("" when no family
                 # solve ran): appended to toggle results so failed
                 # token polls stay auditable without changing verdicts.
                 shield_attempt_tail = ""
-                if framed:
-                    # Shield family first: an iframe-embedded checkbox is
-                    # the Cloudflare Turnstile / reCAPTCHA shape (see
-                    # capability/shield_solve.py, ported from
-                    # genguzzz/shield-bypass). A family click + token poll
-                    # that succeeds returns a packed result for JEV
-                    # review; anything else falls through to the plain
-                    # native toggle below — behavior never regresses.
-                    from .capability.shield_solve import (
-                        detect_shield,
-                        pack_attempt_tail,
-                        pack_result_line,
-                        solve_shield,
-                    )
+                toggle_info = ""
+                for step in plan:
+                    # Show each solver as it runs: stage name + attempt
+                    # outcome lands in run.log AND the packed record logs.
+                    _kv("capability:actions:challenge_stage",
+                        target=f"#{idx}", stage=step)
+                    if step == "captchakraken":
+                        # Hosted vision grid solve (Kraken Abyss): tile
+                        # discovery → numbered overlay → model rounds →
+                        # tile clicks → verify gate. Falls through to
+                        # ocr_grid audit capture when it can't clear.
+                        from .capability.grid_solve import (
+                            pack_result_line as _pack_grid,
+                            run_vision_grid,
+                        )
+                        _grid_res = await run_vision_grid(
+                            platform, instruction="",
+                            session_id=_billing_session)
+                        if _grid_res.success:
+                            msg = _pack_grid(idx, _grid_res)
+                            log(f"vision grid solved rounds={_grid_res.rounds} "
+                                f"tiles={_grid_res.tiles_clicked} "
+                                f"(record in audit trail)",
+                                tag="actions:vision")
+                            return msg + _rank_tail()
+                        # Failed rounds must stay auditable (model picks,
+                        # verify labels, per-round trail) — same pattern
+                        # as shield-bypass-attempt: formatted JSON to console +
+                        # run.log, then fall through to OCR capture.
+                        from ._log_sink import emit_json as _emit_json
 
-                    shield_attempt_tail = ""
-                    try:
-                        shield_text = await get_page_text(platform, limit=800)
-                    except Exception:  # noqa: BLE001
-                        shield_text = ""
-                    det = await detect_shield(platform, shield_text)
-                    if det.detected and det.challenge_type in (
-                            "cf_turnstile", "recaptcha"):
-                        log(f"shield {det.challenge_type} conf={det.confidence:.2f} "
-                            f"on #{idx} — attempting native family solve")
+                        _emit_json({"event": "captchakraken-attempt",
+                                    "record": _grid_res.to_record()})
+                        log(f"unsolved error={_grid_res.error} "
+                            f"fallback=capture", tag="actions:vision")
+                        continue
+                    if step == "ddddocr":
+                        # Open image-grid follow-up: NEVER re-click the
+                        # checkbox (that closes the popup) — route the
+                        # grid to the OCR pipeline so the state machine
+                        # captures it instead of destroying it.
+                        from .capability.captcha_ocr import (
+                            pack_result_line as _pack_ocr,
+                            solve_challenge as _solve_grid,
+                        )
+                        fidx = _followup_idx(elements, idx)
+                        ocr_res = await _solve_grid(
+                            platform, elements, fidx, followup_text)
+                        _ok = bool(ocr_res.available and not ocr_res.error)
+                        if not _ok:
+                            msg = (f"error: element #{idx} image follow-up open "
+                                   f"({via}) but grid capture failed "
+                                   f"({ocr_res.error or 'backend missing'}) — "
+                                   f"leaving it open, no click dispatched")
+                            log(msg)
+                            return msg + _rank_tail()
+                        log(f"state=open via={via} route=ocr_grid "
+                            f"checkbox=untouched", tag="actions:grid")
+                        msg = _pack_ocr(fidx, ocr_res)
+                        return msg + _rank_tail()
+                    if step == "shield-bypass":
+                        # Native family click + token poll (shield_solve).
+                        # Success returns a packed result for JEV review;
+                        # failure keeps its error prefix for the failure
+                        # rails while the attempt tail preserves the
+                        # structured record for the audit trail.
+                        from .capability.shield_solve import (
+                            pack_attempt_tail,
+                            pack_result_line,
+                            solve_shield,
+                        )
+                        log(f"family={det.challenge_type} "
+                            f"conf={det.confidence:.2f} target=#{idx} "
+                            f"action=attempt", tag="actions:shield")
                         sol = await solve_shield(
                             platform, det.challenge_type, timeout_s=15.0)
                         if sol.success:
                             msg = pack_result_line(idx, sol)
-                            log(msg)
-                            return msg
-                        # Failure keeps its error prefix for the failure
-                        # rails, but the attempt tail preserves the
-                        # structured record (family, token_len, elapsed,
-                        # error) for the audit trail — a 15s+ token poll
-                        # must never vanish into prose.
+                            log(f"family={det.challenge_type} "
+                                f"solved token_len={sol.token_len} "
+                                f"(record in audit trail)",
+                                tag="actions:shield")
+                            return msg + _rank_tail()
                         shield_attempt_tail = " " + pack_attempt_tail(sol)
-                        log(f"shield {det.challenge_type} unsolved "
-                            f"({sol.error}) — falling back to native toggle")
-                if native:
-                    log(f"iframe-embedded challenge #{idx} ({native}) — native locator dispatch")
-                res = await dispatch_verified_click(
-                    platform, probe["px"], probe["py"], native_aria=native,
-                    # Shield checkboxes animate: skip actionability waits
-                    # (upstream shield-bypass clicks force=True), or the
-                    # dispatch can hang past timeout without ever clicking.
-                    force=native is not None)
-                if res["outcome"] == "error":
-                    msg = (f"error toggling challenge checkbox #{idx}: "
-                           f"{res['info']}{shield_attempt_tail}")
-                    log(msg)
-                    return msg
-                _bank_box(elements, idx, probe.get("box"),
-                          page.viewport_size or {"width": 1280, "height": 800})
-                msg = f"element #{idx} challenge checkbox toggled humanize=true"
-                if native:
-                    msg += " via native locator (iframe-embedded)"
-                if dismissed:
-                    msg += " + cover dismissed via Escape"
-                if res["outcome"] in ("newtab", "navigated") and res["info"]:
-                    msg += f" + {res['outcome']} {res['info']}"
-                if res["snapshot"]:
-                    msg += f" + {res['snapshot']}"
-                if shield_attempt_tail:
-                    msg += shield_attempt_tail
+                        log(f"family={det.challenge_type} "
+                            f"error={sol.error} fallback=toggle",
+                            tag="actions:shield")
+                        continue
+                    if step == "toggle":
+                        if native:
+                            log(f"target=#{idx} locator=native ref={native}",
+                                tag="actions:toggle")
+                        res = await dispatch_verified_click(
+                            platform, probe["px"], probe["py"],
+                            native_aria=native,
+                            # Shield checkboxes animate: skip actionability
+                            # waits (upstream shield-bypass clicks
+                            # force=True), or the dispatch can hang past
+                            # timeout without ever clicking.
+                            force=native is not None)
+                        if res["outcome"] == "error":
+                            toggle_info = res["info"]
+                            continue  # paid stage (when planned) is next
+                        _bank_box(elements, idx, probe.get("box"),
+                                  page.viewport_size or {"width": 1280, "height": 800})
+                        msg = f"element #{idx} challenge checkbox toggled humanize=true"
+                        if native:
+                            msg += " via native locator (iframe-embedded)"
+                        if dismissed:
+                            msg += " + cover dismissed via Escape"
+                        if res["outcome"] in ("newtab", "navigated") and res["info"]:
+                            msg += f" + {res['outcome']} {res['info']}"
+                        if res["snapshot"]:
+                            msg += f" + {res['snapshot']}"
+                        if shield_attempt_tail:
+                            msg += shield_attempt_tail
+                        log(f"target=#{idx} outcome={res['outcome']} "
+                            f"native={native is not None} "
+                            f"(record in audit trail)", tag="actions:toggle")
+                        return msg
+                    if step == "2captcha-python":
+                        # Last resort: paid 2captcha solve (planned only
+                        # when key + proxy are configured, so free runs
+                        # never spend money and never hang on polling).
+                        from .capability.twocaptcha_client import (
+                            extract_sitekey,
+                            pack_result_line as _tc_pack,
+                            submit_recaptcha_token,
+                        )
+                        try:
+                            _page_url = page.url
+                        except Exception:  # noqa: BLE001
+                            _page_url = ""
+                        _sitekey = await extract_sitekey(page)
+                        if _sitekey:
+                            log(f"target=#{idx} backend=2captcha "
+                                f"action=submit", tag="actions:paid")
+                            _tc_res = await submit_recaptcha_token(
+                                page, _sitekey, _page_url)
+                            if _tc_res.success:
+                                msg = _tc_pack(idx, _tc_res)
+                                log(f"target=#{idx} solved "
+                                    f"token_len={_tc_res.token_len} "
+                                    f"(record in audit trail)",
+                                    tag="actions:paid")
+                                return msg
+                            log(f"target=#{idx} error={_tc_res.error} "
+                                f"fallback=escalate-toggle-error",
+                                tag="actions:paid")
+                        continue
+                msg = (f"error toggling challenge checkbox #{idx}: "
+                       f"{toggle_info}{shield_attempt_tail}")
                 log(msg)
                 return msg
             # Slider: drag the handle across the track in small human steps.
@@ -720,13 +977,15 @@ async def challenge_control(platform, elements: list[ElementRef], idx: int,
                 prev_url = page.url
             except Exception:  # noqa: BLE001
                 prev_url = ""
+            from .capability.human_move import mouse_move
+
             mouse = page.mouse
-            await mouse.move(x0, cy)
+            await mouse_move(page, x0, cy)
             await mouse.down()
             try:
                 for i in range(1, 9):
                     x = x0 + (x1 - x0) * i / 8
-                    await mouse.move(x, cy)
+                    await mouse_move(page, x, cy)
                     await asyncio.sleep(0.05)
             finally:
                 await mouse.up()

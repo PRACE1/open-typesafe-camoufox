@@ -15,19 +15,32 @@ Confidence comes from the kind choice. The runner gates on it
 (min-confidence 0.4, two consecutive no-ops stop). Free text is NEVER
 composed here — kind=type_at / site=other only routes to writer.py.
 
+Transport is the official typesafe_sdk (AsyncTypeSafeClient.system_one);
+our Choice/Noul/Score question dicts map 1:1 onto its wire models, so
+the protocol is unchanged — only the client is no longer hand-rolled.
+Per https://pydantic.dev/docs/ai/models/typesafe/ notes that apply here:
+- State holds judged material only; every judgment lives in a question
+  (criteria what/not_for + focus). Never move questions into the state.
+- One judgment per question: kind/item/site are single picks, Nouls are
+  single flags, progress a single score. Compound questions return
+  plausible numbers with low confidence — split them instead.
+- Confidence semantics: Noul confidence is margin-doubled (|p-0.5|*2),
+  pick-one confidence is spread-based — neither is P(correct). Gates
+  were tuned empirically; TYPESAFE_MODEL defaults to the moving
+  jev-latest alias, so pin a versioned id (e.g. jev-1.13.0) before
+  calibrating thresholds, and re-check when the alias moves. The
+  versioned id that answered is recorded per run (run.json jev_model).
+
 No-key fallback returns kind=none @ 0.0 so the loop stays testable offline.
 Env is read at call time (load_env runs before the loop, after imports).
 """
 
 from __future__ import annotations
 
-import asyncio
 import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
-
-import httpx
 
 from .deps import ElementRef, FocusedField
 from .perception import build_state, host_of, norm_url
@@ -146,24 +159,110 @@ def _env() -> tuple[str, str, str]:
     base = os.environ.get("TYPESAFE_BASE_URL", "https://api.typesafe.ai/v1")
     key = os.environ.get("TYPESAFE_API_KEY", "")
     model = os.environ.get("TYPESAFE_MODEL", "jev-latest")
+    # The official SDK appends its own /v1/... path, so a base URL that
+    # already ends in /v1 (like the default above, kept for backward
+    # compat) would double to /v1/v1/systemone → 404.
+    base = base.rstrip("/")
+    if base.lower().endswith("/v1"):
+        base = base[: -len("/v1")] or base
     return base, key, model
 
 
+def _to_sdk_questions(questions: dict) -> dict:
+    """Translate our question dicts to typed typesafe_sdk questions.
+
+    Our ``{"type": "choice"|"noul"|"score", "instructions": {...},
+    "criteria": {...}}`` shape maps 1:1 onto the SDK wire models, so the
+    protocol (mutually exclusive criteria, Noul flags, progress Score)
+    is unchanged — only the transport is now official.
+    """
+    from typesafe_sdk import Choice, Noul, Score
+
+    out: dict = {}
+    for qid, spec in (questions or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        kind = str(spec.get("type", ""))
+        instructions = spec.get("instructions")
+        criteria = spec.get("criteria")
+        if kind == "choice":
+            out[qid] = Choice(instructions=instructions, criteria=criteria or {})
+        elif kind == "noul":
+            out[qid] = Noul(instructions=instructions, criteria=criteria)
+        elif kind == "score":
+            out[qid] = Score(instructions=instructions, criteria=criteria or [])
+        # Unknown question types are dropped (fail-soft) rather than
+        # sent malformed — the decoder defaults every missing answer.
+    return out
+
+
+def _from_sdk_response(resp: object) -> dict:
+    """Translate a SystemOneResponse back to our raw-answers dict shape.
+
+    ``{"answers": {qid: {"choice", "confidence"} | {"noul"} |
+    {"score"}}}`` — exactly what ``_decode`` and the heal/recovery/
+    captcha/restart decoders read, so nothing downstream changes.
+    """
+    answers: dict = {}
+    raw = getattr(resp, "answers", None) or {}
+    try:
+        items = raw.items()
+    except AttributeError:
+        return {"answers": {}}
+    for qid, ans in items:
+        try:
+            kind = type(ans).__name__
+        except Exception:  # noqa: BLE001
+            continue
+        if kind == "ChoiceAnswer":
+            entry: dict = {"choice": getattr(ans, "choice", None),
+                           "confidence": getattr(ans, "confidence", 0.0)}
+            try:
+                probs = getattr(ans, "probabilities", None)
+                if probs:
+                    entry["probabilities"] = probs
+            except Exception:  # noqa: BLE001
+                pass
+            answers[qid] = entry
+        elif kind == "NoulAnswer":
+            answers[qid] = {"noul": getattr(ans, "noul", 0.0)}
+        elif kind == "ScoreAnswer":
+            entry = {"score": getattr(ans, "score", 0.0)}
+            try:
+                entry["confidence"] = getattr(ans, "confidence", 0.0)
+            except Exception:  # noqa: BLE001
+                pass
+            answers[qid] = entry
+    model = getattr(resp, "model", None)
+    return {"answers": answers, "model": model}
+
+
 async def _post(payload: dict, timeout_s: float, base: str, key: str) -> dict:
-    headers = {"Authorization": f"Bearer {key}"}
-    backoff = 1.0
-    async with httpx.AsyncClient(timeout=timeout_s) as client:
-        for attempt in range(4):
-            res = await client.post(
-                f"{base.rstrip('/')}/systemone", json=payload, headers=headers
-            )
-            if res.status_code in (429, 529) and attempt < 3:
-                await asyncio.sleep(backoff)
-                backoff *= 2
-                continue
-            res.raise_for_status()
-            return res.json()
-    raise RuntimeError("unreachable")
+    """One System One request via the official typesafe_sdk transport.
+
+    Same signature and same return shape as the old hand-rolled httpx
+    call, so every caller and every ``_post`` stub in tests keeps
+    working. Retries (connection errors, timeouts, retryable statuses)
+    now come from the SDK's RetryPolicy instead of our backoff loop;
+    failures still raise into the callers' fail-soft fallbacks.
+    """
+    from typesafe_sdk import AsyncTypeSafeClient
+
+    client = AsyncTypeSafeClient(api_key=key, base_url=base or None,
+                                 timeout=timeout_s)
+    try:
+        resp = await client.system_one(
+            state=payload.get("state") or {},
+            questions=_to_sdk_questions(payload.get("questions")),
+            model=payload.get("model"),
+            timeout=timeout_s,
+        )
+    finally:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+    return _from_sdk_response(resp)
 
 
 def _item_option(e: ElementRef, visited: set[str],
@@ -337,8 +436,8 @@ class HealStrategy(str, Enum):
 HEAL_CRITERIA: dict[str, str] = {
     HealStrategy.REMAP_STALE.value: "Target moved or map re-rendered; re-probe and act on the fresh ref",
     HealStrategy.DISMISS_COVER.value: "Overlay, dropdown, or toast covers the target; dismiss it, then re-act",
-    HealStrategy.DRAG_SLIDER.value: "Target is a drag handle or slide-to-verify control",
-    HealStrategy.SOLVE_CHALLENGE.value: "Checkbox, Turnstile-style, or human-verification control blocks the task",
+    HealStrategy.DRAG_SLIDER.value: "The target IS a drag handle or slide-to-verify control (never for missing boxes or plain links/buttons/inputs)",
+    HealStrategy.SOLVE_CHALLENGE.value: "The target IS a checkbox, Turnstile-style, or human-verification control (never for missing boxes or plain links/buttons/inputs)",
     HealStrategy.EXPAND_CAPABILITY.value: "A novel widget needs a synthesized capability (wallet popup, canvas, custom drag)",
     HealStrategy.ABORT.value: "Unrecoverable blocker; stop the run honestly",
 }
@@ -346,6 +445,7 @@ HEAL_CRITERIA: dict[str, str] = {
 
 async def decide_heal_action(*, error_msg: str, last_kind: str,
                              page_text: str,
+                             target_kind: str = "",
                              timeout_s: float = 15.0) -> tuple[HealStrategy, float]:
     """Triage an execution failure into a recovery strategy + novelty score.
 
@@ -360,6 +460,7 @@ async def decide_heal_action(*, error_msg: str, last_kind: str,
         "model": model,
         "state": {"error": (error_msg or "")[:300],
                   "last_action": last_kind,
+                  "target_kind": (target_kind or "")[:40],
                   "page_excerpt": (page_text or "")[:400]},
         "questions": {
             "strategy": {
@@ -367,8 +468,12 @@ async def decide_heal_action(*, error_msg: str, last_kind: str,
                 "instructions": {
                     "question": "What recovery strategy resolves this execution failure?",
                     "focus": ("Pick expand_capability only when the page needs a widget "
-                              "interaction no basic verb covers; prefer the concrete "
-                              "remap/dismiss/drag/challenge options otherwise."),
+                              "interaction no basic verb covers. drag_slider and "
+                              "solve_challenge are ONLY for targets that ARE that "
+                              "control — a missing box (gone/hidden/no bounding "
+                              "box) or a plain link/button/input means "
+                              "remap_stale (re-probe the fresh map), never "
+                              "challenge. Prefer the fitting concrete option."),
                 },
                 "criteria": dict(HEAL_CRITERIA),
             },

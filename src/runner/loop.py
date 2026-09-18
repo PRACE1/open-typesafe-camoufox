@@ -72,6 +72,7 @@ from .helpers import (
     stop_limits,
 )
 from .proposal import _apply_proposal, proposal_executable, resolve_proposal_action
+from .._log_sink import kv as _kv
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +117,7 @@ async def _step_see(
         fresh_url = await platform.adopt_new_tab(known_tab_ids)
         if fresh_url:
             msg = f"step {steps}: adopted slow popup — {fresh_url}"
-            log(f"TABS   {msg}")
+            _kv("jev-solver:tabs:adopted", detail=msg[:160])
             history.append(msg)
             entry.setdefault("tabs", []).append(f"adopted {fresh_url}")
     known_tab_ids = platform.tab_ids()
@@ -130,7 +131,8 @@ async def _step_see(
         shot_streak = 0
     except Exception as exc:
         shot_streak += 1
-        log(f"SEE    screenshot failed x{shot_streak}: {exc}")
+        _kv("jev-solver:page:see", status="screenshot-failed",
+            streak=shot_streak, error=exc.__class__.__name__)
         entry["see"] = f"screenshot failed x{shot_streak}: {exc}"
         history.append(f"step {steps}: screenshot failed x{shot_streak}")
         entry["verdict"] = "unresolved"
@@ -140,14 +142,16 @@ async def _step_see(
                            f"screenshot failures — mission relaunches fresh")
             entry["restart"] = {"attempts": entry.get("restart_attempts", 0),
                                 "outcome": "terminal"}
-            log(f"STOP   {stop_reason}")
+            _kv("jev-solver:run:stop", reason=stop_reason)
             machine = entry.get("_machine")
             phase_trail = entry.get("_phase_trail", [])
             if machine is not None and phase_trail is not None:
                 if state_id(machine) == "see":
                     advance(machine, phase_trail, "abort")  # see -> stopped
                 else:
-                    log(f"STOP   machine at {state_id(machine)}, trail ends without terminal")
+                    _kv("jev-solver:run:stop",
+                        reason=f"machine at {state_id(machine)}, "
+                               "trail ends without terminal")
         elif screenshot_should_restart(shot_streak):
             restarted = True
             entry["restart_attempts"] = entry.get("restart_attempts", 0) + 1
@@ -175,7 +179,8 @@ async def _step_see(
                                 "tries": entry.get("restart_attempts", 0),
                                 "action": action, "dest": dest,
                                 "result": str(res)[:200]}
-            log(f"RESTART {action} -> {dest} — {str(res)[:100]}")
+            _kv("jev-solver:run:restart", action=action, dest=dest,
+                result=str(res)[:100])
         report_mod.append_transcript(run_dir, entry)
         await asyncio.sleep(interval)
         return {"restarted": restarted, "shot_streak": shot_streak,
@@ -223,13 +228,35 @@ async def _step_see(
         notes.append(banked)
         notes[:] = perception.trim_notes(notes)
         report_mod.append_memory(run_dir, f"- {banked}")
+        # Scored recall: Reader JSON → chunks → memory.jsonl → rerank
+        # vs task → winners join the notes JEV reasons over. Any
+        # failure keeps the excerpt above (fail-soft, offline-safe).
+        try:
+            from .memory import recall_page as _recall_page
+
+            try:
+                _live_html = await asyncio.wait_for(
+                    platform.page.content(), timeout=10.0)
+            except Exception:  # noqa: BLE001
+                _live_html = ""
+            recalled = await _recall_page(
+                run_dir=run_dir, report_mod=report_mod, url=page.url,
+                task_text=task_text, context_note=banked,
+                page_html=_live_html or "")
+        except Exception:  # noqa: BLE001
+            recalled = []
+        for _line in recalled or []:
+            notes.append(_line)
+        if recalled:
+            notes[:] = perception.trim_notes(notes)
+            _kv("jev-solver:memory:recalled", chunks=len(recalled))
     # Blocked (bot-check/captcha) pages stay in the loop: flag the
     # state and keep classifying positions + moving the cursor.
     blocked = perception.is_blocked_page(page.url, page_text)
     if blocked:
         msg = (f"step {steps}: page flagged {blocked} — working it "
                "like any page (classify, move, select, repeat)")
-        log(f"BLOCKED {msg}")
+        _kv("jev-solver:challenge:blocked", step=steps, reason=blocked)
         history.append(msg)
         entry["blocked"] = blocked
 
@@ -249,7 +276,9 @@ async def _step_see(
         f"{' (credential)' if focused.is_credential else ''} · "
         f"text={len(page_text.strip())}ch"
     )
-    log(f"SEE    {see_line}")
+    _kv("jev-solver:page:see", elements=len(elements), links=n_links,
+        external=n_ext, tabs=n_tabs, focused=focused.role or "-",
+        credential=focused.is_credential, text_chars=len(page_text.strip()))
     entry["see"] = see_line
     if page_text.strip():
         log(f"TEXT   {page_text.strip()[:160]}")
@@ -289,7 +318,10 @@ async def _step_steer(
     new_steers, steer_consumed = read_steers(steer_abs, steer_consumed)
     for kind_s, payload in new_steers:
         label = payload if kind_s == "goto" else (payload or "stop")
-        log(f"STEER  {label}")
+        # Console shows a capped preview; the full line still lands in
+        # the entry. Stale multi-KB steer files used to flood the feed.
+        preview = label if len(label) <= 160 else label[:157] + "..."
+        _kv("jev-solver:steer:line", kind=kind_s, preview=preview)
         entry.setdefault("steer", []).append(label)
         if kind_s == "stop":
             stopped = True
@@ -301,7 +333,7 @@ async def _step_steer(
             paused_delta = False
         if kind_s == "goto":
             res = await goto_url(platform, payload or "")
-            log(f"RESULT {res}")
+            _log_result(res)
             history.append(f"step {steps}: steer goto — {res}")
             moves += 1
         elif kind_s == "instruction" and payload:
@@ -377,18 +409,21 @@ async def _step_propose_decide(
             reading_note=reading_note, frontier=frontier,
         )
     except Exception as exc:  # noqa: BLE001
-        log(f"PROPOSE failed ({exc.__class__.__name__})")
+        _kv("jev-solver:action:propose", status="failed",
+            error=exc.__class__.__name__)
     # Phase clock: captured here (not by the caller) so propose/decide
     # durations are real — a single caller-side timestamp made decide
     # times negative and hid which phase burns the budget (seen live).
     t_proposed = time.time()
     if proposed is not None:
-        log(f"PROPOSE {proposed.kind}"
-            + (f" #{proposed.item}" if proposed.item is not None else "")
-            + (f" {proposed.url}" if proposed.url else "")
-            + f" : {proposed.rationale[:100]}")
+        import textwrap as _tw
+        _short_rationale = _tw.shorten(proposed.rationale, width=100,
+                                       placeholder="...")
+        _kv("jev-solver:action:propose", action=proposed.kind,
+            target=(f"#{proposed.item}" if proposed.item is not None else "-"),
+            url=proposed.url or "-", rationale=_short_rationale)
         entry["propose"] = (
-            f"{proposed.kind} #{proposed.item} : {proposed.rationale[:100]}"
+            f"{proposed.kind} #{proposed.item} : {_short_rationale}"
         )
         approval_struct = {
             "question": proposed.question,
@@ -413,7 +448,8 @@ async def _step_propose_decide(
             approval_question=approval_struct, frontier=frontier,
         )
     except Exception as exc:
-        log(f"DECIDE failed ({exc.__class__.__name__}); idling this step")
+        _kv("jev-solver:decision:select", status="failed",
+            error=exc.__class__.__name__)
         entry["decide"] = f"failed: {exc}"
         history.append(f"step {steps}: decide failed, idled")
         advance(machine, phase_trail, "perceived")  # see -> decide
@@ -430,14 +466,24 @@ async def _step_propose_decide(
     # the regex guard: a loading verdict forces wait even on readable
     # text, but a ready verdict never overrides a loading regex.
     ready_now = page_settled(page_text) and decision.page_ready >= 0.35
-    log(f"DECIDE {decision.kind.value} conf={conf:.2f}"
-        + (f" item=#{decision.element_idx}"
-           + (f"/{decision.item_ref}" if decision.item_ref else "")
-           if decision.element_idx is not None else "")
-        + (f" site={decision.target_url or 'other...'}" if decision.kind == Kind.GOTO else "")
-        + f" | ready={decision.page_ready:.2f} text?={decision.needs_text:.2f}"
-        + f" done?={decision.task_done:.2f} prog={decision.progress:.2f}"
-        + f" appr={decision.approval:.2f} fit={decision.fits:.2f}")
+    _kv("jev-solver:decision:select", action=decision.kind.value,
+        conf=round(conf, 2),
+        target=(f"#{decision.element_idx}/{decision.item_ref}"
+                if decision.element_idx is not None else "-"),
+        site=(decision.target_url or "other"
+              if decision.kind == Kind.GOTO else "-"),
+        ready=round(decision.page_ready, 2),
+        needs_text=round(decision.needs_text, 2),
+        done=round(decision.task_done, 2), progress=round(decision.progress, 2),
+        approval=round(decision.approval, 2), fit=round(decision.fits, 2))
+    # Full JEV answer set: every question's verbatim choice + confidence,
+    # so the feed shows what the model actually said (not just the
+    # decoded verdict). Raw payload stays in step-NN-answers.json.
+    try:
+        _kv("jev-solver:decision:answers",
+            **_jev_answer_summary(getattr(decision, "raw", None)))
+    except Exception:  # noqa: BLE001
+        pass
     entry["decide"] = (
         f"{decision.kind.value} conf={conf:.2f} "
         f"item={decision.element_idx} site={decision.target_url or ('other' if decision.propose_url else None)}"
@@ -462,17 +508,17 @@ async def _step_propose_decide(
         executable=proposal_executable(proposed, elements, frontier),
         approval=decision.approval)
     if route == "override":
-        log(f"APPROVED {proposed.kind}"
-            + (f" #{proposed.item}" if proposed.item is not None else "")
-            + f" (approval={decision.approval:.2f}) — executing proposal over Choice")
+        _kv("jev-solver:decision:approve", action=proposed.kind,
+            target=(f"#{proposed.item}" if proposed.item is not None else "-"),
+            approval=round(decision.approval, 2))
         history.append(f"step {steps}: approved proposal — {proposed.rationale[:100]}")
         entry["decide"] += " [approved-override]"
         decision = _apply_proposal(decision, proposed, elements)
         conf = decision.confidence
     elif route == "fallback":
-        log(f"VETO-FALLBACK {proposed.kind}"
-            + (f" #{proposed.item}" if proposed.item is not None else "")
-            + f" (approval={decision.approval:.2f}) — Choice pick vetoed/mismatched, trying proposal")
+        _kv("jev-solver:decision:approve", action=proposed.kind,
+            target=(f"#{proposed.item}" if proposed.item is not None else "-"),
+            approval=round(decision.approval, 2), mode="veto-fallback")
         history.append(f"step {steps}: veto fallback — {proposed.rationale[:100]}")
         entry["decide"] += " [veto-fallback]"
         decision = _apply_proposal(decision, proposed, elements)
@@ -490,8 +536,9 @@ async def _step_propose_decide(
             mismatch_run += 1
         else:
             mismatch_sig, mismatch_run = m_sig, 1
-        log(f"MISMATCH {decision.kind.value} #{decision.element_idx} "
-            f"(fit={decision.fits:.2f}) x{mismatch_run} — waiting neutrally")
+        _kv("jev-solver:decision:mismatch", action=decision.kind.value,
+            target=f"#{decision.element_idx}", fit=round(decision.fits, 2),
+            count=mismatch_run)
         history.append(f"step {steps}: pick mismatched its verb (fit={decision.fits:.2f}), waited")
         entry["act"] = f"mismatch wait ({decision.kind.value} #{decision.element_idx})"
         esc_url = None
@@ -504,7 +551,7 @@ async def _step_propose_decide(
                 page.url, escalated_urls)
         if esc_url is not None:
             escalated_urls.add(perception.norm_url(esc_url))
-            log(f"ESCALATE goto {esc_url} — stuck pick yields to writer destination")
+            _kv("jev-solver:gate:escalate", url=esc_url)
             history.append(f"step {steps}: escalated to goto {esc_url}")
             entry["decide"] += " [escalated-goto]"
             decision = replace(decision, kind=Kind.GOTO, element_idx=None,
@@ -528,7 +575,8 @@ async def _step_propose_decide(
             live_value = await read_input_value(platform, el0.aria)
         if should_submit_instead(decision.element_idx, elements,
                                  last_typed, page.url, live_value):
-            log(f"RETYPE type_at #{decision.element_idx} on filled field — submitting instead")
+            _kv("jev-solver:gate:retype",
+                target=f"#{decision.element_idx}")
             history.append(f"step {steps}: retype on filled field, submitting instead")
             entry["decide"] += " [retype-submit]"
             decision = replace(decision, kind=Kind.PRESS_ENTER, element_idx=None)
@@ -538,7 +586,7 @@ async def _step_propose_decide(
     # blank step with an idle verdict becomes a refresh instead.
     if (blank_streak >= 3 and blank_streak % 3 == 0
             and decision.kind in (Kind.WAIT, Kind.NONE)):
-        log(f"BLANKREFRESH blank SEE x{blank_streak} — reloading instead of waiting")
+        _kv("jev-solver:gate:blank-refresh", streak=blank_streak)
         history.append(f"step {steps}: blank page x{blank_streak}, refreshing instead of waiting")
         entry["decide"] += " [blank-refresh]"
         decision = replace(decision, kind=Kind.REFRESH, element_idx=None)
@@ -555,6 +603,126 @@ async def _step_propose_decide(
 # ---------------------------------------------------------------------------
 # GATE + ACT (the big branching)
 # ---------------------------------------------------------------------------
+
+
+def _log_challenge_result(res: str, steps: int, idx: int) -> dict | None:
+    """Console-print a challenge_control result without the inline blob.
+
+    Returns the parsed shield-bypass-attempt record (or None). The full ``res``
+    (with machine tail) still goes to entry/transcript for audit; the
+    console gets the short verdict plus the record as formatted JSON
+    (crawl4ai extracted_content convention). A 500-char inline JSON blob
+    on one RESULT line is unreadable on Windows consoles.
+    """
+    from .._log_sink import emit_json as _emit_json
+    from ..capability.shield_solve import unpack_attempt_tail as _unpack
+    try:
+        attempt = _unpack(res)
+    except Exception:
+        attempt = None
+    if attempt:
+        _kv("jev-solver:result:update",
+            summary=_short_result(res.split("shield-bypass-attempt:")[0]))
+        _emit_json({"event": "shield-bypass-attempt", "step": steps,
+                    "idx": idx, "record": attempt})
+    else:
+        _log_result(res)
+    return attempt
+
+
+def _jev_answer_summary(raw: Any) -> dict[str, str]:
+    """Per-question ``choice:confidence`` from a raw JEV payload.
+
+    Pure (nothing but the dict): unit-testable without a browser. Skips
+    non-question entries (progress score) and anything malformed.
+    """
+    answers = (raw or {}).get("answers", {}) or {}
+    out: dict[str, str] = {}
+    for qid, ans in answers.items():
+        if not isinstance(ans, dict) or qid == "progress":
+            continue
+        try:
+            conf = round(float(ans.get("confidence", 0.0) or 0.0), 2)
+        except (ValueError, TypeError):
+            conf = 0.0
+        out[str(qid)] = f"{ans.get('choice', '-')}:{conf}"
+    return out
+
+
+RANK_MARKER = "solver-rank:"
+
+
+def _parse_rank_tail(res: str) -> dict | None:
+    """Extract the solver-rank record from a result-line tail.
+
+    Actions appends ``solver-rank:{order,rates}`` to checkbox-path
+    returns (same machine-tail pattern as shield-bypass-attempt): the ranked
+    backend order plus the ledger rates behind it. None when absent.
+    """
+    import json as _json
+
+    try:
+        start = str(res or "").index(RANK_MARKER) + len(RANK_MARKER)
+    except ValueError:
+        return None
+    tail = str(res)[start:].strip()
+    depth = 0
+    for i, ch in enumerate(tail):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = _json.loads(tail[:i + 1])
+                except ValueError:
+                    return None
+                if isinstance(obj, dict) and isinstance(
+                        obj.get("order"), list):
+                    return obj
+                return None
+    return None
+
+
+def _short_result(res: str) -> str:
+    """Console summary of an action result: JSON cut, verdicts kept.
+
+    Packed lines read ``<head> MARKER{json} <tail-summary>`` — the tail
+    carries the human verdict (conf/text/awaiting-review) while the
+    JSON block prints separately via emit_json. Full ``res`` still
+    lands in entry + transcript + history.
+    """
+    text = str(res or "")
+    # Solver-rank tail is metadata, never console content: drop it
+    # before the verdict scan (it trails every other packed block).
+    if RANK_MARKER in text:
+        text = text.split(RANK_MARKER)[0].rstrip()
+    for marker in ("shield-bypass-attempt:", "shield-bypass:", "ddddocr:",
+                   "2captcha-python:", "captchakraken:"):
+        if marker not in text:
+            continue
+        head, rest = text.split(marker, 1)
+        start = rest.find("{")
+        tail = ""
+        if start >= 0:
+            depth = 0
+            for i, ch in enumerate(rest[start:]):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        tail = rest[start + i + 1:]
+                        break
+        text = (head + " " + tail).strip()
+        break
+    text = " ".join(text.split())
+    return (text[:157] + "...") if len(text) > 160 else (text or "(empty)")
+
+
+def _log_result(res: str) -> None:
+    """Console-print an action result as one kv summary line."""
+    _kv("jev-solver:result:update", summary=_short_result(res))
 
 
 async def _step_gate_act(
@@ -621,7 +789,8 @@ async def _step_gate_act(
     # the loop (seen live: low-conf back idled 3x and killed a run
     # that had more pages to read). DONE is always exempt.
     if confidence_gated(decision.kind, conf, min_confidence):
-        log(f"GATE   conf {conf:.2f} < {min_confidence} — idle (no-op {noops + 1})")
+        _kv("jev-solver:gate:idle", conf=round(conf, 2),
+            min_conf=min_confidence, noop=noops + 1)
         history.append(f"step {steps}: low conf {conf:.2f}, idled")
         entry["act"] = "idle (low confidence)"
         noops += 1
@@ -630,7 +799,8 @@ async def _step_gate_act(
         # so the guard's own protection can't kill the run via the
         # no-op counter. Genuine fixation (6x same target) stops
         # honestly with its own reason instead.
-        log(f"LOOPGUARD {decision.kind.value} #{decision.element_idx} x{sig_run} — forced wait (neutral)")
+        _kv("jev-solver:guard:loopguard", action=decision.kind.value,
+            target=f"#{decision.element_idx}", count=sig_run)
         history.append(f"step {steps}: loopguard tripped on {decision.kind.value} #{decision.element_idx}, waited")
         entry["act"] = f"loopguard wait ({decision.kind.value} #{decision.element_idx})"
         if sig_run >= fix_limit:
@@ -638,16 +808,16 @@ async def _step_gate_act(
             stop_reason = (f"loopguard fixation on {decision.kind.value} "
                            f"#{decision.element_idx} x{sig_run}")
             advance(machine, phase_trail, "abort")  # gate -> stopped
-            log(f"STOP   {stop_reason} — ending run")
+            _kv("jev-solver:run:stop", reason=stop_reason)
     elif decision.kind == Kind.WAIT:
         # Patience, not doubt: the screen is still loading. Neutral —
         # it neither resets nor advances the no-op count, so a slow
         # page can't trigger the two-no-op stop by itself.
-        log("IDLE   wait (page loading — neutral)")
+        _kv("jev-solver:gate:idle", mode="wait")
         history.append(f"step {steps}: wait")
         entry["act"] = "wait"
     elif decision.kind == Kind.NONE:
-        log(f"IDLE   none (no-op {noops + 1})")
+        _kv("jev-solver:gate:idle", mode="none", noop=noops + 1)
         history.append(f"step {steps}: none")
         entry["act"] = "none"
         noops += 1
@@ -656,18 +826,21 @@ async def _step_gate_act(
             msg = (f"step {steps}: DONE REJECTED (page not settled — "
                    f"regex={page_settled(page_text)}, model ready={decision.page_ready:.2f}) — "
                    "wait one step and re-observe")
-            log(f"DONE denied: {msg}")
+            _kv("jev-solver:gate:done", status="denied",
+                reason="page-not-settled")
             history.append(msg)
             entry["act"] = "DONE rejected (page not settled)"
         elif decision.task_done < 0.5:
             msg = (f"step {steps}: DONE REJECTED (model completion flag "
                    f"{decision.task_done:.2f} < 0.5) — keep working")
-            log(f"DONE denied: {msg}")
+            _kv("jev-solver:gate:done", status="denied",
+                reason="model-flag")
             history.append(msg)
             entry["act"] = "DONE rejected (model flag)"
         elif not page_text.strip():
             msg = f"step {steps}: DONE REJECTED (empty page text)"
-            log(f"DONE denied: {msg}")
+            _kv("jev-solver:gate:done", status="denied",
+                reason="empty-page")
             history.append(msg)
             entry["act"] = "DONE rejected (empty page)"
         else:
@@ -677,12 +850,13 @@ async def _step_gate_act(
             advance(machine, phase_trail, "finish")  # gate -> done
             entry["act"] = f"DONE ({note[:80]})"
             history.append(f"step {steps}: DONE — {note[:80]}")
-            log(f"DONE   {note[:120]}")
+            _kv("jev-solver:gate:done", status="accepted", note=note[:120])
     elif decision.kind == Kind.GOTO:
         if reading_cooldown_active(steps, entry.get("_reading_until_step", 0)):
             msg = (f"step {steps}: GOTO REJECTED (reading cooldown to step "
                    f"{entry.get('_reading_until_step', 0)}) — read the adopted result page first")
-            log(f"GOTO denied: {msg}")
+            _kv("jev-solver:gate:goto", status="denied",
+                reason="reading-cooldown")
             history.append(msg)
             entry["act"] = "goto rejected (reading)"
         else:
@@ -691,14 +865,15 @@ async def _step_gate_act(
                 proposed = await propose_url(task=effective_task, history=history)
                 target = proposed.url if proposed.ok else None
             if not target:
-                log("GOTO   no valid URL — idle")
+                _kv("jev-solver:gate:goto", status="denied",
+                    reason="no-url")
                 history.append(f"step {steps}: goto without URL, idled")
                 entry["act"] = "goto (no URL)"
                 noops += 1
             else:
-                log(f"ACT    goto {target}")
+                _kv("jev-solver:action:execute", action="goto", url=target)
                 res = await goto_url(platform, target)
-                log(f"RESULT {res}")
+                _log_result(res)
                 if action_failed(res):
                     history.append(f"step {steps}: goto failed — {res}")
                     entry["act"] = f"goto {target}"
@@ -712,9 +887,9 @@ async def _step_gate_act(
                     noops = 0
                     acted = True
     elif decision.kind == Kind.PRESS_ENTER:
-        log("ACT    key=Enter")
+        _kv("jev-solver:action:execute", action="press_enter")
         res = await press_key(platform, "Enter")
-        log(f"RESULT {res}")
+        _log_result(res)
         if action_failed(res):
             history.append(f"step {steps}: Enter failed — {res}")
             entry["act"] = "key=Enter"
@@ -729,9 +904,9 @@ async def _step_gate_act(
             acted = True
             last_effect_kind = "press_enter"
     elif decision.kind == Kind.PRESS_ESCAPE:
-        log("ACT    key=Escape")
+        _kv("jev-solver:action:execute", action="press_escape")
         res = await press_key(platform, "Escape")
-        log(f"RESULT {res}")
+        _log_result(res)
         if action_failed(res):
             history.append(f"step {steps}: Escape failed — {res}")
             entry["act"] = "key=Escape"
@@ -746,9 +921,9 @@ async def _step_gate_act(
             acted = True
             last_effect_kind = "press_escape"
     elif decision.kind == Kind.REFRESH:
-        log("ACT    refresh")
+        _kv("jev-solver:action:execute", action="refresh")
         res = await platform.refresh_page()
-        log(f"RESULT {res}")
+        _log_result(res)
         if action_failed(res):
             history.append(f"step {steps}: refresh failed — {res}")
             entry["act"] = "refresh"
@@ -763,9 +938,9 @@ async def _step_gate_act(
             acted = True
             last_effect_kind = "refresh"
     elif decision.kind == Kind.BACK:
-        log("ACT    back")
+        _kv("jev-solver:action:execute", action="back")
         res = await platform.go_back()
-        log(f"RESULT {res}")
+        _log_result(res)
         if action_failed(res):
             history.append(f"step {steps}: back failed — {res}")
             entry["act"] = "back"
@@ -780,10 +955,10 @@ async def _step_gate_act(
             acted = True
             last_effect_kind = "back"
     elif decision.kind == Kind.CLOSE_OTHERS:
-        log("ACT    close other tabs")
+        _kv("jev-solver:action:execute", action="close_others")
         n_closed = await platform.close_other_tabs()
         res = f"closed {n_closed} other tab(s)"
-        log(f"RESULT {res}")
+        _log_result(res)
         entry["act"] = "close_others"
         entry["result"] = res
         history.append(f"step {steps}: {res}")
@@ -794,29 +969,54 @@ async def _step_gate_act(
         idx = decision.element_idx
         by_idx = {e.idx: e for e in elements}
         if idx is None or idx not in by_idx:
-            log("ACT    challenge without valid item — idle")
+            _kv("jev-solver:action:execute", action="challenge",
+                status="no-item")
             history.append(f"step {steps}: challenge without item, idled")
             entry["act"] = "challenge (no item)"
             noops += 1
         else:
-            log(f"ACT    element #{idx} challenge")
+            _kv("jev-solver:action:execute", action="challenge",
+                target=f"#{idx}")
             res = await challenge_control(platform, elements, idx,
                                           expected_kind=by_idx[idx].kind)
-            log(f"RESULT {res}")
             # Failed shield attempts carry a machine tail that the
             # failure rails would otherwise swallow: parse it into the
             # audit block WITHOUT changing verdict accounting (the
             # error prefix still drives escalate/fail paths below).
-            try:
-                from ..capability.shield_solve import (
-                    unpack_attempt_tail as _unpack_attempt)
-                _attempt = _unpack_attempt(res)
-            except Exception:
-                _attempt = None
+            _attempt = _log_challenge_result(res, steps, idx)
             if _attempt:
                 entry["shield"] = _attempt
                 entry["shield_idx"] = idx
-            if "captcha-ocr:" in res:
+            # Solver ranking rides into the audit block AND history
+            # text: JEV reasons over past backend effectiveness with
+            # its existing machinery (history is model-visible).
+            _rank = _parse_rank_tail(res)
+            if _rank:
+                entry["solver_rank"] = _rank
+                _kv("jev-solver:decision:solvers",
+                    ranked=">".join(
+                        f"{s}({_rank.get('rates', {}).get(s, '-')})"
+                        for s in _rank.get("order", [])))
+                history.append(
+                    f"step {steps}: solvers ranked "
+                    + " > ".join(
+                        f"{s}({_rank.get('rates', {}).get(s, '-')})"
+                        for s in _rank.get("order", [])))
+                # Solver effectiveness joins the persistent notes so EVERY
+                # future JEV decision reasons over past backend results,
+                # not just the last 8 history lines.
+                _rank_note = (
+                    "solvers by past success: " + ", ".join(
+                        f"{s}={_rank.get('rates', {}).get(s, '-')}"
+                        for s in _rank.get("order", [])))
+                if not any(n.startswith("solvers by past success:") for n in notes):
+                    notes.append(_rank_note)
+                else:
+                    notes[:] = [n if not n.startswith(
+                        "solvers by past success:") else _rank_note
+                        for n in notes]
+                notes[:] = perception.trim_notes(notes)
+            if "ddddocr:" in res:
                 # ddddocr pipeline result: analysis only, no dispatch yet.
                 # Record the structured payload for JSONL audit; the OCR
                 # text + suggestion ride in history so the NEXT step's
@@ -853,15 +1053,23 @@ async def _step_gate_act(
                             f"text={str(ocr_record.get('text', ''))[:40]!r} "
                             f"(JEV abstained)")
                 history.append(
-                    f"step {steps}: captcha-ocr #{idx} "
+                    f"step {steps}: ddddocr #{idx} "
                     f"conf={float(ocr_record.get('confidence', 0.0) or 0.0):.2f}"
                     f"{sugg}")
-                log(f"CAPTCHA-OCR #{idx} conf={float(ocr_record.get('confidence', 0.0) or 0.0):.2f}{sugg}")
+                _kv("capability:ddddocr:done", target=f"#{idx}",
+                    conf=round(float(
+                        ocr_record.get("confidence", 0.0) or 0.0), 2))
+                # Structured OTC response as formatted JSON (crawl4ai
+                # extracted_content convention): the model infers the
+                # record from this block, not from the prose summary.
+                from .._log_sink import emit_json as _emit_json
+                _emit_json({"event": "ddddocr", "step": steps,
+                            "idx": idx, "record": ocr_record})
                 moves += 1
                 noops = 0
                 acted = True
-                last_effect_kind = "captcha_ocr"
-            elif "shield-solve:" in res:
+                last_effect_kind = "ddddocr"
+            elif "shield-bypass:" in res:
                 # Native shield solve dispatched and verified by token
                 # poll (not by a body-text diff). Record the structured
                 # payload for JSONL audit; the verdict rides in history
@@ -878,17 +1086,85 @@ async def _step_gate_act(
                 entry["shield_idx"] = idx
                 ok = bool(shield_record.get("success"))
                 history.append(
-                    f"step {steps}: shield-solve #{idx} "
+                    f"step {steps}: shield-bypass #{idx} "
                     f"{shield_record.get('challenge_type', '?')} "
                     f"success={ok} "
                     f"token_len={int(shield_record.get('token_len', 0) or 0)}")
-                log(f"SHIELD-SOLVE #{idx} "
-                    f"{shield_record.get('challenge_type', '?')} success={ok} "
-                    f"token_len={int(shield_record.get('token_len', 0) or 0)}")
+                _kv("capability:shield-bypass:done", target=f"#{idx}",
+                    family=shield_record.get("challenge_type", "?"),
+                    success=ok,
+                    token_len=int(
+                        shield_record.get("token_len", 0) or 0))
+                # Structured OTC response as formatted JSON (crawl4ai
+                # extracted_content convention): the model infers the
+                # record — including the solver's in-response logs —
+                # from this block, not from the prose summary.
+                from .._log_sink import emit_json as _emit_json
+                _emit_json({"event": "shield-bypass", "step": steps,
+                            "idx": idx, "record": shield_record})
                 moves += 1
                 noops = 0
                 acted = True
-                last_effect_kind = "shield_solve"
+                last_effect_kind = "shield-bypass"
+            elif "2captcha-python:" in res:
+                # Paid 2captcha solve dispatched and token injected.
+                # Same audit contract as shield-bypass: structured payload
+                # for JSONL, verdict in history, dedicated effect kind
+                # outside EFFECT_KINDS (token-verified, not a body diff).
+                from ..capability.twocaptcha_client import (
+                    unpack_result_line as _unpack_tc)
+
+                tc_record = _unpack_tc(res) or {}
+                entry["act"] = f"element #{idx} challenge"
+                entry["result"] = res
+                entry["twocaptcha"] = tc_record
+                entry["twocaptcha_idx"] = idx
+                ok = bool(tc_record.get("success"))
+                history.append(
+                    f"step {steps}: 2captcha-python #{idx} "
+                    f"{tc_record.get('captcha_type', '?')} "
+                    f"success={ok} "
+                    f"token_len={int(tc_record.get('token_len', 0) or 0)}")
+                _kv("capability:2captcha-python:done", target=f"#{idx}",
+                    family=tc_record.get("captcha_type", "?"), success=ok,
+                    token_len=int(tc_record.get("token_len", 0) or 0))
+                from .._log_sink import emit_json as _emit_json
+                _emit_json({"event": "2captcha-python", "step": steps,
+                            "idx": idx, "record": tc_record})
+                moves += 1
+                noops = 0
+                acted = True
+                last_effect_kind = "2captcha-python"
+            elif "captchakraken:" in res:
+                # Hosted vision grid solve (rounds of tile clicks +
+                # verify gate). Same audit contract as shield-bypass:
+                # structured payload for JSONL, verdict in history,
+                # dedicated effect kind outside EFFECT_KINDS.
+                from ..capability.grid_solve import (
+                    unpack_result_line as _unpack_grid)
+
+                grid_record = _unpack_grid(res) or {}
+                entry["act"] = f"element #{idx} challenge"
+                entry["result"] = res
+                entry["grid"] = grid_record
+                entry["grid_idx"] = idx
+                ok = bool(grid_record.get("success"))
+                history.append(
+                    f"step {steps}: captchakraken #{idx} "
+                    f"success={ok} "
+                    f"rounds={int(grid_record.get('rounds', 0) or 0)} "
+                    f"tiles={grid_record.get('tiles_clicked', [])}")
+                _kv("captcha:vision_grid:done", target=f"#{idx}",
+                    success=ok,
+                    rounds=int(grid_record.get("rounds", 0) or 0),
+                    tiles_clicked=grid_record.get("tiles_clicked", []))
+                from .._log_sink import emit_json as _emit_json
+                _emit_json({"event": "captchakraken", "step": steps,
+                            "idx": idx, "record": grid_record})
+                moves += 1
+                noops = 0
+                acted = True
+                last_effect_kind = "captchakraken"
             elif "escalating" in res:
                 # Image/puzzle CAPTCHA: TRY, don't stop — checkbox
                 # attempts, waits, and re-observes continue; only a
@@ -901,7 +1177,8 @@ async def _step_gate_act(
                 entry["step_captcha"] = True
                 entry["captcha_streak"] = entry.get("captcha_streak", 0) + 1
                 history.append(f"step {steps}: image challenge dead-end x{entry['captcha_streak']} — consider alternate routes (other engine, direct URL)")
-                log(f"CAPTCHA image/puzzle dead-end x{entry['captcha_streak']}/{CAPTCHA_MAX_ATTEMPTS} — keep trying")
+                _kv("capability:challenge:deadend",
+                    streak=entry["captcha_streak"], cap=CAPTCHA_MAX_ATTEMPTS)
             elif action_failed(res):
                 history.append(f"step {steps}: challenge failed — {res}")
                 entry["act"] = f"element #{idx} challenge"
@@ -919,7 +1196,8 @@ async def _step_gate_act(
         idx = decision.element_idx
         by_idx = {e.idx: e for e in elements}
         if idx is None or idx not in by_idx:
-            log(f"ACT    {decision.kind.value} without valid item — idle")
+            _kv("jev-solver:action:execute", action=decision.kind.value,
+                status="no-item")
             history.append(f"step {steps}: {decision.kind.value} without item, idled")
             entry["act"] = f"{decision.kind.value} (no item)"
             noops += 1
@@ -928,15 +1206,16 @@ async def _step_gate_act(
             if target.kind in BARE_CLICK_VETO_KINDS:
                 msg = (f"step {steps}: vetoed bare click on {target.kind} #{idx} — "
                        "text fields are typed (type_at), never bare-clicked")
-                log(f"VETO   {msg}")
+                _kv("jev-solver:gate:veto", detail=msg[:160])
                 history.append(msg)
                 entry["act"] = f"click vetoed ({target.kind} #{idx})"
                 noops += 1
             else:
-                log(f"ACT    element #{idx} (scroll+circle+click)")
+                _kv("jev-solver:action:execute", action="click_item",
+                    target=f"#{idx}")
                 res = await click_item(platform, elements, idx,
                                         expected_kind=by_idx[idx].kind)
-                log(f"RESULT {res}")
+                _log_result(res)
                 # Self-healing retry: a stale map, covered target, or
                 # vanished box detours ACT -> HEAL -> ACT for exactly
                 # one re-attempt (remapped by aria/selector/label),
@@ -949,14 +1228,15 @@ async def _step_gate_act(
                                            or "dispatch failed" in res):
                     old_label = (target.label or target.placeholder
                                  or target.text or target.id or "")
-                    log(f"HEAL   {res[:90]} — triaging")
+                    _kv("jev-solver:heal:triage", error=_short_result(res))
                     history.append(f"step {steps}: click failed, healing — {res[:90]}")
                     advance(machine, phase_trail, "act_now")  # gate -> act
                     advance(machine, phase_trail, "heal_needed")  # act -> heal
                     strategy, need_new = await decide_heal_action(
                         error_msg=res, last_kind="click_item",
-                        page_text=page_text)
-                    log(f"HEAL   triage -> {strategy.value} (novelty={need_new:.2f})")
+                        page_text=page_text, target_kind=target.kind)
+                    _kv("jev-solver:heal:strategy", strategy=strategy.value,
+                        novelty=round(need_new, 2))
                     history.append(f"step {steps}: heal triage -> {strategy.value}")
                     heal_edge = None
                     heal_abort = None
@@ -970,38 +1250,58 @@ async def _step_gate_act(
                         heal_edge = "heal_failed"
                     elif strategy in (HealStrategy.DRAG_SLIDER,
                                       HealStrategy.SOLVE_CHALLENGE):
-                        log(f"HEAL   failure is a challenge control — working it")
-                        res = await challenge_control(
-                            platform, elements, idx,
-                            expected_kind=target.kind)
-                        log(f"RESULT {res}")
-                        if action_failed(res):
-                            history.append(f"step {steps}: heal challenge failed — {res[:90]}")
+                        from .helpers import heal_strategy_fits as _fits
+
+                        if not _fits(strategy.value, target.kind,
+                                     old_label):
+                            _kv("jev-solver:heal:route",
+                                strategy="unfit-challenge",
+                                want=strategy.value,
+                                kind=target.kind)
+                            history.append(
+                                f"step {steps}: heal {strategy.value} "
+                                f"does not fit {target.kind} #{idx} — "
+                                f"skipping challenge dispatch")
                             machine.healed_target_ready_flag = False
                             advance(machine, phase_trail, "heal_failed")
                             heal_edge = "heal_failed"
                         else:
-                            entry["act"] = f"element #{idx} challenge (via heal)"
-                            entry["result"] = res
-                            history.append(f"step {steps}: heal worked challenge #{idx} — {res[:90]}")
-                            moves += 1
-                            noops = 0
-                            acted = True
-                            last_effect_kind = "challenge"
-                            heal_accounted = True
-                            machine.healed_target_ready_flag = True
-                            advance(machine, phase_trail, "healed")
-                            heal_edge = "healed"
+                            _kv("jev-solver:heal:route", strategy="challenge")
+                            res = await challenge_control(
+                                platform, elements, idx,
+                                expected_kind=target.kind)
+                            _heal_attempt = _log_challenge_result(
+                                res, steps, idx)
+                            if _heal_attempt:
+                                entry["shield"] = _attempt
+                                entry["shield_idx"] = idx
+                            if action_failed(res):
+                                history.append(f"step {steps}: heal challenge failed — {res[:90]}")
+                                machine.healed_target_ready_flag = False
+                                advance(machine, phase_trail, "heal_failed")
+                                heal_edge = "heal_failed"
+                            else:
+                                entry["act"] = f"element #{idx} challenge (via heal)"
+                                entry["result"] = res
+                                history.append(f"step {steps}: heal worked challenge #{idx} — {res[:90]}")
+                                moves += 1
+                                noops = 0
+                                acted = True
+                                last_effect_kind = "challenge"
+                                heal_accounted = True
+                                machine.healed_target_ready_flag = True
+                                advance(machine, phase_trail, "healed")
+                                heal_edge = "healed"
                     elif strategy == HealStrategy.DISMISS_COVER:
                         try:
                             await platform.page.keyboard.press("Escape")
                             await asyncio.sleep(0.6)
                         except Exception:
                             pass
-                        log("HEAL   dismissed once — one re-attempt")
+                        _kv("jev-solver:heal:route", strategy="dismiss-cover")
                         res = await click_item(platform, elements, idx,
                                                expected_kind=target.kind)
-                        log(f"RESULT {res}")
+                        _log_result(res)
                         if action_failed(res):
                             machine.healed_target_ready_flag = False
                             advance(machine, phase_trail, "heal_failed")
@@ -1024,7 +1324,7 @@ async def _step_gate_act(
                             box_norm=box_norm, page_text=page_text)
                         if code is None:
                             history.append(f"step {steps}: heal synthesis declined")
-                            log("HEAL   writer declined synthesis — accounting the failure")
+                            _kv("jev-solver:heal:route", strategy="synthesis-declined")
                             machine.healed_target_ready_flag = False
                             advance(machine, phase_trail, "heal_failed")
                             heal_edge = "heal_failed"
@@ -1036,7 +1336,8 @@ async def _step_gate_act(
                                     f.write(code)
                             except OSError:
                                 audit_path = "(audit write failed)"
-                            log(f"HEAL   synthesized {cap_name} -> {audit_path}")
+                            _kv("jev-solver:heal:synthesized", capability=cap_name,
+                                audit=audit_path)
                             ctx = {"ref": target.ref, "role": target.kind,
                                    "label": old_label, "box_norm": box_norm}
                             result = await validate_capability(
@@ -1044,7 +1345,8 @@ async def _step_gate_act(
                                 target.ref, ctx)
                             if not result.valid:
                                 history.append(f"step {steps}: healed code rejected — {result.error}")
-                                log(f"HEAL   validation failed ({result.error}) — accounting")
+                                _kv("jev-solver:heal:route", strategy="validation-failed",
+                                error=str(result.error)[:80])
                                 machine.healed_target_ready_flag = False
                                 advance(machine, phase_trail, "heal_failed")
                                 heal_edge = "heal_failed"
@@ -1058,7 +1360,7 @@ async def _step_gate_act(
                                     heal_res = "error: healed action timed out after 30s"
                                 except Exception as exc:
                                     heal_res = f"error: healed action raised: {exc}"
-                                log(f"RESULT {heal_res}")
+                                _log_result(heal_res)
                                 res = heal_res
                                 if action_failed(heal_res):
                                     history.append(f"step {steps}: healed action failed — {heal_res[:90]}")
@@ -1082,19 +1384,20 @@ async def _step_gate_act(
                             platform, old_label,
                             target.kind, target.sel, target.aria)
                         if new_idx is not None and new_idx != idx:
-                            log(f"HEAL   remapped #{idx} -> #{new_idx} — one re-attempt")
+                            _kv("jev-solver:heal:route", strategy="remap",
+                                src=f"#{idx}", dst=f"#{new_idx}")
                             history.append(f"step {steps}: healed #{idx} -> #{new_idx}, retrying")
                             # Retry against the FRESH list: refs and
                             # selectors belong to their own probe.
                             res = await click_item(platform, fresh, new_idx,
                                                    expected_kind=target.kind)
-                            log(f"RESULT {res}")
+                            _log_result(res)
                             machine.healed_target_ready_flag = True
                             advance(machine, phase_trail, "healed")  # heal -> act
                             heal_edge = "healed"
                             idx = new_idx
                         else:
-                            log("HEAL   no remap target — accounting the failure")
+                            _kv("jev-solver:heal:route", strategy="no-remap")
                             history.append(f"step {steps}: heal found no remap target")
                             machine.healed_target_ready_flag = False
                             advance(machine, phase_trail, "heal_failed")  # heal -> verify
@@ -1121,7 +1424,8 @@ async def _step_gate_act(
             elem = by_idx[idx]
             label = elem.label or elem.placeholder or elem.text or elem.id or f"element #{idx}"
             cred = is_credential_element(elem)
-            log(f"ACT    element #{idx} type (credential={cred})")
+            _kv("jev-solver:action:execute", action="type_at",
+                target=f"#{idx}", credential=cred)
             if not cred and decision.needs_text < 0.35:
                 msg = (f"step {steps}: model says no text needed at #{idx} "
                        f"(needs_text={decision.needs_text:.2f}) — skipping compose")
@@ -1159,7 +1463,7 @@ async def _step_gate_act(
             if text_to_type is not None:
                 res = await type_at(platform, elements, idx, text_to_type,
                                     expected_kind=elem.kind)
-                log(f"RESULT {res}")
+                _log_result(res)
                 if action_failed(res):
                     history.append(f"step {steps}: type failed — {res}")
                     entry["act"] = f"element #{idx} type={len(text_to_type)}ch"
@@ -1259,7 +1563,8 @@ async def _step_verify_recover(
                      last_effect_kind):
         dead_run += 1
         history.append(f"step {steps}: no observable effect from {last_effect_kind} x{dead_run}")
-        log(f"NOEFFECT {last_effect_kind} changed nothing x{dead_run}")
+        _kv("jev-solver:verify:noeffect", kind=last_effect_kind,
+            count=dead_run)
         if dead_run >= dead_limit and not done and not stopped:
             stopped = True
             stop_reason = f"action had no observable effect x{dead_run}"
@@ -1294,7 +1599,8 @@ async def _step_verify_recover(
             if choice != "none" and conf >= 0.5:
                 strategy = choice
                 triaged_by = f"jev({conf:.2f})"
-            log(f"RECOVER triage -> {choice} ({conf:.2f})")
+            _kv("jev-solver:recover:triage", strategy=choice,
+                conf=round(conf, 2))
         if strategy is not None:
             # Capture pre-recovery state so we can detect whether the
             # compensation actually changed anything on the page.
@@ -1318,7 +1624,8 @@ async def _step_verify_recover(
                 "strategy": strategy,
                 "result": rec_result[:200],
             }
-            log(f"RECOVER {strategy} ({reason}/{triaged_by}) — {rec_result[:120]}")
+            _kv("jev-solver:recover:execute", strategy=strategy,
+                reason=reason, by=triaged_by, result=rec_result[:120])
             recoveries.append({"step": steps, "reason": reason,
                                "strategy": strategy,
                                "result": rec_result[:200]})
@@ -1338,7 +1645,7 @@ async def _step_verify_recover(
                 # Recovery failed: treat like a noop so the next SEE
                 # can detect whether the page is stuck.
                 noops += 1
-                log(f"RECOVER FAILED {strategy} — will retry or stop")
+                _kv("jev-solver:recover:failed", strategy=strategy)
 
     # Last-resort synthesis: the per-step Noul never flags completion,
     # but the chat model can judge across pages. Once per run, when a
@@ -1350,18 +1657,20 @@ async def _step_verify_recover(
             and (dead_run >= dead_limit or noops >= noop_limit)
             and notes_url_count(notes) >= 2):
         synth_attempted = True
-        log("SYNTH  judging completion from notes...")
+        _kv("jev-solver:synth:judge", status="started")
         try:
             verdict = await summarize_task(task=effective_task, notes=notes)
         except Exception as exc:  # noqa: BLE001
             verdict = None
-            log(f"SYNTH  failed ({exc.__class__.__name__})")
+            _kv("jev-solver:synth:judge", status="failed",
+                error=exc.__class__.__name__)
         if verdict is not None and verdict.done:
             done = True
             advance(machine, phase_trail, "finish")  # verify -> done
             entry["act"] = f"DONE ({verdict.note[:80]})"
             history.append(f"step {steps}: DONE (synthesized) — {verdict.note[:80]}")
-            log(f"DONE   {verdict.note[:120]}")
+            _kv("jev-solver:gate:done", status="synthesized",
+                note=verdict.note[:120])
 
     if not step_captcha:
         captcha_streak = 0
@@ -1369,13 +1678,14 @@ async def _step_verify_recover(
         stopped = True
         stop_reason = f"{noop_limit} consecutive no-ops"
         advance(machine, phase_trail, "abort")  # verify -> stopped
-        log(f"STOP   {noop_limit} consecutive no-ops — ending run")
+        _kv("jev-solver:run:stop",
+            reason=f"{noop_limit} consecutive no-ops")
     if captcha_should_stop(captcha_streak) and not done and not stopped:
         stopped = True
         stop_reason = (f"image challenge persisted after "
                        f"{captcha_streak} attempts — needs a human")
         advance(machine, phase_trail, "abort")  # verify -> stopped
-        log(f"STOP   {stop_reason} — ending run honestly")
+        _kv("jev-solver:run:stop", reason=stop_reason)
     if heal_abort is not None and not done and not stopped:
         stopped = True
         stop_reason = heal_abort
@@ -1614,6 +1924,9 @@ def _write_step_record(
         "recovery": recovery,
         "captcha_ocr": entry.get("captcha_ocr") or {},
         "shield": entry.get("shield") or {},
+        "grid": entry.get("grid") or {},
+        "twocaptcha": entry.get("twocaptcha") or {},
+        "solver_rank": entry.get("solver_rank") or {},
         "frontier": frontier_summary,
         "confidence": confidence,
         "replayable": replayable,
@@ -1638,6 +1951,7 @@ async def _post_loop_summary(
     started: str,
     state: RunState,
     frontier=None,
+    decided_model: str | None = None,
 ) -> dict:
     """Harvest cursor events, write run.json, log the summary."""
     from ..run.logging_utils import log
@@ -1649,6 +1963,7 @@ async def _post_loop_summary(
         "finished": datetime.now().isoformat(timespec="seconds"),
         "steps": steps, "moves": moves, "task_done": done,
         "stopped": stopped, "stop_reason": stop_reason,
+        "jev_model": decided_model,
         "recoveries": recoveries,
         "cursor_moves": len(cursor["moves"]),
         "cursor_clicks": len(cursor["clicks"]),
@@ -1739,6 +2054,9 @@ async def run_decide_session(
     done = False
     stopped = False
     stop_reason = ""
+    decided_model: str | None = None  # versioned Jev id actually answering
+    # (docs: a run logged against jev-latest still records which model
+    # produced it — the alias moves, the record must not).
     paused = False
     noops = 0
     last_sig: tuple | None = None
@@ -1795,7 +2113,9 @@ async def run_decide_session(
     started = datetime.now().isoformat(timespec="seconds")
     t_end = None if budget_s <= 0 else time.time() + budget_s
 
-    async with AsyncCamoufox(headless=headless, humanize=False) as browser:
+    from ..capability.twocaptcha_client import launch_kwargs as _proxy_kw
+    async with AsyncCamoufox(headless=headless, humanize=False,
+                             **_proxy_kw()) as browser:
         # Browser-level humanize degrades per-dispatch at any level
         # (measured: 2.1s -> 8.4s -> timeouts within 3 moves). Our own
         # multi-hop loops draw human-like paths; pass --humanize to opt back
@@ -1810,7 +2130,8 @@ async def run_decide_session(
             platform._last_url = page.url
             await platform.reinject_tracker()
         await platform.start_cursor_tracking()
-        log(f"tracker selftest: {'PASS' if await platform.cursor_selftest() else 'WARN — cursor.json may be incomplete'}")
+        _kv("capability:cursor:selftest",
+            status="PASS" if await platform.cursor_selftest() else "WARN")
         known_tab_ids = platform.tab_ids()
         last_page_id = id(platform.page)
 
@@ -1821,7 +2142,7 @@ async def run_decide_session(
                 continue
             steps += 1
             entry: dict = {"n": steps, "t": round(time.time(), 1)}
-            log(f"──── step {steps}/{max_steps} " + "─" * 40)
+            _kv("jev-solver:step:start", step=steps, max_steps=max_steps)
             if not phase_trail:
                 phase_trail.append(state_id(machine))  # == "see"
             elif state_id(machine) != "see":
@@ -1951,6 +2272,13 @@ async def run_decide_session(
                 await asyncio.sleep(interval)
                 continue
             decision = pd["decision"]
+            try:
+                seen_model = (getattr(decision, "raw", None) or {}).get(
+                    "model")
+                if seen_model:
+                    decided_model = str(seen_model)
+            except Exception:  # noqa: BLE001
+                pass
             t_proposed = pd.get("t_proposed", t_top)
             t_decided = pd.get("t_decided", t_proposed)
             mismatch_sig = pd["mismatch_sig"]
@@ -2040,9 +2368,10 @@ async def run_decide_session(
                 report_mod=report_mod,
                 frontier=frontier,
             )
-            log(f"TIME   propose={t_proposed - t_top:.1f}s "
-                f"decide={t_decided - t_proposed:.1f}s "
-                f"act={t_acted_at - t_decided:.1f}s")
+            _kv("jev-solver:timing:step",
+                propose=f"{t_proposed - t_top:.1f}s",
+                decide=f"{t_decided - t_proposed:.1f}s",
+                act=f"{t_acted_at - t_decided:.1f}s")
 
             # Deferred reporting note: entry["phases"], the wire record,
             # and the transcript append live AFTER the stops below, so
@@ -2142,4 +2471,5 @@ async def run_decide_session(
         steps=steps, moves=moves, done=done, stopped=stopped,
         stop_reason=stop_reason, recoveries=recoveries,
         started=started, state=state, frontier=frontier,
+        decided_model=decided_model,
     )

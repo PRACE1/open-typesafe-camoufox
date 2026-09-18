@@ -14,6 +14,7 @@ from src.capability.shield_solve import (
     RESULT_MARKER,
     ShieldDetection,
     ShieldSolveResult,
+    detect_image_followup,
     detect_shield,
     pack_result_line,
     solve_shield,
@@ -27,13 +28,13 @@ def _run(coro):
 
 
 class _FakeLocator:
-    def __init__(self, count=0, values=None, clicked=None):
+    def __init__(self, count=0, values=None, clicked=None, visible=True):
         self._count = count
         # Shared (not copied): polls across locator instances must observe
         # the token materializing over time, like the live page.
         self._values = values if values is not None else []
         self.clicked = clicked if clicked is not None else []
-        self.visible = True
+        self.visible = visible
 
     @property
     def first(self):
@@ -76,9 +77,10 @@ class _FakeFrameLocator:
 
 
 class _FakePage:
-    def __init__(self, counts=None, token_values=None):
+    def __init__(self, counts=None, token_values=None, bframe_visible=True):
         self._counts = counts or {}
         self._token_values = token_values
+        self._bframe_visible = bframe_visible
         self._checkbox = _FakeLocator(count=1)
         self.frame_calls = []
         self.viewport_size = {"width": 1000, "height": 800}
@@ -87,7 +89,9 @@ class _FakePage:
         for key in self._counts:
             if key in sel:
                 return _FakeLocator(count=self._counts[key],
-                                    values=self._token_values)
+                                    values=self._token_values,
+                                    visible=self._bframe_visible
+                                    if "bframe" in sel else True)
         return _FakeLocator(count=0)
 
     def frame_locator(self, sel):
@@ -103,8 +107,8 @@ class _FakePlatform:
         self.page = page
 
 
-def _plat(counts=None, token_values=None):
-    return _FakePlatform(_FakePage(counts, token_values))
+def _plat(counts=None, token_values=None, bframe_visible=True):
+    return _FakePlatform(_FakePage(counts, token_values, bframe_visible))
 
 
 # -- detect ---------------------------------------------------------------
@@ -135,6 +139,36 @@ def test_detect_cf_waf_by_text():
 def test_detect_nothing_clean_page():
     det = _run(detect_shield(_plat(), "ordinary article text"))
     assert det.detected is False and det.challenge_type == "none"
+
+
+def test_followup_by_instruction_text():
+    found, via = _run(detect_image_followup(
+        _plat(), "Select all images with bicycles"))
+    assert found is True and via == "page-text"
+
+
+def test_followup_by_bframe_iframe():
+    found, via = _run(detect_image_followup(
+        _plat({"recaptcha/api2/bframe": 1}), "ordinary article text"))
+    assert found is True and via == "bframe"
+
+
+def test_followup_closed_clean_page():
+    # Anchor iframe alone (no bframe, no instruction text) is NOT a
+    # follow-up: the checkbox may still be clicked.
+    found, _ = _run(detect_image_followup(
+        _plat({"google.com/recaptcha": 1}), "ordinary article text"))
+    assert found is False
+
+
+def test_followup_hidden_bframe_is_not_open():
+    # Recaptcha renders the bframe iframe hidden from page load: mere
+    # presence must not block the first anchor click (seen live: zero
+    # clicks dispatched because the detector fired on a hidden frame).
+    found, _ = _run(detect_image_followup(
+        _plat({"recaptcha/api2/bframe": 1}, bframe_visible=False),
+        "ordinary article text"))
+    assert found is False
 
 
 # -- solve ----------------------------------------------------------------
@@ -281,7 +315,7 @@ def test_challenge_control_shield_success_packed(monkeypatch):
     plat = _ChallengePlatform(_FakePage())
     res = _run(_actions.challenge_control(plat, _checkbox_els(), 2,
                                           expected_kind="checkbox"))
-    assert "shield-solve:" in res and not res.startswith("error")
+    assert "shield-bypass:" in res and not res.startswith("error")
     obj = unpack_result_line(res)
     assert obj["success"] is True and obj["token_len"] == 64
 

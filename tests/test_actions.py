@@ -261,7 +261,8 @@ class _FakeMouse:
             raise RuntimeError("boom")
         self.moves.append(("click", px, py))
 
-    async def move(self, x, y):
+    async def move(self, x, y, **kwargs):
+        # steps=1 kwarg: production pins it (Camoufox hangs without it).
         self.moves.append(("move", x, y))
 
     async def down(self):
@@ -519,6 +520,10 @@ class _FakeAriaPage(_FakePage):
 
     def locator(self, sel):
         self.seen.append(sel)
+        if "bframe" in sel:
+            # No image-grid popup open in these scenarios: the bframe
+            # probe reads empty while anchor/token probes hit.
+            return _FakeAriaLocator(count=0)
         return self._locator
 
 
@@ -953,6 +958,25 @@ def test_click_item_framed_target_native_dispatch(monkeypatch):
     assert plat.page.keyboard.presses == ["Escape"]  # dismiss tried first
 
 
+def test_click_item_stale_iframe_dispatches_natively(monkeypatch):
+    """Decided-checkbox vs live-iframe is the normal embedded-widget
+    shape, not a re-render: click_item dispatches natively instead of
+    refusing forever (seen live: zero clicks dispatched on the demo)."""
+    from src.actions import click_item
+    box_el = _aria_el(idx=6, aria="f4e7", kind="checkbox",
+                      label="I'm not a robot")
+    els = [_el(i) for i in range(6)] + [box_el]
+    _stub_find(monkeypatch, els)
+    loc = _FakeAriaLocator(
+        ident={"kind": "checkbox", "role": "checkbox",
+               "label": "I'm not a robot"})
+    plat = _FakePlatform2(_FakeAriaPage(loc, point="covered:iframe"))
+    res = _run(click_item(plat, els, 6, expected_kind="checkbox"))
+    assert "native locator (iframe-embedded)" in res
+    assert "stale map" not in res
+    assert loc.clicked == [10000]
+
+
 async def _shield_fast_fail(platform, challenge_type, timeout_s=30.0):
     """Fast-failing shield solve: exercises the fallback wiring without
     burning the 30s production token-poll deadline."""
@@ -1059,6 +1083,110 @@ def test_challenge_checkbox_stale_iframe_still_toggles_natively(monkeypatch):
     res = _run(challenge_control(plat, els, 6, expected_kind="checkbox"))
     assert "challenge checkbox toggled" in res and "native locator" in res
     assert loc.clicked == [10000]
-    # Stale-with-cover gets the one-shot Escape dismiss, then the native
-    # toggle still dispatches through the aria identity.
-    assert plat.page.keyboard.presses == ["Escape"]
+    # No Escape dismiss on iframe covers: the "cover" is the iframe host
+    # itself, and Escape would close an open image follow-up popup before
+    # the grid can be captured. The native toggle dispatches through the
+    # aria identity without it.
+    assert plat.page.keyboard.presses == []
+
+
+def test_challenge_checkbox_open_followup_routes_to_ocr(monkeypatch):
+    """An open image-grid follow-up must reach the OCR pipeline — never a
+    re-click (which closes the popup) and never an Escape (same effect).
+
+    Seen live on the recaptcha demo: checkbox toggled, grid popup opened,
+    next step re-clicked the checkbox and the popup died uncaptured.
+    """
+    from src.actions import challenge_control
+    from src.capability.captcha_ocr import CaptchaOcrResult
+
+    async def _followup_open(platform, page_text=""):
+        return True, "bframe"
+
+    async def _grid_ocr(platform, elements, idx, page_text=""):
+        return CaptchaOcrResult(available=True, kind="captcha",
+                                text="", confidence=0.0, elapsed_ms=5)
+
+    monkeypatch.setattr("src.capability.shield_solve.detect_image_followup",
+                        _followup_open)
+    monkeypatch.setattr("src.capability.captcha_ocr.solve_challenge",
+                        _grid_ocr)
+    box_el = _aria_el(idx=6, aria="f4e7", kind="checkbox",
+                      label="I'm not a robot")
+    els = [_el(i) for i in range(6)] + [box_el]
+    _stub_find(monkeypatch, els)
+    loc = _FakeAriaLocator(
+        ident={"kind": "checkbox", "role": "checkbox",
+               "label": "I'm not a robot"})
+    plat = _FakePlatform2(_FakeAriaPage(loc, point="covered:iframe"))
+    res = _run(challenge_control(plat, els, 6, expected_kind="checkbox"))
+    assert "ddddocr:" in res and not res.startswith("error")
+    assert loc.clicked == []  # checkbox untouched
+    assert plat.page.keyboard.presses == []  # no Escape either
+
+
+def test_challenge_vision_failure_audits_then_captures(monkeypatch):
+    """Vision configured but unsolved: the failed grid record is emitted
+    as formatted JSON (forensics, billing trail) and the flow falls
+    through to OCR capture — never a silent drop, never a re-click."""
+    import json as _json
+
+    from src.actions import challenge_control
+    from src.capability.captcha_ocr import CaptchaOcrResult
+    from src.capability.grid_solve import GridSolveResult
+
+    async def _followup_open(platform, page_text=""):
+        return True, "bframe"
+
+    async def _vision_fail(platform, instruction="", session_id="",
+                           max_rounds=3):
+        return GridSolveResult(
+            available=True, rounds=2, tiles_clicked=[0],
+            logs=["round 1: model returned 1 tile(s)"],
+            error="rounds exhausted without clear")
+
+    async def _grid_ocr(platform, elements, idx, page_text=""):
+        return CaptchaOcrResult(available=True, kind="captcha",
+                                text="", confidence=0.0, elapsed_ms=5)
+
+    monkeypatch.setattr("src.capability.shield_solve.detect_image_followup",
+                        _followup_open)
+    monkeypatch.setattr("src.capability.grid_solve.run_vision_grid",
+                        _vision_fail)
+    monkeypatch.setattr("src.capability.captcha_ocr.solve_challenge",
+                        _grid_ocr)
+    monkeypatch.setenv("CAPTCHA_KRAKEN_API_KEY", "ck_live_test")
+    box_el = _aria_el(idx=6, aria="f4e7", kind="checkbox",
+                      label="I'm not a robot")
+    els = [_el(i) for i in range(6)] + [box_el]
+    _stub_find(monkeypatch, els)
+    loc = _FakeAriaLocator(
+        ident={"kind": "checkbox", "role": "checkbox",
+               "label": "I'm not a robot"})
+    plat = _FakePlatform2(_FakeAriaPage(loc, point="covered:iframe"))
+    res = _run(challenge_control(plat, els, 6, expected_kind="checkbox"))
+    assert "ddddocr:" in res and not res.startswith("error")
+    assert loc.clicked == []  # checkbox untouched throughout
+
+
+def test_challenge_checkbox_no_followup_clicks_normally(monkeypatch):
+    """No follow-up open: the checkbox path is unchanged (shield solve,
+    then native toggle). Guards the new guard."""
+    from src.actions import challenge_control
+
+    async def _no_followup(platform, page_text=""):
+        return False, ""
+
+    monkeypatch.setattr("src.capability.shield_solve.detect_image_followup",
+                        _no_followup)
+    monkeypatch.setattr("src.capability.shield_solve.solve_shield",
+                        _shield_fast_fail)
+    box_el = _aria_el(idx=6, aria="f4e7", kind="checkbox", label="I agree")
+    els = [_el(i) for i in range(6)] + [box_el]
+    _stub_find(monkeypatch, els)
+    loc = _FakeAriaLocator(
+        ident={"kind": "checkbox", "role": "checkbox", "label": "I agree"})
+    plat = _FakePlatform2(_FakeAriaPage(loc, point="covered:iframe"))
+    res = _run(challenge_control(plat, els, 6, expected_kind="checkbox"))
+    assert "challenge checkbox toggled" in res and "native locator" in res
+    assert loc.clicked == [10000]

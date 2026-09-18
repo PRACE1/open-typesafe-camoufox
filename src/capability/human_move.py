@@ -6,12 +6,15 @@ dispatch pays a humanize cost that scales with the browser's
 humanize level (historical: 1.0 ~1.35s, 0.4 ~0.50s, 0.15 ~0.18s,
 0.3 ~0.3-0.4s per dispatch).
 
-WARNING (2026-09-18): browser-level humanize currently degrades per
-dispatch at ANY level (measured: 2.1s -> 8.4s -> timeouts within 3
-moves), wedging every mouse op until nothing dispatches. The runner
-therefore defaults humanize OFF (see --humanize to opt back in); our
-own multi-hop loops still draw human-like paths, and the per-dispatch
-timeout guards below stay as the tripwire.
+ROOT CAUSE (2026-09-18, measured): Camoufox's input pipeline treats an
+OMITTED steps key as "humanize this move", expanding it into smoothing
+substeps that never drain — 1.0s -> 4.0s -> 8.1s -> 16s -> TimeoutError
+per consecutive dispatch (keyboard/evaluate unaffected at 0.01s).
+Explicit steps=1 dispatches stay at ~0.01s forever. ALL cursor moves
+funnel through mouse_move() below, which pins steps=1. The runner still
+defaults humanize OFF (see --humanize); our own multi-hop loops draw
+the human-like paths, and the per-dispatch timeout guards stay as the
+tripwire.
 
 Path shape (independent of the browser flag): the HumanMoveMouse
 statistical model (bundled PCA/GMM, 300 real human samples) picks lateral
@@ -69,14 +72,29 @@ def subsample_arc(xy: np.ndarray, k: int) -> np.ndarray:
     return xy[idx]
 
 
+async def mouse_move(page, x: float, y: float,
+                     timeout: float = 5.0) -> None:
+    """Single verified cursor dispatch.
+
+    ``steps=1`` MUST always be passed explicitly: Camoufox's input
+    pipeline treats an omitted steps key as "humanize this move",
+    expanding it into smoothing substeps that never drain — measured
+    1.0s -> 4.0s -> 8.1s -> 16s -> TimeoutError per consecutive dispatch,
+    while steps=1 dispatches stay at ~0.01s. Every in-browser cursor move
+    in this repo funnels through here.
+    """
+    await asyncio.wait_for(
+        page.mouse.move(float(x), float(y), steps=1), timeout=timeout)
+
+
 def _move_with_timeout(page, x: float, y: float):
-    return asyncio.wait_for(page.mouse.move(x, y), timeout=5.0)
+    return mouse_move(page, x, y, timeout=5.0)
 
 
 async def _move_with_timeout_strict(page, x: float, y: float) -> None:
     """Like _move_with_timeout but surfaces a descriptive TimeoutError."""
     try:
-        await asyncio.wait_for(page.mouse.move(x, y), timeout=5.0)
+        await mouse_move(page, x, y, timeout=5.0)
     except asyncio.TimeoutError:
         raise TimeoutError(f"mouse.move({x},{y}) timed out after 5s")
 
@@ -153,6 +171,108 @@ async def _replay(
         x = max(1.0, min(float(x), vp_w - 1.0))
         y = max(1.0, min(float(y), vp_h - 1.0))
         await _move_with_timeout_strict(page, x, y)
+
+
+def _subsample_cursory(
+    pts: list[tuple[float, float]], max_hops: int,
+) -> list[tuple[float, float]]:
+    """Thin dense cursory output to a dispatch budget, endpoints kept."""
+    if len(pts) <= max_hops or max_hops < 2:
+        return list(pts)
+    idx = [round(i * (len(pts) - 1) / (max_hops - 1)) for i in range(max_hops)]
+    return [pts[i] for i in dict.fromkeys(idx)]
+
+
+async def cursory_move(
+    page,
+    start,
+    end,
+    *,
+    seed: int | None = None,
+    max_hops: int = 8,
+    vp: dict | None = None,
+) -> bool:
+    """One cursory-rendered move: recorded-human trajectory, thinned.
+
+    Vinyzu/cursory replays real recorded human paths (morphs the nearest
+    recording onto start→end) instead of our synthetic bezier/ellipse
+    math. Dense 60Hz output is subsampled to the dispatch budget — the
+    browser-side humanize IS the timing, same contract as _replay.
+    Returns True on success, False on any failure (caller falls back).
+    """
+    try:
+        from cursory import generate_trajectory
+    except Exception as exc:  # noqa: BLE001
+        log(f"[cursory] unavailable: {exc}")
+        return False
+    try:
+        pts, _timings = await asyncio.to_thread(
+            generate_trajectory,
+            (float(start[0]), float(start[1])),
+            (float(end[0]), float(end[1])),
+            60, 1, seed, 0.65,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"[cursory] generate failed: {exc}")
+        return False
+    vp_w, vp_h = (vp["width"], vp["height"]) if vp else (1280, 800)
+    try:
+        await _replay(page,
+                      _subsample_cursory(
+                          [(float(x), float(y)) for x, y in pts], max_hops),
+                      vp_w, vp_h)
+    except Exception as exc:  # noqa: BLE001
+        log(f"[cursory] replay failed: {exc.__class__.__name__}: {exc}")
+        return False
+    return True
+
+
+async def cursory_loop(
+    page,
+    cx: float,
+    cy: float,
+    rx: float,
+    ry: float,
+    *,
+    hops: int = 5,
+    vp: dict | None = None,
+    seed: int | None = None,
+) -> tuple[float, float] | None:
+    """One clean revolution around (cx, cy), arcs rendered by cursory.
+
+    Same shape contract as human_loop (evenly spaced ellipse waypoints,
+    first dispatch doubles as the approach, the following click closes
+    the last gap onto center) — but each arc is a recorded-human path
+    morphed onto its chord instead of a synthetic ellipse hop.
+    Returns the start point on success; None on failure.
+    """
+    hops = max(3, int(hops))
+    t = np.linspace(0.0, 2 * np.pi, hops, endpoint=False)
+    waypoints = [(float(cx + np.cos(a) * rx), float(cy + np.sin(a) * ry))
+                 for a in t]
+    path: list[tuple[float, float]] = []
+    for prev, nxt in zip(waypoints, waypoints[1:]):
+        try:
+            from cursory import generate_trajectory
+        except Exception as exc:  # noqa: BLE001
+            log(f"[cursory] unavailable: {exc}")
+            return None
+        try:
+            pts, _timings = await asyncio.to_thread(
+                generate_trajectory, prev, nxt, 60, 1, seed, 0.65)
+        except Exception as exc:  # noqa: BLE001
+            log(f"[cursory] arc failed: {exc}")
+            return None
+        seg = _subsample_cursory(
+            [(float(x), float(y)) for x, y in pts], 3)
+        path.extend(seg if not path else seg[1:])
+    vp_w, vp_h = (vp["width"], vp["height"]) if vp else (1280, 800)
+    try:
+        await _replay(page, path, vp_w, vp_h)
+    except Exception as exc:  # noqa: BLE001
+        log(f"[cursory-loop] replay failed: {exc.__class__.__name__}: {exc}")
+        return None
+    return waypoints[0]
 
 
 async def human_loop(

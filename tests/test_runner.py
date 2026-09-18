@@ -577,3 +577,71 @@ def test_verify_recover_done_skips_dead_rail_abort(tmp_path):
         last_effect_kind="click_item")))
     assert vr["done"] is True and vr["stopped"] is False
     assert len(trail) == 3  # no abort attempted from done
+
+
+def test_heal_strategy_fits_challenge_only_controls():
+    from src.runner.helpers import heal_strategy_fits
+
+    # Checkbox/slider targets fit challenge strategies.
+    assert heal_strategy_fits("solve_challenge", "checkbox", "robot") is True
+    assert heal_strategy_fits("drag_slider", "slider", "") is True
+    # Captcha-marked elements fit even with other kinds.
+    assert heal_strategy_fits("solve_challenge", "image",
+                              "select all images") is True
+    assert heal_strategy_fits("solve_challenge", "button",
+                              "verify you are human") is True
+    # Plain elements and missing boxes never fit: the refusal in
+    # challenge_control ("not a checkbox/slider") is guaranteed, so
+    # dispatching is pure waste.
+    assert heal_strategy_fits("solve_challenge", "link", "More") is False
+    assert heal_strategy_fits("solve_challenge", "button", "Submit") is False
+    assert heal_strategy_fits("solve_challenge", "input", "?") is False
+    assert heal_strategy_fits("solve_challenge", "", "") is False
+    assert heal_strategy_fits("drag_slider", "link", "x") is False
+    # Non-challenge strategies fit everything.
+    assert heal_strategy_fits("remap_stale", "link", "x") is True
+    assert heal_strategy_fits("dismiss_cover", "", "") is True
+    assert heal_strategy_fits("abort", "", "") is True
+
+
+def test_short_result_keeps_tail_verdict():
+    from src.runner.loop import _short_result
+
+    assert _short_result(
+        'element #5 ddddocr:{"a": 1} conf=0.00 '
+        "awaiting JEV review") == \
+        "element #5 conf=0.00 awaiting JEV review"
+    assert _short_result("plain line") == "plain line"
+    assert _short_result("") == "(empty)"
+    assert len(_short_result("x" * 500)) <= 160
+
+
+def test_jev_answer_summary_shows_every_question():
+    from src.runner.loop import _jev_answer_summary
+
+    raw = {"answers": {
+        "kind": {"choice": "challenge", "confidence": 0.97},
+        "item": {"choice": "f1e7", "confidence": 0.8},
+        "site": {"choice": "other", "confidence": 0.5},
+        "progress": {"score": 1.0},
+        "broken": "not-a-dict",
+        "vague": {"choice": "x"},
+    }}
+    assert _jev_answer_summary(raw) == {
+        "kind": "challenge:0.97", "item": "f1e7:0.8",
+        "site": "other:0.5", "vague": "x:0.0"}
+    assert _jev_answer_summary(None) == {}
+    assert _jev_answer_summary({}) == {}
+
+
+def test_parse_rank_tail_extracts_order_and_rates():
+    from src.runner.loop import _parse_rank_tail
+
+    res = ('element #5 ok solver-rank:{"order": ["captchakraken", '
+           '"ddddocr"], "rates": {"captchakraken": 0.8, "ddddocr": 0.0}}')
+    rank = _parse_rank_tail(res)
+    assert rank is not None
+    assert rank["order"] == ["captchakraken", "ddddocr"]
+    assert rank["rates"]["captchakraken"] == 0.8
+    assert _parse_rank_tail("plain result line") is None
+    assert _parse_rank_tail("solver-rank:not-json") is None

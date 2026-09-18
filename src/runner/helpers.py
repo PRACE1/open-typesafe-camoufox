@@ -65,6 +65,35 @@ def escalation_target(mismatch_run: int, candidate_url: str | None,
     return candidate_url
 
 
+_CHALLENGE_KINDS = ("checkbox", "slider")
+
+_CHALLENGE_MARKERS = (
+    "captcha", "recaptcha", "puzzle", "verify you are human",
+    "i'm not a robot", "not a robot", "slide to", "drag", "checkbox",
+    "select all images", "select each image", "image grid",
+)
+
+
+def heal_strategy_fits(strategy_value: str, target_kind: str,
+                       label: str = "") -> bool:
+    """True when a heal strategy fits the failed target.
+
+    ``drag_slider`` / ``solve_challenge`` dispatch into
+    ``challenge_control``, which refuses anything that isn't a
+    checkbox/slider/captcha control — sending a plain link, button,
+    input, or a gone box there always ends in a refusal ("not a
+    checkbox/slider ... no dispatch"). Those mistriages must fall back
+    before dispatching, not after failing. All other strategies fit
+    every target. Pure.
+    """
+    if strategy_value not in ("drag_slider", "solve_challenge"):
+        return True
+    if (target_kind or "") in _CHALLENGE_KINDS:
+        return True
+    blob = f"{target_kind or ''} {label or ''}".lower()
+    return any(marker in blob for marker in _CHALLENGE_MARKERS)
+
+
 def stop_limits(max_steps: int) -> tuple[int, int, int]:
     """(noop, dead-run, fixation) stop limits scaled to the step budget.
 

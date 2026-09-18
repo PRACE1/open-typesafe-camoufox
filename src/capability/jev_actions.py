@@ -14,10 +14,11 @@ JevCapability: 2-tool mixin (read_frame + move_cursor) on top of CamoufoxCapabil
   rest; HUMANIZE_LEVEL speeds each dispatch to ~0.3s), optional click/type/
   key.
   ELEMENT MODE (action.element=<idx>): the video-agent pattern —
-  scroll-into-view -> model-based highlight (a single clean 5-hop loop via
-  _hover_and_human_highlight; the first hop doubles as the approach and the
-  click's own humanized move settles the center; geometric octagon fallback)
-  -> click focus -> type -> key. The idx comes from find_elements().
+  scroll-into-view -> cursory-rendered highlight (recorded-human arcs
+  via _hover_and_highlight; the first dispatch doubles as the approach
+  and the click's own humanized move settles the center; direct cursory
+  settle fallback) -> click focus -> type -> key. The idx comes from
+  find_elements().
 
 find_elements() probes the live DOM for actionable elements (inputs,
 buttons, links) in reading order and returns the element map the planner
@@ -187,9 +188,9 @@ class JevCapability(CamoufoxCapability):
         """Humanized cursor action. humanize forced on (HUMANIZE_LEVEL-scaled).
 
         Element mode (action.element set): video-agent pattern —
-        scroll-into-view -> clean model loop highlight (first hop doubles as
-        the curved approach; the click's own humanized move settles the
-        center; octagon fallback) -> click focus -> type -> key.
+        scroll-into-view -> cursory ring highlight (first dispatch doubles
+        as the curved approach; the click's own humanized move settles the
+        center; direct cursory settle fallback) -> click focus -> type -> key.
         Pixel mode: model move -> click (focus) -> type -> key.
         Typed values resolve {ENV_NAME} placeholders at runtime and are NEVER logged.
         """

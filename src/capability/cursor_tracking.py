@@ -15,6 +15,7 @@ import asyncio
 import random
 from typing import Any
 
+from .._log_sink import kv as _kv
 from .logging_utils import log, log_verbose
 from .cursor_tracker_script import CURSOR_TRACKER_INIT_SCRIPT
 
@@ -47,7 +48,7 @@ class CursorTrackingMixin:
             return  # already running
         self._stop_idle_motion = False
         self._idle_motion_task = asyncio.create_task(self._idle_motion_loop())
-        log("idle motion loop started — cursor will drift while no tool is active")
+        _kv("capability:cursor:idle", status="started")
 
     async def stop_idle_motion(self) -> None:
         """Stop the idle-cursor loop and let the last move finish."""
@@ -61,7 +62,7 @@ class CursorTrackingMixin:
             except Exception:
                 pass
         self._idle_motion_task = None
-        log("idle motion loop stopped")
+        _kv("capability:cursor:idle", status="stopped")
 
     def resume_idle_motion(self) -> None:
         """Re-arm the idle drift loop after a tool action finishes."""
@@ -152,7 +153,9 @@ class CursorTrackingMixin:
                     step_y = rng.uniform(-10, 10)
                     nx = max(40.0, min(vp["width"] - 40.0, self._idle_cur_x + step_x))
                     ny = max(40.0, min(vp["height"] - 40.0, self._idle_cur_y + step_y))
-                    await asyncio.wait_for(page.mouse.move(nx, ny), timeout=5.0)
+                    from .human_move import mouse_move
+
+                    await mouse_move(page, nx, ny, timeout=5.0)
                     self._idle_cur_x = nx
                     self._idle_cur_y = ny
                     self._last_cursor_pos = (nx, ny)
@@ -264,7 +267,8 @@ class CursorTrackingMixin:
             # to the boolean.
             is_our_nav = self._is_navigating_state() if self._tracker_interp else self._navigating
             tag = "ours" if is_our_nav else "EXTERNAL"
-            log(f"[nav:{self._rel_time()}] framenavigated ({tag}): {old_url} -> {new_url}")
+            _kv("capability:nav:framenavigated", scope=tag,
+                old=old_url or "-", new=new_url or "-")
             if is_our_nav:
                 # safe_goto already harvested and will re-inject after load.
                 return
@@ -285,7 +289,8 @@ class CursorTrackingMixin:
                 request = response.request
                 if request.resource_type != "document" or request.frame != page.main_frame:
                     return
-                log(f"[nav:{self._rel_time()}] document response {response.status} {response.url}")
+                _kv("capability:nav:response", status=response.status,
+                    url=response.url)
             except Exception:
                 pass
 
@@ -393,7 +398,9 @@ class CursorTrackingMixin:
                 if check:
                     started = True
             if started:
-                log(f"cursor tracking started (startTime={self._tracking_start_time:.0f}ms)")
+                _kv("capability:cursor:tracking",
+                    status="started",
+                    start_time=f"{self._tracking_start_time:.0f}ms")
                 # Start the idle-motion loop now so the cursor drifts while the
                 # LLM thinks between tool calls. The loop yields to any tool
                 # that acquires the page lock, so it never fights scroll/click.
@@ -475,8 +482,10 @@ class CursorTrackingMixin:
             self._accumulated_moves.extend(moves)
             self._accumulated_clicks.extend(clicks)
         if moves or clicks or not quiet:
-            log(f"cursor tracker partial harvest: +{len(moves)} moves, +{len(clicks)} clicks "
-                 f"(total: {len(self._accumulated_moves)} moves, {len(self._accumulated_clicks)} clicks)")
+            _kv("capability:cursor:harvest", phase="partial",
+                moves=len(moves), clicks=len(clicks),
+                total_moves=len(self._accumulated_moves),
+                total_clicks=len(self._accumulated_clicks))
 
     async def reinject_tracker(self) -> None:
         """Re-inject the cursor tracker into the main world of the current page.
@@ -621,14 +630,12 @@ class CursorTrackingMixin:
                 raw_before = await page.evaluate(probe_plain)
 
             before = _json.loads(raw_before) if isinstance(raw_before, str) else raw_before
-            log(
-                f"[cursor-selftest] tracker present={before.get('present')} "
-                f"started={before.get('started')} harvestFn={before.get('harvestFn')} "
-                f"moves={before.get('moves')}"
-            )
+            _kv("capability:cursor:selftest", phase="probe",
+                present=before.get("present"), started=before.get("started"),
+                harvest_fn=before.get("harvestFn"), moves=before.get("moves"))
             if not before.get("present"):
-                log("[cursor-selftest] FAIL: window.__cursorTracker is MISSING in the main world "
-                     "— injection did not land. cursor.json will be empty.")
+                _kv("capability:cursor:selftest", status="FAIL",
+                    reason="tracker-missing")
                 return False
 
             vp = page.viewport_size or {"width": 1280, "height": 800}
@@ -637,23 +644,20 @@ class CursorTrackingMixin:
             # ("humanize:maxTime is not a double"). Wrap with a hard timeout
             # so the self-test can't stall the entire recording session.
             try:
-                await asyncio.wait_for(
-                    page.mouse.move(vp["width"] * 0.4, vp["height"] * 0.4),
-                    timeout=5.0,
-                )
-                await asyncio.wait_for(
-                    page.mouse.move(vp["width"] * 0.6, vp["height"] * 0.55),
-                    timeout=5.0,
-                )
+                from .human_move import mouse_move
+
+                await mouse_move(page, vp["width"] * 0.4,
+                                 vp["height"] * 0.4, timeout=5.0)
+                await mouse_move(page, vp["width"] * 0.6,
+                                 vp["height"] * 0.55, timeout=5.0)
                 # keep the model's "where is the cursor" belief in sync so the
                 # next human_move starts from the real current position
                 self._last_cursor_pos = (vp["width"] * 0.6, vp["height"] * 0.55)
                 self._idle_cur_x = vp["width"] * 0.6
                 self._idle_cur_y = vp["height"] * 0.55
             except asyncio.TimeoutError:
-                log("[cursor-selftest] TIMEOUT: page.mouse.move() took >5s — "
-                     "Camoufox humanize is likely broken. Self-test aborted "
-                     "(recording continues; cursor may be empty).")
+                _kv("capability:cursor:selftest", status="TIMEOUT",
+                    reason="mouse-move>5s")
                 return False
 
             raw_after = None
@@ -673,16 +677,15 @@ class CursorTrackingMixin:
             after = _json.loads(raw_after) if isinstance(raw_after, str) else raw_after
             delta = int(after.get("moves", 0)) - int(before.get("moves", 0))
             if delta > 0:
-                log(f"[cursor-selftest] PASS: +{delta} moves captured from 2 probe mouse moves "
-                     f"(total {after.get('moves')}) — main-world listener is LIVE.")
+                _kv("capability:cursor:selftest", status="PASS",
+                    moves=delta, probes=2, total=after.get("moves"))
                 return True
-            log(f"[cursor-selftest] FAIL: tracker exists and started={after.get('started')} but "
-                 f"captured +0 moves from 2 probe mouse moves. The listener is not receiving "
-                 f"Camoufox's dispatched events (isolated/main world mismatch). cursor.json will "
-                 f"be empty — this is a Camoufox injection fault, not a harvest-ordering fault.")
+            _kv("capability:cursor:selftest", status="FAIL",
+                reason="listener-mismatch", started=after.get("started"))
             return False
         except Exception as exc:
-            log(f"[cursor-selftest] ERROR (non-fatal): {type(exc).__name__}: {exc}")
+            _kv("capability:cursor:selftest", status="ERROR",
+                error=type(exc).__name__)
             return False
 
     async def safe_goto(self, url: str, *, timeout: int = 20000) -> None:
@@ -702,8 +705,8 @@ class CursorTrackingMixin:
         page = self.page
         before = len(self._accumulated_moves)
         await self._harvest_and_accumulate()
-        log(f"[nav:{self._rel_time()}] goto {url} "
-             f"(buffer before nav: {before} -> {len(self._accumulated_moves)} moves)")
+        _kv("capability:nav:goto", url=url, buffered_moves=len(
+            self._accumulated_moves))
         # Send GOTO to the tracker machine: tracking -> navigating.
         # While in navigating, any EXTERNAL_NAV event from the framenavigated
         # listener is ignored (our nav, already handled). This replaces the
@@ -719,7 +722,7 @@ class CursorTrackingMixin:
         # Send NAV_DONE: navigating -> tracking. The navigating.exit action
         # logs the tracker restart; the actual restart happens below.
         await self._tracker_send("NAV_DONE")
-        log(f"[nav:{self._rel_time()}] landed on {page.url}")
+        _kv("capability:nav:landed", url=page.url)
         await self._restart_tracker_on_new_page()
 
     async def harvest_cursor_events(self) -> dict[str, Any]:
@@ -741,8 +744,8 @@ class CursorTrackingMixin:
         moves = self._accumulated_moves
         clicks = self._accumulated_clicks
         started = self._tracking_start_time is not None
-        log(f"cursor tracker final harvest: {len(moves)} moves, {len(clicks)} clicks "
-             f"(started={started})")
+        _kv("capability:cursor:harvest", phase="final",
+            moves=len(moves), clicks=len(clicks), started=started)
         return {
             "moves": list(moves),
             "clicks": list(clicks),

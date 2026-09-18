@@ -12,8 +12,10 @@ import sys
 from src import _log_sink
 
 
-def log(msg: str) -> None:
-    line = f"[jev-solver] {msg}"
+def log(msg: str, *, tag: str = "") -> None:
+    """jev-solver feed line; ``tag`` appends hierarchy (``step:start``)."""
+    prefix = f"[jev-solver:{tag}]" if tag else "[jev-solver]"
+    line = f"{prefix} {msg}"
     _log_sink.append(line)
     try:
         print(_log_sink.console_safe(line), flush=True)

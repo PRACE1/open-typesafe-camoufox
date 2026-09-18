@@ -244,6 +244,99 @@ def test_heal_triage_decodes_strategy_and_clamps_noul(monkeypatch):
     assert strat == HealStrategy.DISMISS_COVER and need == 1.0
 
 
+def test_heal_triage_sends_target_kind(monkeypatch):
+    import src.decide as _decide
+
+    seen = {}
+
+    async def _fake_post(payload, timeout_s, base, key):
+        seen.update(payload["state"])
+        return {"answers": {"strategy": {"choice": "remap_stale"},
+                            "need_new_cap": {"noul": 0.0}}}
+
+    monkeypatch.setattr(_decide, "_post", _fake_post)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    strat, _ = asyncio.run(decide_heal_action(
+        error_msg="error: no bounding box", last_kind="click_item",
+        page_text="p", target_kind="link"))
+    assert strat == HealStrategy.REMAP_STALE
+    assert seen["target_kind"] == "link"
+    assert "no bounding box" in seen["error"]
+
+
+def test_post_uses_official_sdk_transport(monkeypatch):
+    """_post speaks System One through typesafe_sdk (typed questions),
+    returning the same raw-answers shape the decoders read."""
+    import sys
+    import types
+
+    import src.decide as _decide
+
+    seen = {}
+
+    class ChoiceAnswer:
+        def __init__(self):
+            self.choice = "click_item"
+            self.confidence = 0.9
+            self.probabilities = {"click_item": 0.9}
+
+    class NoulAnswer:
+        def __init__(self):
+            self.noul = 0.7
+
+    class ScoreAnswer:
+        def __init__(self):
+            self.score = 0.4
+            self.confidence = 0.5
+
+    class FakeResp:
+        model = "jev-1.13.0"
+        answers = {"kind": ChoiceAnswer(), "ready": NoulAnswer(),
+                   "progress": ScoreAnswer()}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen["init"] = kwargs
+
+        async def system_one(self, **kwargs):
+            seen["call"] = kwargs
+            return FakeResp()
+
+        async def aclose(self):
+            seen["closed"] = True
+
+    fake_sdk = types.ModuleType("typesafe_sdk")
+    fake_sdk.AsyncTypeSafeClient = FakeClient
+    fake_sdk.Choice = lambda **k: ("Choice", k)
+    fake_sdk.Noul = lambda **k: ("Noul", k)
+    fake_sdk.Score = lambda **k: ("Score", k)
+    monkeypatch.setitem(sys.modules, "typesafe_sdk", fake_sdk)
+    payload = {"model": "jev-latest", "state": {"url": "u"},
+               "questions": {
+                   "kind": {"type": "choice", "instructions": {"question": "q"},
+                            "criteria": {"a": "b"}},
+                   "ready": {"type": "noul", "instructions": {"question": "q2"}},
+                   "progress": {"type": "score", "instructions": {},
+                                "criteria": []},
+                   "bogus": {"type": "unknown"},
+               }}
+    out = asyncio.run(_decide._post(payload, 30.0, "https://x.test/v1", "k"))
+    assert out["answers"]["kind"] == {"choice": "click_item",
+                                      "confidence": 0.9,
+                                      "probabilities": {"click_item": 0.9}}
+    assert out["answers"]["ready"] == {"noul": 0.7}
+    assert out["answers"]["progress"] == {"score": 0.4, "confidence": 0.5}
+    assert out["model"] == "jev-1.13.0"
+    assert seen["init"]["api_key"] == "k"
+    assert seen["call"]["model"] == "jev-latest"
+    assert seen["call"]["timeout"] == 30.0
+    kinds = {qid: marker[0] for qid, marker in
+             seen["call"]["questions"].items()}
+    assert kinds == {"kind": "Choice", "ready": "Noul",
+                     "progress": "Score"}  # bogus dropped
+    assert seen["closed"] is True
+
+
 def test_heal_triage_invalid_choice_falls_back(monkeypatch):
     import src.decide as _decide
 

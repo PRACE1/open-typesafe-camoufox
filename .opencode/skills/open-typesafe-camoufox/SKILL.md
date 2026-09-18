@@ -62,6 +62,19 @@ Every run writes `runs/<timestamp>/`:
 | `step-NN-payload.jsonl` | pydantic-validated JSON line: state + questions + rankings + decision |
 | `step-NN-answers.json` | every classifier probability (debug stalls here first) |
 | `transcript.jsonl`, `cursor.json` | per-step lines + cursor trail |
+| `memory.jsonl`, `MEMORY.md` | scored page-memory chunks (JSON) + human notebook |
+| `steps.jsonl`, `wire.jsonl`, `frontier.jsonl` | canonical step records, element maps, crawl ledger (all `run_id`+`seq` enveloped) |
+
+Page memory (structured, not prose): each newly settled page is fetched as
+Reader JSON (`Accept: application/json` → `{url,title,content}`), falling back
+to crawl4ai **library-only** CSS/regex extraction over the live DOM
+(`JsonCssExtractionStrategy.extract(url, html)` directly — no crawler, no
+second browser, Camoufox only). Chunks are stored in `memory.jsonl`, scored
+against the task by `jina-reranker-v3.5`, and winners join the notes JEV
+reasons over (`MEMORY  recalled N chunk(s)` in the feed). Needs
+`JINA_API_KEY` in `.env.local` for rerank (Reader works anonymously at
+20 RPM); everything fail-softs to excerpt banking offline. Costs: Reader
+free tier, reranker metered per call — usage logged per recall.
 
 Live feed lines: `SEE` (elements/links/tabs/focused/text) → `PROPOSE <kind> [#item] : <rationale>` → `DECIDE <kind> conf=<x> [item=#n] | ready=<x> text?=<x> done?=<x> prog=<x> appr=<x>` → `ACT` → `RESULT` → `TIME propose=<s> decide=<s> act=<s>`. `kind` is one of `wait | click_item | type_at | press_enter | refresh | close_others | goto | challenge | done | none` (each with a written what/not-for boundary). At approval ≥ 0.7 the proposal executes over the Choice vote (`[approved-override]`, `+ newtab <url>` when a tab opens). The Noul flags ride along: `ready` can only add patience, `text?` gates the writer call, `done?` must agree before `done` is accepted. `conf < --min-confidence` idles;
 two doubt no-ops stop the run; `wait` is patience (loading page) and never

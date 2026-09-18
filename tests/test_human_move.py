@@ -14,7 +14,7 @@ class MockMouse:
     def __init__(self):
         self.calls = []
 
-    async def move(self, x, y):
+    async def move(self, x, y, **kwargs):
         self.calls.append((float(x), float(y)))
 
 

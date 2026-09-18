@@ -1,5 +1,6 @@
 """shield_solve.py — native anti-bot checkbox solver (shield-bypass port).
 
+Library: https://github.com/genguzzz/shield-bypass
 Technique source: https://github.com/genguzzz/shield-bypass (MIT),
 verified via GitHub REST API + raw.githubusercontent fallbacks:
 ``bypass/plugins/cf_turnstile.py`` (iframe-scoped checkbox click at a
@@ -33,7 +34,16 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from .logging_utils import log
+from .logging_utils import log as _base_log
+
+
+def log(msg: str, tag: str = "shield-bypass") -> None:
+    """Hierarchical domain logger (default ``shield-bypass[:sub]``).
+
+    Named after the actual technique source:
+    https://github.com/genguzzz/shield-bypass
+    """
+    _base_log(msg, tag=tag)
 
 TURNSTILE_IFRAME_SEL = (
     "iframe[src*='challenges.cloudflare.com'], "
@@ -51,6 +61,20 @@ RECAPTCHA_IFRAME_SEL = (
 )
 RECAPTCHA_TOKEN_SEL = "textarea[name='g-recaptcha-response']"
 RECAPTCHA_ANCHOR_SEL = "#recaptcha-anchor, .recaptcha-checkbox-border"
+RECAPTCHA_BFRAME_SEL = (
+    "iframe[src*='recaptcha/api2/bframe'], "
+    "iframe[src*='recaptcha.net/recaptcha/api2/bframe']"
+)
+# Instruction text inside an open image-grid follow-up popup. The
+# anchor-checkbox click opens this popup; while it is open the
+# checkbox must NOT be clicked again (that closes the popup) and no
+# Escape may be dispatched (same effect) — the grid goes to the OCR
+# pipeline instead.
+IMAGE_FOLLOWUP_TEXT_MARKERS = (
+    "select all images",
+    "select each image",
+    "verify you are human",
+)
 HCAPTCHA_IFRAME_SEL = "iframe[src*='hcaptcha'], iframe[src*='hcaptcha.com']"
 HCAPTCHA_TOKEN_SEL = "textarea[name='h-captcha-response']"
 
@@ -78,6 +102,11 @@ class ShieldSolveResult(BaseModel):
     ``token_len`` proves a token materialized without ever recording
     the token value itself. Serialized into the step JSONL (``shield``
     block) and the per-step ``shield-NN.json`` audit file.
+
+    ``logs`` carries the solver's own diagnostic trail inside the
+    response (click path taken, token-poll outcome, failure reason) so
+    the audit record is self-describing without chasing run.log lines.
+    Token values never enter ``logs`` — lengths only.
     """
 
     model_config = {"extra": "ignore"}
@@ -89,6 +118,7 @@ class ShieldSolveResult(BaseModel):
     elapsed_ms: int = 0
     error: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
+    logs: list[str] = Field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:
         """Compact dict for JSONL audit (no token values, ever)."""
@@ -100,6 +130,7 @@ class ShieldSolveResult(BaseModel):
             "elapsed_ms": self.elapsed_ms,
             "error": self.error,
             "data": self.data,
+            "logs": list(self.logs),
         }
 
 
@@ -171,10 +202,41 @@ async def detect_shield(platform, page_text: str = "") -> ShieldDetection:
     return ShieldDetection()
 
 
-async def _click_turnstile_checkbox(page) -> bool:
+async def detect_image_followup(platform, page_text: str = "") -> tuple[bool, str]:
+    """True when a recaptcha image-grid follow-up popup is open.
+
+    Detected via its instruction text, or via a VISIBLE bframe iframe
+    (the popup document). Visibility matters: recaptcha renders the
+    bframe iframe hidden from page load, so mere presence must not
+    block the very first anchor click. While open, the caller must not
+    re-click the anchor checkbox and must not Escape-dismiss: either
+    closes the popup before the grid can be captured. Never raises.
+    """
+    text = (page_text or "").lower()
+    if any(k in text for k in IMAGE_FOLLOWUP_TEXT_MARKERS):
+        return True, "page-text"
+    try:
+        loc = platform.page.locator(RECAPTCHA_BFRAME_SEL).first
+        if await asyncio.wait_for(loc.count(), timeout=5.0) == 0:
+            return False, ""
+        visible = await asyncio.wait_for(loc.is_visible(timeout=500),
+                                         timeout=5.0)
+    except Exception:  # noqa: BLE001
+        return False, ""
+    if visible:
+        return True, "bframe"
+    return False, ""
+
+
+async def _click_turnstile_checkbox(page, logs: list[str] | None = None) -> bool:
     """Port of upstream click_turnstile_checkbox: role checkbox first,
     iframe-host offset click as fallback. Returns True if a click
-    dispatched (not proof of solve — token polling decides that)."""
+    dispatched (not proof of solve — token polling decides that).
+
+    Each step is appended to ``logs`` (when given) so the trail lives
+    inside the ``ShieldSolveResult`` response, not just run.log.
+    """
+    trail = logs if logs is not None else []
     # Path 1: frame-locator role checkbox (most faithful click target).
     try:
         fl = page.frame_locator(TURNSTILE_IFRAME_SEL).first
@@ -183,9 +245,12 @@ async def _click_turnstile_checkbox(page) -> bool:
                                   timeout=5.0):
             await asyncio.wait_for(
                 cb.click(timeout=3000, force=True), timeout=8.0)
+            trail.append("turnstile: role-checkbox click dispatched")
             return True
+        trail.append("turnstile: role checkbox not visible — trying offset click")
     except Exception as exc:  # noqa: BLE001
-        log(f"[shield] turnstile role-click failed: {exc}")
+        trail.append(f"turnstile: role-click failed ({exc.__class__.__name__}) — trying offset click")
+        log(f"turnstile role-click failed: {exc}")
     # Path 2: iframe host element-handle click at the fixed widget
     # offset with a human-like delay (upstream WIDGET_CLICK + delay=60).
     try:
@@ -193,19 +258,27 @@ async def _click_turnstile_checkbox(page) -> bool:
         handle = await asyncio.wait_for(host.element_handle(timeout=500),
                                         timeout=5.0)
         if handle is None:
+            trail.append("turnstile: offset click skipped (no element handle)")
             return False
         await asyncio.wait_for(
             handle.click(position=dict(WIDGET_CLICK), timeout=3000,
                          delay=60, force=True),
             timeout=8.0)
+        trail.append("turnstile: iframe-host offset click dispatched")
         return True
     except Exception as exc:  # noqa: BLE001
-        log(f"[shield] turnstile offset-click failed: {exc}")
+        trail.append(f"turnstile: offset-click failed ({exc.__class__.__name__})")
+        log(f"turnstile offset-click failed: {exc}")
         return False
 
 
-async def _click_recaptcha_checkbox(page) -> bool:
-    """Port of upstream RecaptchaPlugin.solve step 2: anchor click."""
+async def _click_recaptcha_checkbox(page, logs: list[str] | None = None) -> bool:
+    """Port of upstream RecaptchaPlugin.solve step 2: anchor click.
+
+    Each step is appended to ``logs`` (when given) so the trail lives
+    inside the ``ShieldSolveResult`` response, not just run.log.
+    """
+    trail = logs if logs is not None else []
     try:
         fl = page.frame_locator(RECAPTCHA_IFRAME_SEL).first
         anchor = fl.locator(RECAPTCHA_ANCHOR_SEL).first
@@ -213,10 +286,13 @@ async def _click_recaptcha_checkbox(page) -> bool:
                                   timeout=5.0):
             await asyncio.wait_for(
                 anchor.click(timeout=3000), timeout=8.0)
+            trail.append("recaptcha: anchor click dispatched")
             return True
+        trail.append("recaptcha: anchor not visible — no click dispatched")
         return False
     except Exception as exc:  # noqa: BLE001
-        log(f"[shield] recaptcha anchor click failed: {exc}")
+        trail.append(f"recaptcha: anchor click failed ({exc.__class__.__name__})")
+        log(f"recaptcha anchor click failed: {exc}")
         return False
 
 
@@ -249,54 +325,73 @@ async def solve_shield(platform, challenge_type: str,
     t0 = time.monotonic()
     elapsed = lambda: int((time.monotonic() - t0) * 1000)
     page = platform.page
+    logs: list[str] = [f"solve start: family={challenge_type or 'none'} timeout={timeout_s}s"]
     if challenge_type == "cf_turnstile":
         n = await _read_token_len(page, TURNSTILE_TOKEN_SEL)
         if n:
+            logs.append(f"turnstile: token already present (len={n}) — no click needed")
             return ShieldSolveResult(challenge_type=challenge_type,
                                      success=True, token_len=n,
                                      elapsed_ms=elapsed(),
-                                     data={"early_token": True})
-        clicked = await _click_turnstile_checkbox(page)
+                                     data={"early_token": True},
+                                     logs=logs)
+        logs.append("turnstile: no early token — dispatching family click")
+        clicked = await _click_turnstile_checkbox(page, logs)
+        logs.append(f"turnstile: click dispatched={clicked} — polling token input")
         n = await _poll_token(page, TURNSTILE_TOKEN_SEL, timeout_s)
         if n:
+            logs.append(f"turnstile: solved (token_len={n} elapsed_ms={elapsed()})")
             return ShieldSolveResult(challenge_type=challenge_type,
                                      success=True, token_len=n,
                                      elapsed_ms=elapsed(),
-                                     data={"clicked": clicked})
+                                     data={"clicked": clicked},
+                                     logs=logs)
+        logs.append(f"turnstile: unsolved — no token within {timeout_s}s")
         return ShieldSolveResult(
             challenge_type=challenge_type, success=False,
             elapsed_ms=elapsed(),
             error=(f"turnstile checkbox produced no token within "
                    f"{timeout_s}s timeout"),
-            data={"clicked": clicked})
+            data={"clicked": clicked},
+            logs=logs)
     if challenge_type == "recaptcha":
         n = await _read_token_len(page, RECAPTCHA_TOKEN_SEL)
         if n:
+            logs.append(f"recaptcha: token already present (len={n}) — no click needed")
             return ShieldSolveResult(challenge_type=challenge_type,
                                      success=True, token_len=n,
                                      elapsed_ms=elapsed(),
-                                     data={"early_token": True})
-        clicked = await _click_recaptcha_checkbox(page)
+                                     data={"early_token": True},
+                                     logs=logs)
+        logs.append("recaptcha: no early token — dispatching anchor click")
+        clicked = await _click_recaptcha_checkbox(page, logs)
+        logs.append(f"recaptcha: click dispatched={clicked} — polling token input")
         n = await _poll_token(page, RECAPTCHA_TOKEN_SEL, timeout_s)
         if n:
+            logs.append(f"recaptcha: solved (token_len={n} elapsed_ms={elapsed()})")
             return ShieldSolveResult(challenge_type=challenge_type,
                                      success=True, token_len=n,
                                      elapsed_ms=elapsed(),
-                                     data={"clicked": clicked})
+                                     data={"clicked": clicked},
+                                     logs=logs)
+        logs.append(f"recaptcha: unsolved — no token within {timeout_s}s")
         return ShieldSolveResult(
             challenge_type=challenge_type, success=False,
             elapsed_ms=elapsed(),
             error=(f"recaptcha produced no token within {timeout_s}s "
                    f"(may require image challenge solve)"),
-            data={"clicked": clicked})
+            data={"clicked": clicked},
+            logs=logs)
+    logs.append(f"no native solver for family {challenge_type!r} — routing to dddocr/escalate rails")
     return ShieldSolveResult(
         challenge_type=challenge_type or "none", success=False,
         elapsed_ms=elapsed(),
         error=f"no native solver for challenge family "
-              f"{challenge_type!r} (route to dddocr/escalate rails)")
+              f"{challenge_type!r} (route to dddocr/escalate rails)",
+        logs=logs)
 
 
-RESULT_MARKER = "shield-solve:"
+RESULT_MARKER = "shield-bypass:"
 
 
 def pack_result_line(idx: int, result: ShieldSolveResult) -> str:
@@ -341,13 +436,13 @@ def unpack_result_line(line: str) -> dict | None:
     return None
 
 
-ATTEMPT_MARKER = "shield-attempt:"
+ATTEMPT_MARKER = "shield-bypass-attempt:"
 
 
 def pack_attempt_tail(result: ShieldSolveResult) -> str:
     """Compact machine tail for FAILED shield attempts.
 
-    Successes pack the full ``shield-solve:`` line (progress branch).
+    Successes pack the full ``shield-bypass:`` line (progress branch).
     Failures keep their ``error:`` prefix for the failure rails, with
     this tail appended so the attempt (family, token_len, elapsed,
     error) still lands in the audit trail instead of vanishing into

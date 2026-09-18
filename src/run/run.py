@@ -37,9 +37,6 @@ for _p in (_ROOT, _SRC):
 
 from src.run.logging_utils import log, set_verbose  # noqa: E402
 from src.run.env_loader import load_env  # noqa: E402
-from src.run.agent_runner import run_jev_session  # noqa: E402
-from src.runner import run_decide_session  # noqa: E402
-from src.capability.human_move import HUMANIZE_LEVEL  # noqa: E402
 
 
 def _check_placeholders(task: str) -> list[str]:
@@ -62,13 +59,35 @@ async def _preflight(url: str, humanize: bool | float) -> int:
         return 4
     if "TYPESAFE_API_KEY" in missing_keys:
         log("PREFLIGHT WARN: TYPESAFE_API_KEY missing — Jev falls back to a heuristic (no real grounding)")
+    import os as _os
+
+    if _os.environ.get("JINA_API_KEY", "").strip():
+        log("PREFLIGHT jina: key set — Reader + rerank recall enabled")
+    else:
+        log("PREFLIGHT jina: anonymous (Reader 20 RPM, rerank fail-soft)")
+    if _os.environ.get("CAPTCHA_KRAKEN_API_KEY", "").strip():
+        log("PREFLIGHT kraken: key set — hosted vision grids enabled "
+            f"({(_os.environ.get('VLLM_BASE_URL', '').strip() or 'https://api.captchakraken.com/v1')})")
+    else:
+        log("PREFLIGHT kraken: no key — vision grid stage stays unplanned")
 
     from camoufox.async_api import AsyncCamoufox
 
+    from src.capability.twocaptcha_client import (
+        check_proxy as _check_proxy,
+        launch_kwargs as _proxy_kw,
+    )
+
+    _proxy_ok, _proxy_detail = _check_proxy()
+    log(f"PREFLIGHT proxy: {_proxy_detail}")
+    if not _proxy_ok:
+        log("PREFLIGHT WARN: 2captcha proxy down/unconfigured — "
+            "paid solves will refuse (browser still runs)")
     log("PREFLIGHT: launching headed Camoufox (watch for the window)...")
     try:
         async with asyncio.timeout(90):
-            async with AsyncCamoufox(headless=False, humanize=humanize) as browser:
+            async with AsyncCamoufox(headless=False, humanize=humanize,
+                                     **_proxy_kw()) as browser:
                 page = await browser.new_page()
                 await page.goto("about:blank")
                 vp = page.viewport_size or {}
@@ -216,13 +235,35 @@ def _replay(run_dir: str, step: int) -> int:
     return 0
 
 
+def _explain(query: str, full: bool) -> int:
+    """Offline capability Q&A: keyword-routed plain-English answers, no model."""
+    import sys
+    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    from src.explain import answer, key_status, topic_names
+
+    if not query:
+        print("Capability topics (ask one in plain English, e.g. otc --explain \"what's new?\"):")
+        print("\n".join(f"  {t}" for t in topic_names()))
+        print()
+        print("API keys in .env.local (values masked):")
+        print(key_status())
+        return 0
+    print(f"Q: {query}\n")
+    print(answer(query, full=full))
+    return 0
+
+
 def main() -> int:
     load_env()
     ap = argparse.ArgumentParser(
         prog="otc",
         description="open-typesafe-camoufox: plain-English task -> Jev-classified browser actions -> done.",
     )
-    ap.add_argument("--url", required=True, help="Start URL to solve.")
+    ap.add_argument("--url", required=False, help="Start URL to solve.")
     ap.add_argument("--task", default="", help='Instruction, e.g. "Sign in with {TWITTER_USERNAME} / {TWITTER_PASSWORD}". Placeholders resolve from .env.local at execution; values never log.')
     ap.add_argument("--steer", default="steer.txt", help="Steer file polled each step (stop | goto <url> | instruction).")
     ap.add_argument("--fps", type=float, default=3.0, help="Jev sample rate 2-5 (capture stays 60fps).")
@@ -237,9 +278,24 @@ def main() -> int:
     ap.add_argument("--replay-step", type=int, default=0, help="Step number to replay (0 = list available steps).")
     ap.add_argument("--mission", action="store_true", help="Resume-until-done: stopped sessions relaunch with covered URLs seeded, sharing the step/wall-clock budget (max 10 sessions). For long collection missions that must not die on transient stalls.")
     ap.add_argument("--humanize", action="store_true", help="Opt into Camoufox browser-level mouse smoothing (default OFF: measured per-dispatch degradation wedging mouse ops within ~3 moves).")
+    ap.add_argument("--explain", nargs="?", const="", default=None,
+                    help="Offline capability Q&A, no model/browser. "
+                         "--explain alone lists the topics + key status; "
+                         "--explain \"question\" answers it "
+                         "(--explain-full adds detail paragraphs).")
+    ap.add_argument("--explain-full", action="store_true", help="With --explain, include the detail paragraph of each matched topic.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     set_verbose(args.verbose)
+
+    if args.url is None:
+        return _explain(args.explain or "", args.explain_full)
+
+    # Heavy browser/agent stack — imported only on the run path so
+    # --explain / --replay / --preflight stay light (no keys needed).
+    from src.run.agent_runner import run_jev_session
+    from src.runner import run_decide_session
+    from src.capability.human_move import HUMANIZE_LEVEL
 
     if args.replay:
         return _replay(args.replay, args.replay_step)

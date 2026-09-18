@@ -31,6 +31,26 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .deps import ElementRef
 
+import itertools as _itertools
+
+_seq = _itertools.count(1)
+
+
+def _envelope(run_dir: str, obj: dict[str, Any]) -> dict[str, Any]:
+    """Join-key envelope for every JSONL line: ``run_id`` (the run-dir
+    name) + a process-global ``seq``.
+
+    ``setdefault`` semantics so callers and tests can pin values. This
+    is what turns the five append-only streams (steps, transcript,
+    wire, payload, frontier) into one queryable trajectory:
+    ``jq -s 'sort_by(.seq)'``. Snapshots (run.json, frontier.json)
+    stay envelope-free — they are derived caches, not stream members.
+    """
+    out = dict(obj)
+    out.setdefault("run_id", os.path.basename(os.path.abspath(run_dir)))
+    out.setdefault("seq", next(_seq))
+    return out
+
 
 class StepPayload(BaseModel):
     """Typed per-step record: everything Jev saw, asked, and answered.
@@ -44,6 +64,8 @@ class StepPayload(BaseModel):
 
     n: int = Field(ge=1)
     t: float = 0.0
+    run_id: str = ""
+    seq: int = 0
     url: str = ""
     task: str = ""
     state: dict[str, Any] = Field(default_factory=dict)
@@ -103,6 +125,8 @@ class StepRecord(BaseModel):
 
     n: int = Field(ge=1)
     t: float = 0.0
+    run_id: str = ""
+    seq: int = 0
     url: str = ""
     url_after: str = ""
     intent: str = ""
@@ -117,6 +141,9 @@ class StepRecord(BaseModel):
     recovery: RecoveryAttempt | None = None
     captcha_ocr: dict[str, Any] = Field(default_factory=dict)
     shield: dict[str, Any] = Field(default_factory=dict)
+    twocaptcha: dict[str, Any] = Field(default_factory=dict)
+    grid: dict[str, Any] = Field(default_factory=dict)
+    solver_rank: dict[str, Any] = Field(default_factory=dict)
     frontier: dict[str, Any] = Field(default_factory=dict)
     confidence: float = 0.0
     replayable: bool = False
@@ -134,6 +161,7 @@ def write_step_jsonl(run_dir: str, record: dict[str, Any]) -> str:
     loudly in tests; at runtime the raw dict still lands for forensics.
     """
     path = os.path.join(run_dir, "steps.jsonl")
+    record = _envelope(run_dir, record)
     try:
         line = StepRecord.model_validate(record).model_dump_json()
     except ValidationError:
@@ -157,10 +185,10 @@ def write_payload_jsonl(run_dir: str, n: int, *, t: float = 0.0,
     still lands for forensics.
     """
     path = os.path.join(run_dir, f"step-{n:02d}-payload.jsonl")
-    obj = {"n": n, "t": t, "url": url, "task": task,
-           "state": state or {}, "questions": questions or {},
-           "answers": answers or {}, "decision": decision,
-           "phases": phases or []}
+    obj = _envelope(run_dir, {"n": n, "t": t, "url": url, "task": task,
+                              "state": state or {}, "questions": questions or {},
+                              "answers": answers or {}, "decision": decision,
+                              "phases": phases or []})
     try:
         line = StepPayload.model_validate(obj).model_dump_json()
     except ValidationError:
@@ -282,7 +310,22 @@ def write_frontier_event(run_dir: str, event: dict[str, Any]) -> str:
     """
     path = os.path.join(run_dir, "frontier.jsonl")
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        f.write(json.dumps(_envelope(run_dir, event), ensure_ascii=False) + "\n")
+    return path
+
+
+def write_memory_jsonl(run_dir: str, rows: list[dict[str, Any]]) -> str:
+    """Append scored page-memory chunks (memory.jsonl, enveloped).
+
+    The machine companion to MEMORY.md: one line per chunk with
+    run_id/seq/url/section/text/score/source, queryable like every
+    other trajectory stream. Snapshots never land here — appends only.
+    """
+    path = os.path.join(run_dir, "memory.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        for row in rows or []:
+            f.write(json.dumps(_envelope(run_dir, dict(row)),
+                               ensure_ascii=False) + "\n")
     return path
 
 
@@ -314,7 +357,8 @@ def _public_entry(entry: dict) -> dict:
 
 def append_transcript(run_dir: str, entry: dict) -> None:
     with open(os.path.join(run_dir, "transcript.jsonl"), "a", encoding="utf-8") as f:
-        f.write(json.dumps(_public_entry(entry), ensure_ascii=False) + "\n")
+        f.write(json.dumps(_envelope(run_dir, _public_entry(entry)),
+                           ensure_ascii=False) + "\n")
 
 
 def write_wire(run_dir: str, wire: dict[str, Any]) -> str:
@@ -328,7 +372,8 @@ def write_wire(run_dir: str, wire: dict[str, Any]) -> str:
     """
     path = os.path.join(run_dir, "wire.jsonl")
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(_public_entry(wire), ensure_ascii=False) + "\n")
+        f.write(json.dumps(_envelope(run_dir, _public_entry(wire)),
+                           ensure_ascii=False) + "\n")
     return path
 
 
@@ -346,28 +391,10 @@ def write_run_json(run_dir: str, summary: dict) -> str:
     return path
 
 
-def replay_payload(run_dir: str, n: int) -> dict[str, Any]:
-    """Load a saved step's payload + answers for offline debugging."""
-    out: dict[str, Any] = {}
-    answers_path = os.path.join(run_dir, f"step-{n:02d}-answers.json")
-    if os.path.exists(answers_path):
-        with open(answers_path, encoding="utf-8") as f:
-            out["answers"] = json.load(f)
-    payload_path = os.path.join(run_dir, f"step-{n:02d}-payload.jsonl")
-    if os.path.exists(payload_path):
-        with open(payload_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out["payload"] = StepPayload.model_validate_json(line).model_dump()
-                except (ValidationError, ValueError):
-                    try:
-                        out["payload"] = json.loads(line)
-                    except ValueError:
-                        continue
-    return out
+# Trajectory reads live in src.trajectory (replay + lessons); report.py
+# keeps byte-writers only. Re-exported here so existing imports
+# (run.py, loop.py, scripts, tests) keep working unchanged.
+from .trajectory import LESSONS_LIMIT, load_lessons, replay_payload
 
 
 def append_memory(run_dir: str, line: str) -> str:
@@ -381,26 +408,3 @@ def append_memory(run_dir: str, line: str) -> str:
     with open(path, "a", encoding="utf-8") as f:
         f.write(line.rstrip() + "\n")
     return path
-
-
-LESSONS_LIMIT = 1200  # chars of the shared lessons file injected per call
-
-
-def load_lessons(root: str, limit: int = LESSONS_LIMIT) -> str:
-    """Bounded excerpt of the shared cross-run lessons notebook.
-
-    `.agent-memory/MEMORY.md` holds durable hard-won facts (this build's
-    quirks, gate thresholds, loop shapes). Bounded like the doc's notebook
-    model: latest snapshot per run, never dumped whole, so the packet can't
-    bloat across 40-50 steps.
-    """
-    path = os.path.join(root, ".agent-memory", "MEMORY.md")
-    try:
-        with open(path, encoding="utf-8") as f:
-            text = f.read().strip()
-    except OSError:
-        return ""
-    if len(text) <= limit:
-        return text
-    cut = text[:limit].rsplit("\n", 1)[0]
-    return cut if cut else text[:limit]

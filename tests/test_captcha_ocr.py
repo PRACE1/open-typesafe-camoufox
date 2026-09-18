@@ -79,7 +79,7 @@ def test_history_line_never_embeds_bytes():
     res = CaptchaOcrResult(available=True, kind="captcha", text="X" * 200,
                            confidence=0.9)
     line = res.to_history_line(7, 2)
-    assert "captcha-ocr" in line and len(line) < 300
+    assert "ddddocr" in line and len(line) < 300
 
 
 def test_mean_confidence_and_text_rebuild():
@@ -249,7 +249,7 @@ def test_challenge_control_captcha_ocr_success(monkeypatch):
            ElementRef(idx=1, kind="input", label="code")]
     plat = _ShotPlatform(png=png)
     res = asyncio.run(_actions.challenge_control(plat, els, 0))
-    assert "captcha-ocr:" in res
+    assert "ddddocr:" in res
     assert not res.startswith("error")
     obj = unpack_result_line(res)
     assert obj is not None and obj["available"] is True
@@ -268,6 +268,98 @@ def test_challenge_control_captcha_no_image_escalates(monkeypatch):
     plat = _ShotPlatform(png=None)  # locator.count() == 0 → no capture
     res = asyncio.run(_actions.challenge_control(plat, els, 0))
     assert "escalating" in res
+
+
+class _TileHandle:
+    def __init__(self, box):
+        self._box = box
+
+    async def bounding_box(self):
+        return dict(self._box)
+
+    async def screenshot(self, timeout=None):
+        return b"tile-png"
+
+
+class _TileLocator:
+    def __init__(self, boxes):
+        self._boxes = boxes
+
+    async def count(self):
+        return len(self._boxes)
+
+    async def all(self):
+        return [_TileHandle(b) for b in self._boxes]
+
+
+class _GridPage:
+    """bframe frame-locator serving a 3x3 of 100px photo tiles."""
+
+    def __init__(self):
+        self._boxes = [
+            {"x": 10 + c * 100, "y": 20 + r * 100,
+             "width": 100, "height": 100}
+            for r in range(3) for c in range(3)]
+
+    def frame_locator(self, sel):
+        return self
+
+    @property
+    def first(self):
+        return self
+
+    def locator(self, sel):
+        return _TileLocator(self._boxes)
+
+
+class _GridPlatform:
+    def __init__(self):
+        self.page = _GridPage()
+
+
+def test_discover_grid_tiles_reading_order():
+    tiles = asyncio.run(co.discover_grid_tiles(_GridPlatform()))
+    assert [t["index"] for t in tiles] == list(range(9))
+    assert tiles[0]["box"]["x"] == 10 and tiles[8]["box"]["x"] == 210
+    assert all("locator" in t for t in tiles)
+
+
+def test_discover_grid_tiles_absent_without_bframe():
+    class _NoFrame:
+        def frame_locator(self, sel):
+            raise RuntimeError("no frame")
+
+    plat = type("P", (), {"page": _NoFrame()})()
+    assert asyncio.run(co.discover_grid_tiles(plat)) == []
+
+
+def test_read_grid_tiles_per_tile(monkeypatch):
+    async def _fake_read(png):
+        assert png == b"tile-png"
+        return "7", 0.9, [], None
+
+    monkeypatch.setattr(co, "solve_text_captcha", _fake_read)
+    tiles = asyncio.run(co.discover_grid_tiles(_GridPlatform()))
+    readings = asyncio.run(co.read_grid_tiles(_GridPlatform(), tiles))
+    assert len(readings) == 9
+    assert all(r["text"] == "7" and r["confidence"] == 0.9
+               for r in readings)
+
+
+def test_grid_boxes_clear_text_miss_error(monkeypatch):
+    """A 3x3 image grid has no text to OCR: detection boxes ARE the
+    result, so a text miss with boxes found packs clean (error None)
+    for JEV review instead of collapsing to a capture failure."""
+    png = _real_captcha_png("grid")
+    _install_stub(monkeypatch, _FakeOcr(
+        text="", conf_rows=[],
+        boxes=[[10, 10, 50, 50], [60, 10, 100, 50]]))
+    els = [ElementRef(idx=0, kind="image", label="Select all images",
+                      aria="e1", ref="e1")]
+    plat = _ShotPlatform(png=png)
+    res = asyncio.run(co.solve_challenge(plat, els, 0, ""))
+    assert res.error is None and len(res.boxes) == 2
+    assert res.suggest_item is None  # no input to type a grid into
 
 
 def test_write_captcha_json_roundtrip(tmp_path):

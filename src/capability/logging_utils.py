@@ -9,9 +9,16 @@ import sys
 from src import _log_sink
 
 
-def log(msg: str) -> None:
-    """Flushed log line — stdout + session run.log."""
-    line = f"[capability] {msg}"
+def log(msg: str, *, tag: str = "") -> None:
+    """Flushed log line — stdout + session run.log.
+
+    ``tag`` names the solver/method for auditability (e.g.
+    ``[capability:captchakraken]`` instead of a blank ``[capability]``).
+    Modules bind their tag once via ``functools.partial``; call sites
+    stay ``log("...")``.
+    """
+    prefix = f"[capability:{tag}]" if tag else "[capability]"
+    line = f"{prefix} {msg}"
     _log_sink.append(line)
     try:
         print(_log_sink.console_safe(line), flush=True)

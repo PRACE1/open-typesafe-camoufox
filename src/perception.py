@@ -26,7 +26,7 @@ from .capability.aria_refs import (
     parse_aria_snapshot,
 )
 from .capability.element_probe import ELEMENT_PROBE_JS
-from .capability.logging_utils import log
+from .capability.logging_utils import log, log_verbose
 from .deps import ElementRef, FocusedField
 
 MAX_ELEMENTS = 128  # probe cap; well under Jev's 255-option Choice cap
@@ -231,6 +231,9 @@ def is_credential_element(e: ElementRef) -> bool:
     return is_credential(e.kind, e.type, e.label, e.placeholder)
 
 
+_last_refs_sig: str | None = None
+
+
 async def find_elements(platform) -> list[ElementRef]:
     """Probe the live page; return the element map in snapshot order.
 
@@ -245,8 +248,16 @@ async def find_elements(platform) -> list[ElementRef]:
         log(f"SEE    aria snapshot failed ({exc.__class__.__name__}) — DOM probe fallback")
         text = ""
     if (text or "").strip():
+        log_verbose(f"SEE    aria snapshot raw:\n{text}")
         els = _elements_from_aria(text)
         if els:
+            # One REFS dump per distinct map: click_item re-probes
+            # several times per step and each probe would reprint it.
+            global _last_refs_sig
+            sig = "|".join(f"{e.ref}:{e.kind}:{e.label}" for e in els)
+            if sig != _last_refs_sig:
+                _last_refs_sig = sig
+                log(f"REFS   {format_refs(els)}")
             return els
         log("SEE    aria snapshot empty — DOM probe fallback")
     return await _elements_from_probe(platform)
@@ -422,6 +433,24 @@ async def get_focused_field(platform) -> FocusedField:
         ),
         frame=frame,
     )
+
+
+def format_refs(elements: list[ElementRef], limit: int = 16) -> str:
+    """One-line ref table dumped right after the aria snapshot.
+
+    Shows what the snapshot actually contains per ref — including
+    iframe-embedded nodes (``fNeM`` refs) whose live kind may differ
+    from the decided kind when the map goes stale. Capped to ``limit``
+    entries so the live feed stays readable.
+    """
+    if not elements:
+        return "(no refs)"
+    bits = []
+    for e in elements[:limit]:
+        label = (e.label or e.placeholder or e.text or e.id or "?")[:40]
+        bits.append(f"{e.ref}:{e.kind} {label!r}")
+    tail = f" +{len(elements) - limit} more" if len(elements) > limit else ""
+    return " | ".join(bits) + tail
 
 
 def format_elements(elements: list[ElementRef]) -> str:

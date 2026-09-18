@@ -213,7 +213,9 @@ async def run_jev_session(
     t_end = time.time() + budget_s
     result_extra: dict = {}
 
-    async with AsyncCamoufox(headless=headless, humanize=humanize) as browser:
+    from ..capability.twocaptcha_client import launch_kwargs as _proxy_kw
+    async with AsyncCamoufox(headless=headless, humanize=humanize,
+                             **_proxy_kw()) as browser:
         page = await browser.new_page()
         await capability.set_page(page)
         try:

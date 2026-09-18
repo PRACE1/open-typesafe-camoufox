@@ -1,4 +1,5 @@
 .env.local
+.agent-memory/solver-ledger.jsonl
 .scratch/
 __pycache__/
 .pytest_cache/

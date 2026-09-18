@@ -63,6 +63,35 @@ def test_payload_and_answers_roundtrip(tmp_path):
     assert replay_payload(run_dir, 99) == {}
 
 
+def test_jsonl_lines_carry_run_id_and_seq(tmp_path):
+    """Trajectory envelope: every JSONL stream carries run_id + seq so
+    steps/transcript/wire/payload/frontier join into one trajectory."""
+    import json as _json
+
+    from src.report import (
+        append_transcript,
+        write_frontier_event,
+        write_step_jsonl,
+        write_wire,
+    )
+    run_dir = str(tmp_path / "20260918-000000")
+    (tmp_path / "20260918-000000").mkdir()
+    write_step_jsonl(run_dir, {"n": 1})
+    append_transcript(run_dir, {"n": 1})
+    write_wire(run_dir, {"n": 1})
+    write_frontier_event(run_dir, {"op": "visited"})
+    rows = []
+    for name in ("steps.jsonl", "transcript.jsonl", "wire.jsonl",
+                 "frontier.jsonl"):
+        for ln in open(f"{run_dir}/{name}", encoding="utf-8"):
+            if ln.strip():
+                rows.append(_json.loads(ln))
+    assert len(rows) == 4
+    assert {r["run_id"] for r in rows} == {"20260918-000000"}
+    seqs = sorted(r["seq"] for r in rows)
+    assert len(set(seqs)) == 4  # globally ordered, no collisions
+
+
 def test_make_run_dir(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     d = make_run_dir()

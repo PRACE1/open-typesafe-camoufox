@@ -5,7 +5,8 @@ description = "Jev-primary computer use on headed Camoufox: cheap classifier dec
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.0",
-    "pydantic-ai>=1.0",
+    "pydantic-ai>=2.45",
+    "pydantic-ai-slim[typesafe]>=2.45",
     "camoufox>=0.4",
     "playwright>=1.40",
     "pillow>=10.0",
@@ -16,6 +17,8 @@ dependencies = [
     "pydot>=4.0.1",
     "ddddocr>=1.5.1",
     "crawl4ai>=0.7",
+    "2captcha-python>=1.2",
+    "cursory>=2.0",
 ]
 
 [project.scripts]

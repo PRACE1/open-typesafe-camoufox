@@ -349,3 +349,100 @@ def test_challenge_control_shield_failure_falls_back_to_toggle(monkeypatch):
     res = _run(_actions.challenge_control(plat, _checkbox_els(), 2,
                                           expected_kind="checkbox"))
     assert "challenge checkbox toggled" in res and "native locator" in res
+
+
+class _FakeOffsetHandle:
+    def __init__(self, box):
+        self._box = box
+        self.clicks = []
+
+    async def bounding_box(self):
+        return self._box
+
+    async def click(self, position=None, timeout=None, delay=None,
+                    force=False):
+        self.clicks.append({"position": position, "delay": delay,
+                            "force": force})
+
+
+class _FakeFrameText:
+    def __init__(self, visible=False):
+        self._visible = visible
+
+    @property
+    def first(self):
+        return self
+
+    async def is_visible(self, timeout=None):
+        return self._visible
+
+
+class _FakeCFFrame:
+    def __init__(self, url, box=None, verifying=False):
+        self.url = url
+        self._box = box
+        self._verifying = verifying
+        self.handle = _FakeOffsetHandle(box)
+
+    async def frame_element(self):
+        return self.handle
+
+    def get_by_text(self, text, exact=False):
+        return _FakeFrameText(self._verifying)
+
+
+class _NoCheckboxFrameLocator:
+    @property
+    def first(self):
+        return self
+
+    def get_by_role(self, role):
+        return self
+
+    async def is_visible(self, timeout=None):
+        return False
+
+
+class _OffsetTestPage:
+    def __init__(self, frames):
+        self.frames = frames
+
+    def frame_locator(self, sel):
+        return _NoCheckboxFrameLocator()
+
+    def locator(self, sel):
+        return _FakeLocator(count=0)
+
+
+def test_offset_click_hits_widget_frame():
+    from src.capability.shield_solve import (
+        WIDGET_CLICK,
+        _click_turnstile_checkbox,
+    )
+    loader = _FakeCFFrame("https://challenges.cloudflare.com/x",
+                          box={"x": 0, "y": 0, "width": 10, "height": 10})
+    widget = _FakeCFFrame(
+        "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/av0",
+        box={"x": 100, "y": 200, "width": 300, "height": 65})
+    logs = []
+    ok = _run(_click_turnstile_checkbox(_OffsetTestPage([loader, widget]),
+                                        logs))
+    assert ok is True
+    assert loader.handle.clicks == []
+    assert len(widget.handle.clicks) == 1
+    click = widget.handle.clicks[0]
+    assert click["position"] == dict(WIDGET_CLICK)
+    assert click["delay"] == 60 and click["force"] is True
+    assert any("offset click dispatched" in line for line in logs)
+
+
+def test_offset_click_skips_non_widget_frames():
+    from src.capability.shield_solve import _click_turnstile_checkbox
+    loader = _FakeCFFrame("https://challenges.cloudflare.com/x",
+                          box={"x": 0, "y": 0, "width": 10, "height": 10})
+    other = _FakeCFFrame("https://example.com/", box=None)
+    logs = []
+    ok = _run(_click_turnstile_checkbox(_OffsetTestPage([loader, other]),
+                                        logs))
+    assert ok is False
+    assert any("no widget iframe" in line for line in logs)

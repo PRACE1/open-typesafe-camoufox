@@ -262,24 +262,28 @@ async def _click_turnstile_checkbox(page, logs: list[str] | None = None) -> bool
     except Exception as exc:  # noqa: BLE001
         trail.append(f"turnstile: role-click failed ({exc.__class__.__name__}) — trying offset click")
         log(f"turnstile role-click failed: {exc}")
-    # Path 2: per-iframe widget loop (upstream click_turnstile_checkbox).
-    # `.first` is usually a hidden loader iframe, not the widget — walk
-    # every match, keep the one with a real widget box that is not already
-    # verifying, and offset-click exactly that host.
+    # Path 2: frame-driven widget loop (upstream click_turnstile_checkbox).
+    # Locator `.first`/`.nth` kept resolving hidden loader iframes — or
+    # nothing once the widget re-renders — while page.frames still sees
+    # the live frame (same source the patch install and probe resolve).
+    # So drive off each frame's own element via frame_element().
     try:
-        total = await asyncio.wait_for(
-            page.locator(TURNSTILE_IFRAME_SEL).count(), timeout=5.0)
+        frames = list(getattr(page, "frames", []) or [])
     except Exception:  # noqa: BLE001
-        total = 0
-    for i in range(total):
-        host_i = page.locator(TURNSTILE_IFRAME_SEL).nth(i)
+        frames = []
+    for i, frame in enumerate(frames):
         try:
-            handle_i = await asyncio.wait_for(
-                host_i.element_handle(timeout=2000), timeout=5.0)
+            url = getattr(frame, "url", "") or ""
         except Exception:  # noqa: BLE001
-            handle_i = None
-        if handle_i is None:
-            trail.append(f"turnstile: iframe[{i}] no handle — skipping")
+            continue
+        low = url.lower()
+        if "challenges.cloudflare.com" not in low and "turnstile" not in low:
+            continue
+        try:
+            handle_i = await asyncio.wait_for(frame.frame_element(),
+                                              timeout=5.0)
+        except Exception:  # noqa: BLE001
+            trail.append(f"turnstile: iframe[{i}] no element — skipping")
             continue
         try:
             box = await handle_i.bounding_box()
@@ -291,9 +295,8 @@ async def _click_turnstile_checkbox(page, logs: list[str] | None = None) -> bool
             trail.append(f"turnstile: iframe[{i}] box not widget — skipping")
             continue
         try:
-            fl_i = page.frame_locator(TURNSTILE_IFRAME_SEL).nth(i)
             verifying = await asyncio.wait_for(
-                fl_i.get_by_text("Verifying...", exact=True).first.is_visible(timeout=300),
+                frame.get_by_text("Verifying...", exact=True).first.is_visible(timeout=300),
                 timeout=5.0)
         except Exception:  # noqa: BLE001
             verifying = False
